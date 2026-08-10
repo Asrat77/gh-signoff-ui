@@ -238,7 +238,13 @@ func pick(cond bool, a, b string) string {
 }
 
 func validContextName(s string) bool {
-	if len(s) > 64 {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	// A leading dash would make gh parse the name as an option rather than a
+	// positional argument. gh-signoff's own -f overrides its check that the
+	// commit is present on a remote, so this is not merely cosmetic.
+	if s[0] == '-' {
 		return false
 	}
 	for _, r := range s {
