@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Signoff</title>
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div class="window">
+  <div class="titlebar">
+    <div class="dot r"></div><div class="dot y"></div><div class="dot g"></div>
+    <div class="title">Signoff</div>
+    <div class="titlebar-spacer"></div>
+    <button class="kbtn" id="paletteBtn" type="button">
+      <span class="refresh-dot" id="refreshDot" title="Live"></span>
+      Quick sign off <kbd>⌘K</kbd>
+    </button>
+  </div>
+
+  <div class="body">
+    <nav class="sidebar" aria-label="Main">
+      <button class="repo-picker" type="button" id="repoPicker" title="Open on GitHub">
+        <span class="sq" id="repoInitials">··</span>
+        <span class="rp-text">
+          <b id="repoName">loading…</b>
+          <span id="repoBranch"></span>
+        </span>
+      </button>
+
+      <button class="nav-item" type="button" data-page="dashboard" aria-current="page">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><path d="M9 12l2 2 4-4"/></svg>
+        Dashboard
+        <span class="nav-count" id="navCount"></span>
+      </button>
+      <button class="nav-item" type="button" data-page="history">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 7v5l3 3"/></svg>
+        History
+      </button>
+      <button class="nav-item" type="button" data-page="rules">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6l7-3z"/></svg>
+        Required checks
+      </button>
+
+      <div class="sidebar-spacer"></div>
+
+      <div class="sidebar-foot">
+        Wraps <span class="cmd">gh signoff</span><br>
+        <span id="versionLine"></span>
+      </div>
+    </nav>
+
+    <main class="main" id="main">
+      <div class="page" id="page-dashboard"></div>
+      <div class="page hidden" id="page-history"></div>
+      <div class="page hidden" id="page-rules"></div>
+    </main>
+  </div>
+</div>
+
+<div class="palette-overlay" id="paletteOverlay">
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Command palette">
+    <label for="paletteInput" class="sr-only">Search commands</label>
+    <input id="paletteInput" placeholder="Sign off a check, switch page, or copy a command…"
+           autocomplete="off" role="combobox" aria-expanded="true"
+           aria-controls="paletteResults" aria-autocomplete="list">
+    <div class="palette-results" id="paletteResults" role="listbox" aria-label="Commands"></div>
+  </div>
+</div>
+
+<div class="sr-only" role="status" aria-live="polite" id="live"></div>
+
+<script>
+  window.SIGNOFF = { token: "{{TOKEN}}", readOnly: {{READONLY}} };
+</script>
+<script src="/app.js"></script>
+</body>
+</html>
