@@ -22,6 +22,7 @@ type server struct {
 	dir      string
 	token    string
 	readOnly bool
+	demo     *demoStore // non-nil only when -demo was passed
 
 	mu      sync.Mutex
 	running bool // one signoff at a time; the CLI is not reentrant per commit
@@ -85,8 +86,13 @@ func (s *server) routes() *http.ServeMux {
 		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 		defer cancel()
 
-		st := buildState(ctx, s.dir)
-		st.normalize()
+		var st State
+		if s.demo != nil {
+			st = s.demo.snapshot()
+		} else {
+			st = buildState(ctx, s.dir)
+			st.normalize()
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(st)
@@ -149,6 +155,20 @@ func (s *server) handleSignoff(w http.ResponseWriter, r *http.Request) {
 	pretty := "gh " + strings.Join(args, " ")
 	send("line", "$ "+pretty)
 
+	if s.demo != nil {
+		for _, line := range []string{
+			"running locally…",
+			"✓ " + name + " passed",
+		} {
+			time.Sleep(450 * time.Millisecond)
+			send("line", line)
+		}
+		s.demo.signoff(name)
+		send("line", "✓ Signed off on 3db401c"+pick(name != "", " for "+name, ""))
+		send("done", `{"code":0}`)
+		return
+	}
+
 	if s.readOnly {
 		send("line", "read-only mode: refusing to write a commit status")
 		send("done", `{"code":1,"readOnly":true}`)
@@ -208,6 +228,13 @@ func (s *server) handleSignoff(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	send("done", fmt.Sprintf(`{"code":%d}`, code))
+}
+
+func pick(cond bool, a, b string) string {
+	if cond {
+		return a
+	}
+	return b
 }
 
 func validContextName(s string) bool {

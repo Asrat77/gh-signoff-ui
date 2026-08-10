@@ -67,6 +67,7 @@ func main() {
 		dir       = flag.String("dir", ".", "repository directory")
 		noBrowser = flag.Bool("no-browser", false, "do not open a browser window")
 		readOnly  = flag.Bool("read-only", false, "refuse every write; useful for demos")
+		demo      = flag.Bool("demo", false, "serve fixed sample data instead of reading GitHub")
 		version   = flag.Bool("version", false, "print version and exit")
 	)
 	flag.Parse()
@@ -85,6 +86,9 @@ func main() {
 	}
 
 	srv := &server{dir: abs, token: newToken(), readOnly: *readOnly}
+	if *demo {
+		srv.demo = newDemoStore()
+	}
 
 	ln, err := listen(*port)
 	if err != nil {
