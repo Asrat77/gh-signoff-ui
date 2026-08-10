@@ -274,6 +274,26 @@ func buildState(ctx context.Context, dir string) State {
 	return st
 }
 
+// normalize guarantees every slice marshals as [] rather than null.
+//
+// Go encodes a nil slice as JSON null, which forces every consumer to guard
+// each field before touching .length. Emitting empty arrays keeps the wire
+// contract free of that null-versus-empty ambiguity.
+func (s *State) normalize() {
+	if s.Checks == nil {
+		s.Checks = []Check{}
+	}
+	if s.History == nil {
+		s.History = []Event{}
+	}
+	if s.Rules.Contexts == nil {
+		s.Rules.Contexts = []string{}
+	}
+	if s.Rules.SignoffContexts == nil {
+		s.Rules.SignoffContexts = []string{}
+	}
+}
+
 // buildInstallCommand reconstructs the `gh signoff install` invocation that
 // would produce the current rule, so the Required Checks page can show it.
 func buildInstallCommand(signoffContexts []string, branch string) string {

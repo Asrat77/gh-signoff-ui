@@ -78,34 +78,52 @@
   async function fetchState() {
     const dot = $("#refreshDot");
     dot.classList.add("busy");
+
+    let next;
     try {
       const res = await fetch("/api/state", { headers: { "X-Signoff-Token": TOKEN } });
       if (!res.ok) throw new Error(`state request failed: ${res.status}`);
-      state = await res.json();
+      next = await res.json();
       dot.classList.remove("stale");
-      render();
+      dot.title = "Live";
     } catch (err) {
       dot.classList.add("stale");
       dot.title = `Could not refresh: ${err.message}`;
+      return;
     } finally {
       dot.classList.remove("busy");
     }
+
+    // Rendering is deliberately outside the fetch's try block. Catching render
+    // errors alongside network errors once turned a null-dereference into a
+    // silent blank page wearing a "could not refresh" tooltip.
+    state = next;
+    render();
   }
 
   // ------------------------------------------------------------- rendering
 
   function render() {
     if (!state) return;
-    renderChrome();
+    try {
+      renderChrome();
 
-    const env = state.env;
-    const blocked = !env.ghInstalled || !env.authenticated || !env.inGitRepo;
+      const env = state.env;
+      const blocked = !env.ghInstalled || !env.authenticated || !env.inGitRepo;
 
-    $("#page-dashboard").innerHTML = blocked ? setupScreen(env) : dashboard();
-    $("#page-history").innerHTML = blocked ? setupScreen(env) : historyPage();
-    $("#page-rules").innerHTML = blocked ? setupScreen(env) : rulesPage();
+      $("#page-dashboard").innerHTML = blocked ? setupScreen(env) : dashboard();
+      $("#page-history").innerHTML = blocked ? setupScreen(env) : historyPage();
+      $("#page-rules").innerHTML = blocked ? setupScreen(env) : rulesPage();
 
-    wireDashboard();
+      wireDashboard();
+    } catch (err) {
+      // A rendering bug must announce itself rather than leave a blank pane.
+      console.error("render failed", err);
+      $("#page-dashboard").innerHTML = banner(
+        `Signoff could not render this state: ${esc(err.message)}. The status above is unreliable — check the terminal running Signoff.`,
+        "red"
+      );
+    }
   }
 
   function renderChrome() {
@@ -326,7 +344,7 @@
       return `<div class="section-title">Required for merge</div>
         <div class="footnote">Branch protection for <span class="code">${esc(rules.branch)}</span> isn't readable with your permissions — that endpoint needs admin. Readiness above assumes the default <span class="code">signoff</span> context.</div>`;
     }
-    if (!rules.signoffContexts.length) {
+    if (!(rules.signoffContexts || []).length) {
       const why = rules.protected
         ? `No signoff context is required on <span class="code">${esc(rules.branch)}</span>.`
         : `<span class="code">${esc(rules.branch)}</span> has no branch protection, so no signoff is required.`;

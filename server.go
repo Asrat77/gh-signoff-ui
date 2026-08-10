@@ -86,6 +86,7 @@ func (s *server) routes() *http.ServeMux {
 		defer cancel()
 
 		st := buildState(ctx, s.dir)
+		st.normalize()
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Cache-Control", "no-store")
 		_ = json.NewEncoder(w).Encode(st)
