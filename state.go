@@ -201,7 +201,7 @@ func buildState(ctx context.Context, dir string) State {
 		st.History = append(st.History, Event{
 			Name:   displayName(s.Context),
 			State:  s.State,
-			Actor:  s.Creator,
+			Actor:  actorFrom(s),
 			At:     s.CreatedAt,
 			Detail: s.Description,
 		})
@@ -211,6 +211,22 @@ func buildState(ctx context.Context, dir string) State {
 	})
 
 	return st
+}
+
+// actorFrom names who signed off.
+//
+// The combined-status API does not always populate creator — observed null on
+// statuses written by gh signoff through a user OAuth token. gh-signoff sets
+// the description to "<user> signed off", so fall back to that rather than
+// rendering an "unknown" author for a signoff that plainly has one.
+func actorFrom(s CommitStatus) string {
+	if s.Creator != "" {
+		return s.Creator
+	}
+	if name, ok := strings.CutSuffix(s.Description, " signed off"); ok && name != "" {
+		return name
+	}
+	return ""
 }
 
 // resolveChecks turns branch protection plus the statuses actually present on
@@ -253,7 +269,7 @@ func resolveChecks(signoffContexts []string, latest map[string]CommitStatus, rea
 		}
 		if s, ok := latest[cname]; ok {
 			c.State = s.State
-			c.Actor = s.Creator
+			c.Actor = actorFrom(s)
 			c.AvatarURL = s.AvatarURL
 			c.Description = s.Description
 			at := s.CreatedAt

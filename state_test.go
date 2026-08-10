@@ -206,3 +206,24 @@ func TestDemoSignoffCompletesTheRing(t *testing.T) {
 			st.Passed, st.Total, st.Ready)
 	}
 }
+
+// GitHub returned creator: null for statuses written by gh signoff through a
+// user OAuth token, which rendered the author as "unknown". gh-signoff puts
+// the name in the description instead.
+func TestActorFallsBackToDescription(t *testing.T) {
+	cases := []struct {
+		creator, desc, want string
+	}{
+		{"octocat", "Asrat signed off", "octocat"}, // creator wins
+		{"", "Asrat signed off", "Asrat"},          // observed on real data
+		{"", "", ""},
+		{"", "something else entirely", ""},
+	}
+	for _, c := range cases {
+		got := actorFrom(CommitStatus{Creator: c.creator, Description: c.desc})
+		if got != c.want {
+			t.Errorf("actorFrom(creator=%q, desc=%q) = %q, want %q",
+				c.creator, c.desc, got, c.want)
+		}
+	}
+}
