@@ -103,8 +103,25 @@
 
   // ------------------------------------------------------------- rendering
 
-  function render() {
+  // Signature of everything that affects the DOM. fetchedAt is excluded: it
+  // changes on every poll and would defeat the whole point.
+  function signature(s) {
+    return JSON.stringify(s, (k, v) => (k === "fetchedAt" ? undefined : v));
+  }
+
+  let lastSignature = null;
+
+  function render(force = false) {
     if (!state) return;
+
+    // Re-rendering replaces every node in the page, which detaches whatever
+    // the user is reaching for and drops focus and scroll with it. A poll that
+    // found no change must leave the DOM alone.
+    const sig = signature(state);
+    if (!force && sig === lastSignature) return;
+    if (busy && !force) return;
+    lastSignature = sig;
+
     try {
       renderChrome();
 
@@ -119,6 +136,7 @@
     } catch (err) {
       // A rendering bug must announce itself rather than leave a blank pane.
       console.error("render failed", err);
+      lastSignature = null; // never cache a failed render
       $("#page-dashboard").innerHTML = banner(
         `Signoff could not render this state: ${esc(err.message)}. The status above is unreliable — check the terminal running Signoff.`,
         "red"
@@ -442,7 +460,9 @@
       a.addEventListener("click", (e) => { e.preventDefault(); go(a.dataset.nav); });
     });
     const close = $("#termClose");
-    if (close) close.addEventListener("click", () => { termOpen = false; render(); });
+    // Local view state isn't part of the state signature, so this needs to
+    // force a re-render rather than be skipped as "nothing changed".
+    if (close) close.addEventListener("click", () => { termOpen = false; render(true); });
   }
 
   function log(text, cls) {
