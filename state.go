@@ -43,7 +43,8 @@ type Rules struct {
 	Branch          string   `json:"branch"`
 	Contexts        []string `json:"contexts"`        // every required context, signoff or not
 	SignoffContexts []string `json:"signoffContexts"` // just the signoff/* ones
-	Readable        bool     `json:"readable"`        // false when the API refused (needs admin)
+	Readable        bool     `json:"readable"`        // false only when the API refused (needs admin)
+	Protected       bool     `json:"protected"`       // true when the branch has protection rules at all
 	Enforced        bool     `json:"enforced"`        // true when at least one signoff context gates merge
 	InstallCommand  string   `json:"installCommand"`
 }
@@ -149,8 +150,14 @@ func buildState(ctx context.Context, dir string) State {
 		protBranch = pr.BaseRef
 	}
 
-	contexts, readable := readProtectionContexts(ctx, dir, repo.NameWithOwner, protBranch)
-	rules := Rules{Branch: protBranch, Contexts: contexts, Readable: readable}
+	contexts, protStatus := readProtectionContexts(ctx, dir, repo.NameWithOwner, protBranch)
+	readable := protStatus != ProtectionUnreadable
+	rules := Rules{
+		Branch:    protBranch,
+		Contexts:  contexts,
+		Readable:  readable,
+		Protected: protStatus == ProtectionOK,
+	}
 	for _, c := range contexts {
 		if strings.HasPrefix(c, "signoff") {
 			rules.SignoffContexts = append(rules.SignoffContexts, c)

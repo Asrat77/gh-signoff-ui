@@ -292,17 +292,36 @@ func readCommitStatuses(ctx context.Context, dir, repo, sha string) ([]CommitSta
 	return out, nil
 }
 
+// ProtectionStatus distinguishes the three outcomes of reading branch
+// protection, which GitHub unhelpfully reports with the same 404 status code:
+//
+//	{"message":"Branch not protected"} -> the branch genuinely has no rules
+//	{"message":"Not Found"}            -> the caller lacks admin, or it is gone
+//
+// Collapsing these two would either tell a repo owner their permissions are
+// wrong, or tell a contributor that nothing is required when something is.
+type ProtectionStatus int
+
+const (
+	ProtectionOK ProtectionStatus = iota
+	ProtectionAbsent
+	ProtectionUnreadable
+)
+
 // readProtectionContexts returns the required status check contexts for a
-// branch. Reading branch protection needs admin, so a 403/404 is reported as
-// "unknown" (nil, false) rather than "none required" — the distinction matters
-// because rendering "0 required" to a contributor would be a lie.
-func readProtectionContexts(ctx context.Context, dir, repo, branch string) ([]string, bool) {
+// branch, plus which of the three outcomes above occurred.
+func readProtectionContexts(ctx context.Context, dir, repo, branch string) ([]string, ProtectionStatus) {
 	var contexts []string
 	path := fmt.Sprintf("repos/%s/branches/%s/protection", repo, branch)
 	err := ghJSONIn(ctx, dir, &contexts, "api", path,
 		"--jq", "[.required_status_checks.contexts[]?]")
-	if err != nil {
-		return nil, false
+	if err == nil {
+		return contexts, ProtectionOK
 	}
-	return contexts, true
+
+	var ge *ghError
+	if errors.As(err, &ge) && strings.Contains(ge.Msg, "Branch not protected") {
+		return nil, ProtectionAbsent
+	}
+	return nil, ProtectionUnreadable
 }

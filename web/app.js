@@ -180,9 +180,12 @@
     html += headerBlock(pr);
 
     if (rules.readable && !rules.enforced) {
+      const why = rules.protected
+        ? `Branch protection on <code class="cmd-chip">${esc(rules.branch)}</code> exists but doesn't require a signoff`
+        : `<code class="cmd-chip">${esc(rules.branch)}</code> has no branch protection`;
       html += banner(
-        `Branch protection on <code class="cmd-chip">${esc(rules.branch)}</code> does not require a signoff, so nothing here blocks a merge. ` +
-        `Run <code class="cmd-chip">gh signoff install</code> to make it a requirement.`
+        `${why}, so nothing here blocks a merge. ` +
+        `Run <code class="cmd-chip">gh signoff install</code> to make signoff a requirement.`
       );
     }
 
@@ -324,8 +327,10 @@
         <div class="footnote">Branch protection for <span class="code">${esc(rules.branch)}</span> isn't readable with your permissions — that endpoint needs admin. Readiness above assumes the default <span class="code">signoff</span> context.</div>`;
     }
     if (!rules.signoffContexts.length) {
-      return `<div class="section-title">Required for merge</div>
-        <div class="footnote">No signoff context is required on <span class="code">${esc(rules.branch)}</span>.</div>`;
+      const why = rules.protected
+        ? `No signoff context is required on <span class="code">${esc(rules.branch)}</span>.`
+        : `<span class="code">${esc(rules.branch)}</span> has no branch protection, so no signoff is required.`;
+      return `<div class="section-title">Required for merge</div><div class="footnote">${why}</div>`;
     }
     const chips = rules.signoffContexts
       .map((c) => `<span class="code">${esc(c.replace(/^signoff\//, ""))}</span>`)
