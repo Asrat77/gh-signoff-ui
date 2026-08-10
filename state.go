@@ -185,73 +185,12 @@ func buildState(ctx context.Context, dir string) State {
 		}
 	}
 
-	required := map[string]bool{}
-	if readable {
-		for _, c := range rules.SignoffContexts {
-			required[c] = true
-		}
-	} else {
-		required["signoff"] = true
+	if !readable {
 		st.Warning = "Branch protection isn't readable with your permissions, so required checks are assumed. Readiness may not match what GitHub enforces."
 	}
 
-	seen := map[string]bool{}
-	var checks []Check
-	add := func(cname string) {
-		if seen[cname] {
-			return
-		}
-		seen[cname] = true
-		name := displayName(cname)
-		c := Check{
-			Context:  cname,
-			Name:     name,
-			Category: categoryFor(name),
-			State:    "absent",
-			Required: required[cname],
-			Command:  signoffCommand(cname),
-		}
-		if s, ok := latest[cname]; ok {
-			c.State = s.State
-			c.Actor = s.Creator
-			c.AvatarURL = s.AvatarURL
-			c.Description = s.Description
-			at := s.CreatedAt
-			c.At = &at
-		}
-		checks = append(checks, c)
-	}
-
-	for _, c := range rules.SignoffContexts {
-		add(c)
-	}
-	if !readable {
-		add("signoff")
-	}
-	for c := range latest {
-		add(c) // signed off but not required — still worth showing
-	}
-
-	sort.SliceStable(checks, func(i, j int) bool {
-		if checks[i].Required != checks[j].Required {
-			return checks[i].Required
-		}
-		return checks[i].Name < checks[j].Name
-	})
-	st.Checks = checks
-
-	for _, c := range checks {
-		if !c.Required {
-			continue
-		}
-		st.Total++
-		if c.State == "success" {
-			st.Passed++
-		} else if st.Blocking == "" {
-			st.Blocking = c.Name
-		}
-	}
-	st.Ready = st.Total > 0 && st.Passed == st.Total
+	st.Checks = resolveChecks(rules.SignoffContexts, latest, readable)
+	st.Passed, st.Total, st.Blocking, st.Ready = tally(st.Checks)
 
 	// History is real: /statuses returns every status ever posted to this SHA,
 	// including re-signoffs and failures, newest first.
@@ -272,6 +211,101 @@ func buildState(ctx context.Context, dir string) State {
 	})
 
 	return st
+}
+
+// resolveChecks turns branch protection plus the statuses actually present on
+// a commit into the rows the dashboard shows.
+//
+// Required membership comes from protection when it is readable. When it is
+// not, it falls back to gh-signoff's own assumption that the bare "signoff"
+// context is required, which is the safest guess: it reports "not ready" for
+// a commit that might in fact be mergeable, rather than the reverse.
+//
+// Contexts signed off but not required are included and marked not-required,
+// so a stray or newly removed context stays visible instead of disappearing.
+func resolveChecks(signoffContexts []string, latest map[string]CommitStatus, readable bool) []Check {
+	required := map[string]bool{}
+	if readable {
+		for _, c := range signoffContexts {
+			required[c] = true
+		}
+	} else {
+		required["signoff"] = true
+	}
+
+	seen := map[string]bool{}
+	checks := []Check{}
+
+	add := func(cname string) {
+		if seen[cname] {
+			return
+		}
+		seen[cname] = true
+
+		name := displayName(cname)
+		c := Check{
+			Context:  cname,
+			Name:     name,
+			Category: categoryFor(name),
+			State:    "absent",
+			Required: required[cname],
+			Command:  signoffCommand(cname),
+		}
+		if s, ok := latest[cname]; ok {
+			c.State = s.State
+			c.Actor = s.Creator
+			c.AvatarURL = s.AvatarURL
+			c.Description = s.Description
+			at := s.CreatedAt
+			c.At = &at
+		}
+		checks = append(checks, c)
+	}
+
+	if readable {
+		for _, c := range signoffContexts {
+			add(c)
+		}
+	} else {
+		add("signoff")
+	}
+
+	// Map iteration order is random, so collect and sort before adding.
+	extra := make([]string, 0, len(latest))
+	for c := range latest {
+		if !seen[c] {
+			extra = append(extra, c)
+		}
+	}
+	sort.Strings(extra)
+	for _, c := range extra {
+		add(c)
+	}
+
+	sort.SliceStable(checks, func(i, j int) bool {
+		if checks[i].Required != checks[j].Required {
+			return checks[i].Required
+		}
+		return checks[i].Name < checks[j].Name
+	})
+	return checks
+}
+
+// tally counts only required checks: an optional context that happens to be
+// green must never make a blocked PR look ready.
+func tally(checks []Check) (passed, total int, blocking string, ready bool) {
+	for _, c := range checks {
+		if !c.Required {
+			continue
+		}
+		total++
+		if c.State == "success" {
+			passed++
+		} else if blocking == "" {
+			blocking = c.Name
+		}
+	}
+	return passed, total, blocking, total > 0 && passed == total
 }
 
 // normalize guarantees every slice marshals as [] rather than null.
