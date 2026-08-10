@@ -83,13 +83,13 @@ func notFound(err error) bool {
 // dashboard at all. The UI renders a specific remedy for each false flag
 // rather than a generic error screen.
 type Environment struct {
-	GhInstalled     bool   `json:"ghInstalled"`
-	GhVersion       string `json:"ghVersion"`
-	Authenticated   bool   `json:"authenticated"`
-	Login           string `json:"login"`
-	InGitRepo       bool   `json:"inGitRepo"`
-	SignoffInstalled bool  `json:"signoffInstalled"`
-	SignoffVersion  string `json:"signoffVersion"`
+	GhInstalled      bool   `json:"ghInstalled"`
+	GhVersion        string `json:"ghVersion"`
+	Authenticated    bool   `json:"authenticated"`
+	Login            string `json:"login"`
+	InGitRepo        bool   `json:"inGitRepo"`
+	SignoffInstalled bool   `json:"signoffInstalled"`
+	SignoffVersion   string `json:"signoffVersion"`
 }
 
 func probeEnvironment(ctx context.Context, dir string) Environment {
@@ -201,13 +201,13 @@ func readRepo(ctx context.Context, dir string) (RepoInfo, error) {
 }
 
 type PRInfo struct {
-	Number   int    `json:"number"`
-	Title    string `json:"title"`
-	Author   string `json:"author"`
-	URL      string `json:"url"`
-	State    string `json:"state"`
-	HeadSHA  string `json:"headSha"`
-	BaseRef  string `json:"baseRef"`
+	Number    int    `json:"number"`
+	Title     string `json:"title"`
+	Author    string `json:"author"`
+	URL       string `json:"url"`
+	State     string `json:"state"`
+	HeadSHA   string `json:"headSha"`
+	BaseRef   string `json:"baseRef"`
 	Mergeable string `json:"mergeable"`
 }
 
@@ -222,9 +222,9 @@ func readPR(ctx context.Context, dir string) (*PRInfo, error) {
 		Author struct {
 			Login string `json:"login"`
 		} `json:"author"`
-		HeadRefOid   string `json:"headRefOid"`
-		BaseRefName  string `json:"baseRefName"`
-		Mergeable    string `json:"mergeable"`
+		HeadRefOid  string `json:"headRefOid"`
+		BaseRefName string `json:"baseRefName"`
+		Mergeable   string `json:"mergeable"`
 	}
 	err := ghJSONIn(ctx, dir, &raw, "pr", "view", "--json",
 		"number,title,url,state,author,headRefOid,baseRefName,mergeable")

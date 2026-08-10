@@ -23,19 +23,19 @@ type Check struct {
 
 // State is the whole payload the dashboard renders from.
 type State struct {
-	Env      Environment `json:"env"`
-	Repo     RepoInfo    `json:"repo"`
-	PR       *PRInfo     `json:"pr"`
-	Checks   []Check     `json:"checks"`
-	History  []Event     `json:"history"`
-	Rules    Rules       `json:"rules"`
-	Passed   int         `json:"passed"`
-	Total    int         `json:"total"`
-	Ready    bool        `json:"ready"`
-	Blocking string      `json:"blocking"` // display name of the first unmet required check
-	Warning  string      `json:"warning"`  // non-fatal caveat shown under the header
-	Error    string      `json:"error"`
-	FetchedAt time.Time  `json:"fetchedAt"`
+	Env       Environment `json:"env"`
+	Repo      RepoInfo    `json:"repo"`
+	PR        *PRInfo     `json:"pr"`
+	Checks    []Check     `json:"checks"`
+	History   []Event     `json:"history"`
+	Rules     Rules       `json:"rules"`
+	Passed    int         `json:"passed"`
+	Total     int         `json:"total"`
+	Ready     bool        `json:"ready"`
+	Blocking  string      `json:"blocking"` // display name of the first unmet required check
+	Warning   string      `json:"warning"`  // non-fatal caveat shown under the header
+	Error     string      `json:"error"`
+	FetchedAt time.Time   `json:"fetchedAt"`
 }
 
 // Rules describes what branch protection actually requires.
@@ -51,11 +51,11 @@ type Rules struct {
 
 // Event is one entry of real signoff activity.
 type Event struct {
-	Name      string    `json:"name"`
-	State     string    `json:"state"`
-	Actor     string    `json:"actor"`
-	At        time.Time `json:"at"`
-	Detail    string    `json:"detail"`
+	Name   string    `json:"name"`
+	State  string    `json:"state"`
+	Actor  string    `json:"actor"`
+	At     time.Time `json:"at"`
+	Detail string    `json:"detail"`
 }
 
 // displayName mirrors gh-signoff's own rendering: "signoff/tests" shows as
