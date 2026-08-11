@@ -22,6 +22,7 @@ let popover = null;
 let settings = null;
 let quitting = false;
 let statusTimer = null;
+let trayRefreshInFlight = false;
 let currentStatus = "neutral";
 const ownsInstanceLock = app.requestSingleInstanceLock();
 
@@ -204,10 +205,14 @@ function trustedGitHubURL(value) {
 }
 
 async function refreshTrayStatus() {
-  if (!backendInfo || !tray) return;
+  if (!backendInfo || !tray || trayRefreshInFlight) return;
+  trayRefreshInFlight = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 30_000);
   try {
     const response = await fetch(new URL("/api/product", backendInfo.url), {
       headers: { "X-Signoff-Token": backendInfo.token },
+      signal: controller.signal,
     });
     if (!response.ok) return;
     const product = await response.json();
@@ -218,6 +223,9 @@ async function refreshTrayStatus() {
   } catch {
     tray.setImage(trayIcon("neutral"));
     tray.setToolTip("Signoff — local service unavailable");
+  } finally {
+    clearTimeout(timeout);
+    trayRefreshInFlight = false;
   }
 }
 

@@ -6,6 +6,7 @@ async function resetDemo(page) {
     const token = window.SIGNOFF.token;
     await fetch("/api/refresh", { method: "POST", headers: { "X-Signoff-Token": token } });
   });
+  await page.reload();
   await expect(page.locator(".popover-shell")).toBeVisible();
 }
 
@@ -44,13 +45,14 @@ test.describe("Signoff product surfaces", () => {
     await resetDemo(page);
 
     await page.getByRole("button", { name: /Add label-based partial signoff/ }).click();
-    await page.keyboard.press("Meta+K");
+    await page.keyboard.press("ControlOrMeta+K");
     await page.getByRole("textbox", { name: "Search actions and pull requests" }).fill("rns482");
     await expect(page.getByRole("option", { name: /Run security on #482/ })).toBeVisible();
   });
 
   test("covers every settings surface", async ({ page }) => {
     await page.setViewportSize({ width: 960, height: 720 });
+    await resetDemo(page);
     await page.goto("/?surface=settings&tab=repositories");
     await expect(page.getByRole("heading", { name: "Tracked repositories" })).toBeVisible();
 
