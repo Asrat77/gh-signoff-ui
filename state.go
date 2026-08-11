@@ -9,16 +9,18 @@ import (
 
 // Check is one signoff context resolved against the current commit.
 type Check struct {
-	Context     string     `json:"context"` // "signoff" or "signoff/tests"
-	Name        string     `json:"name"`    // display name: "signoff" or "tests"
-	Category    string     `json:"category"`
-	State       string     `json:"state"` // success | failure | error | pending | absent
-	Required    bool       `json:"required"`
-	Actor       string     `json:"actor"`
-	AvatarURL   string     `json:"avatarUrl"`
-	At          *time.Time `json:"at"`
-	Description string     `json:"description"`
-	Command     string     `json:"command"` // the exact CLI command that signs this off
+	Context      string     `json:"context"` // "signoff" or "signoff/tests"
+	Name         string     `json:"name"`    // display name: "signoff" or "tests"
+	Category     string     `json:"category"`
+	State        string     `json:"state"` // success | failure | error | pending | absent
+	Required     bool       `json:"required"`
+	Actor        string     `json:"actor"`
+	AvatarURL    string     `json:"avatarUrl"`
+	At           *time.Time `json:"at"`
+	Description  string     `json:"description"`
+	Command      string     `json:"command"` // the exact CLI command that signs this off
+	LocalCommand string     `json:"localCommand"`
+	Configured   bool       `json:"configured"`
 }
 
 // State is the whole payload the dashboard renders from.
@@ -65,6 +67,10 @@ func displayName(ctx string) string {
 		return "signoff"
 	}
 	return strings.TrimPrefix(ctx, "signoff/")
+}
+
+func isSignoffContext(ctx string) bool {
+	return ctx == "signoff" || strings.HasPrefix(ctx, "signoff/")
 }
 
 // categoryFor drives badge color only. v1 ships three known categories and
@@ -159,7 +165,7 @@ func buildState(ctx context.Context, dir string) State {
 		Protected: protStatus == ProtectionOK,
 	}
 	for _, c := range contexts {
-		if strings.HasPrefix(c, "signoff") {
+		if isSignoffContext(c) {
 			rules.SignoffContexts = append(rules.SignoffContexts, c)
 		}
 	}
@@ -177,7 +183,7 @@ func buildState(ctx context.Context, dir string) State {
 	// not rely on that.
 	latest := map[string]CommitStatus{}
 	for _, s := range statuses {
-		if !strings.HasPrefix(s.Context, "signoff") {
+		if !isSignoffContext(s.Context) {
 			continue
 		}
 		if prev, ok := latest[s.Context]; !ok || s.CreatedAt.After(prev.CreatedAt) {
@@ -195,7 +201,7 @@ func buildState(ctx context.Context, dir string) State {
 	// History is real: /statuses returns every status ever posted to this SHA,
 	// including re-signoffs and failures, newest first.
 	for _, s := range statuses {
-		if !strings.HasPrefix(s.Context, "signoff") {
+		if !isSignoffContext(s.Context) {
 			continue
 		}
 		st.History = append(st.History, Event{
