@@ -1,4 +1,10 @@
+.superdesign/tmp/
 gh-signoff-ui
-dist/
 *.test
 .DS_Store
+node_modules/
+dist/
+desktop/bin/*
+!desktop/bin/.gitkeep
+test-results/
+playwright-report/
