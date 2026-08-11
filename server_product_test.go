@@ -71,6 +71,16 @@ func TestProductAPIRejectsTokenInURLAndForeignOrigins(t *testing.T) {
 	}
 }
 
+func TestValidBranchNameRejectsLeadingDash(t *testing.T) {
+	dir := t.TempDir()
+	if validBranchName(context.Background(), dir, "--force") {
+		t.Fatal("branch names beginning with a dash must be rejected")
+	}
+	if !validBranchName(context.Background(), dir, "feature/safe") {
+		t.Fatal("valid branch name was rejected")
+	}
+}
+
 func TestProductAPIAndDemoRunFlow(t *testing.T) {
 	srv, ts := newDemoServerForTest(t)
 	defer ts.Close()
