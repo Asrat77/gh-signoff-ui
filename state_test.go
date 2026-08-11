@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 )
@@ -225,5 +227,66 @@ func TestActorFallsBackToDescription(t *testing.T) {
 			t.Errorf("actorFrom(creator=%q, desc=%q) = %q, want %q",
 				c.creator, c.desc, got, c.want)
 		}
+	}
+}
+
+func TestProductSummaryUsesWorstPullRequestState(t *testing.T) {
+	prs := []PullRequestState{
+		{Status: "ready"},
+		{Status: "attention"},
+		{Status: "failing"},
+	}
+	got := summarizePullRequests(prs)
+	if got.TotalPullRequests != 3 || got.Ready != 1 || got.NeedsAttention != 2 || got.Failing != 1 {
+		t.Fatalf("unexpected summary: %+v", got)
+	}
+	if got.Status != "failing" {
+		t.Fatalf("status = %q, want failing", got.Status)
+	}
+}
+
+func TestDemoProductCoversAllPopoverStates(t *testing.T) {
+	state := buildDemoProductState()
+	state.normalize()
+	if len(state.Repositories) < 2 || len(state.PullRequests) < 3 {
+		t.Fatalf("demo needs multiple repositories and PRs: %+v", state.Summary)
+	}
+	want := map[string]bool{"attention": false, "failing": false, "ready": false}
+	for _, pr := range state.PullRequests {
+		want[pr.Status] = true
+	}
+	for status, found := range want {
+		if !found {
+			t.Errorf("demo missing %s PR", status)
+		}
+	}
+}
+
+func TestMergeSignoffContextsPreservesExternalChecks(t *testing.T) {
+	got := mergeSignoffContexts(
+		[]string{"ci/build", "signoff/lint", "signoff-ci", "ci/build"},
+		[]string{"signoff/tests"},
+	)
+	want := []string{"ci/build", "signoff-ci", "signoff/tests"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("merged contexts = %#v, want %#v", got, want)
+	}
+}
+
+func TestRunRequiresThePullRequestCommitToBeCheckedOut(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	if _, stderr, code, err := runIn(ctx, dir, "git", "init", "-q"); err != nil || code != 0 {
+		t.Fatalf("git init: %v (%s)", err, stderr)
+	}
+	if _, stderr, code, err := runIn(ctx, dir, "git", "-c", "user.name=Signoff Test", "-c", "user.email=signoff@example.test", "commit", "--allow-empty", "-qm", "initial"); err != nil || code != 0 {
+		t.Fatalf("git commit: %v (%s)", err, stderr)
+	}
+	sha, _, _, _ := runIn(ctx, dir, "git", "rev-parse", "HEAD")
+	if err := requireCheckedOutCommit(ctx, dir, sha); err != nil {
+		t.Fatalf("matching commit was rejected: %v", err)
+	}
+	if err := requireCheckedOutCommit(ctx, dir, "0000000000000000000000000000000000000000"); err == nil {
+		t.Fatal("mismatched commit should be rejected")
 	}
 }

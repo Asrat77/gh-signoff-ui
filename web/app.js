@@ -1,678 +1,631 @@
-/* Signoff — front end.
-   Reads real state from the Go process, which reads it from the GitHub API.
-   Nothing here fabricates state: if a value is unknown it renders as unknown. */
-
 (() => {
   "use strict";
 
   const TOKEN = window.SIGNOFF.token;
   const READ_ONLY = window.SIGNOFF.readOnly;
+  const desktop = window.signoffDesktop || null;
+  const params = new URLSearchParams(location.search);
+  const surface = params.get("surface") || "popover";
+  document.body.dataset.surface = surface;
 
-  let state = null;
-  let page = "dashboard";
-  let termLines = [];
-  let termOpen = false;
-  let busy = false;
+  const app = document.querySelector("#app");
+  const paletteOverlay = document.querySelector("#paletteOverlay");
+  const paletteInput = document.querySelector("#paletteInput");
+  const paletteResults = document.querySelector("#paletteResults");
+  const toast = document.querySelector("#toast");
 
-  const $ = (sel) => document.querySelector(sel);
-  const esc = (s) =>
-    String(s ?? "").replace(/[&<>"']/g, (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])
-    );
+  let product = null;
+  let loading = true;
+  let loadError = "";
+  let selectedPRID = null;
+  let filter = "attention";
+  let settingsTab = params.get("tab") || "repositories";
+  let selectedSettingsRepoID = null;
+  let terminal = { open: false, running: false, phase: "", lines: [], prID: "", check: "" };
+  let paletteActions = [];
+  let paletteIndex = 0;
+  let pollTimer = null;
 
-  const announce = (msg) => { $("#live").textContent = msg; };
+  const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[char]);
 
-  // ---------------------------------------------------------------- helpers
-
-  function relTime(iso) {
-    if (!iso) return "";
-    const then = new Date(iso).getTime();
-    if (Number.isNaN(then)) return "";
-    const secs = Math.round((Date.now() - then) / 1000);
-    if (secs < 45) return "just now";
-    if (secs < 90) return "1m ago";
-    if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
-    if (secs < 86400) return `${Math.round(secs / 3600)}h ago`;
-    if (secs < 604800) return `${Math.round(secs / 86400)}d ago`;
-    return new Date(iso).toLocaleDateString();
-  }
-
-  function clockTime(iso) {
-    const d = new Date(iso);
-    if (Number.isNaN(d.getTime())) return "";
-    const today = new Date();
-    const sameDay = d.toDateString() === today.toDateString();
-    return sameDay
-      ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
-      : d.toLocaleDateString([], { month: "short", day: "numeric" });
-  }
-
-  const ICONS = {
-    tests: '<path d="M9 16.2L4.8 12l-1.4 1.4L9 19 21 7l-1.4-1.4z"/>',
-    lint: '<path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/>',
-    security: '<path d="M12 2l8 4v6c0 5-3.5 9-8 10-4.5-1-8-5-8-10V6l8-4z"/>',
-    default: '<path d="M12 2l2.9 6.2 6.8.9-5 4.7 1.3 6.7L12 17.3 5.9 20.5 7.2 13.8l-5-4.7 6.8-.9z"/>',
-    alt1: '<circle cx="12" cy="12" r="9"/>',
-    alt2: '<rect x="4" y="4" width="16" height="16" rx="3"/>',
-    alt3: '<path d="M12 3l9 16H3z"/>',
-  };
-
-  const CHECK_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M5 13l4 4L19 7"/></svg>';
-  const X_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M6 6l12 12M18 6L6 18"/></svg>';
-  const DOT_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="9"/></svg>';
-  const SPIN_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><path d="M12 3a9 9 0 1 0 9 9"/></svg>';
-  const WARN_SVG =
-    '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><path d="M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>';
-
-  function badge(category) {
-    const glyph = ICONS[category] || ICONS.default;
-    return `<span class="cat-badge ${esc(category)}"><svg viewBox="0 0 24 24" fill="#fff">${glyph}</svg></span>`;
-  }
-
-  // ------------------------------------------------------------------- data
-
-  async function fetchState() {
-    const dot = $("#refreshDot");
-    dot.classList.add("busy");
-
-    let next;
-    try {
-      const res = await fetch("/api/state", { headers: { "X-Signoff-Token": TOKEN } });
-      if (!res.ok) throw new Error(`state request failed: ${res.status}`);
-      next = await res.json();
-      dot.classList.remove("stale");
-      dot.title = "Live";
-    } catch (err) {
-      dot.classList.add("stale");
-      dot.title = `Could not refresh: ${err.message}`;
-      return;
-    } finally {
-      dot.classList.remove("busy");
-    }
-
-    // Rendering is deliberately outside the fetch's try block. Catching render
-    // errors alongside network errors once turned a null-dereference into a
-    // silent blank page wearing a "could not refresh" tooltip.
-    state = next;
-    render();
-  }
-
-  // ------------------------------------------------------------- rendering
-
-  // Signature of everything that affects the DOM. fetchedAt is excluded: it
-  // changes on every poll and would defeat the whole point.
-  function signature(s) {
-    return JSON.stringify(s, (k, v) => (k === "fetchedAt" ? undefined : v));
-  }
-
-  let lastSignature = null;
-
-  function render(force = false) {
-    if (!state) return;
-
-    // Re-rendering replaces every node in the page, which detaches whatever
-    // the user is reaching for and drops focus and scroll with it. A poll that
-    // found no change must leave the DOM alone.
-    const sig = signature(state);
-    if (!force && sig === lastSignature) return;
-    if (busy && !force) return;
-    lastSignature = sig;
-
-    try {
-      renderChrome();
-
-      const env = state.env;
-      const blocked = !env.ghInstalled || !env.authenticated || !env.inGitRepo;
-
-      $("#page-dashboard").innerHTML = blocked ? setupScreen(env) : dashboard();
-      $("#page-history").innerHTML = blocked ? setupScreen(env) : historyPage();
-      $("#page-rules").innerHTML = blocked ? setupScreen(env) : rulesPage();
-
-      wireDashboard();
-    } catch (err) {
-      // A rendering bug must announce itself rather than leave a blank pane.
-      console.error("render failed", err);
-      lastSignature = null; // never cache a failed render
-      $("#page-dashboard").innerHTML = banner(
-        `Signoff could not render this state: ${esc(err.message)}. The status above is unreliable — check the terminal running Signoff.`,
-        "red"
-      );
-    }
-  }
-
-  function renderChrome() {
-    const repo = state.repo || {};
-    const name = repo.nameWithOwner || "—";
-    const short = name.split("/").pop() || name;
-    $("#repoName").textContent = short;
-    $("#repoName").title = name;
-    $("#repoBranch").textContent = repo.currentBranch || "";
-    $("#repoInitials").textContent = short.slice(0, 2);
-    $("#repoPicker").onclick = () => {
-      if (repo.nameWithOwner) window.open(`https://github.com/${repo.nameWithOwner}`, "_blank", "noopener");
+  function icon(name, cls = "") {
+    const paths = {
+      brand: '<path d="M7 4v7a4 4 0 0 0 4 4h2"/><circle cx="7" cy="4" r="2"/><circle cx="15" cy="15" r="2"/><path d="M15 13V8"/><circle cx="15" cy="6" r="2"/>',
+      refresh: '<path d="M20 11a8.1 8.1 0 0 0-15.5-2M4 4v5h5"/><path d="M4 13a8.1 8.1 0 0 0 15.5 2M20 20v-5h-5"/>',
+      settings: '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6 1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/>',
+      back: '<path d="m15 18-6-6 6-6"/>',
+      folder: '<path d="M3 7h6l2 2h10v10H3z"/><path d="M3 7V5h6l2 2"/>',
+      terminal: '<path d="m5 7 4 4-4 4"/><path d="M11 17h8"/>',
+      external: '<path d="M14 3h7v7"/><path d="m10 14 11-11"/><path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"/>',
+      plus: '<path d="M12 5v14M5 12h14"/>',
+      history: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/><path d="M12 7v5l3 2"/>',
+      repo: '<path d="M4 4h16v16H4z"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+      check: '<path d="m5 12 4 4L19 6"/>',
+      x: '<path d="m6 6 12 12M18 6 6 18"/>',
+      shield: '<path d="M12 3 20 7v5c0 5-3.5 8-8 9-4.5-1-8-4-8-9V7z"/>',
+      bolt: '<path d="m13 2-9 12h7l-1 8 10-12h-7z"/>',
+      test: '<path d="m5 12 4 4L19 6"/>',
+      command: '<path d="M9 6v12M15 6v12M6 9h12M6 15h12"/>',
     };
-
-    const v = state.env.signoffVersion ? `gh-signoff ${esc(state.env.signoffVersion)}` : "";
-    $("#versionLine").innerHTML = v;
-
-    $("#navCount").textContent = state.total ? `${state.passed}/${state.total}` : "";
+    return `<svg class="${esc(cls)}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.command}</svg>`;
   }
 
-  function setupScreen(env) {
-    if (!env.ghInstalled) {
-      return empty(
-        "GitHub CLI not found",
-        "Signoff drives the <code>gh</code> command, so it needs to be installed and on your PATH.",
-        "brew install gh"
-      );
+  function categoryIcon(category) {
+    const name = category === "tests" ? "test" : category === "lint" ? "bolt" : category === "security" ? "shield" : "command";
+    return `<span class="category ${esc(category)}">${icon(name)}</span>`;
+  }
+
+  function relativeTime(value) {
+    if (!value) return "";
+    const milliseconds = Date.now() - new Date(value).getTime();
+    if (!Number.isFinite(milliseconds)) return "";
+    const minutes = Math.max(0, Math.round(milliseconds / 60000));
+    if (minutes < 1) return "now";
+    if (minutes < 60) return `${minutes}m`;
+    const hours = Math.round(minutes / 60);
+    if (hours < 24) return `${hours}h`;
+    return `${Math.round(hours / 24)}d`;
+  }
+
+  function formatDate(value) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return "—";
+    return date.toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  }
+
+  async function api(path, options = {}) {
+    const headers = new Headers(options.headers || {});
+    headers.set("X-Signoff-Token", TOKEN);
+    if (options.body && !headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    const response = await fetch(path, { ...options, headers });
+    if (!response.ok) {
+      const message = (await response.text()).trim() || `${response.status} ${response.statusText}`;
+      throw new Error(message);
     }
-    if (!env.authenticated) {
-      return empty(
-        "Not signed in to GitHub",
-        "Authenticate the CLI once and this window picks it up — Signoff never handles your token itself.",
-        "gh auth login"
-      );
-    }
-    return empty(
-      "Not a git repository",
-      "Start Signoff from inside a repository, or point it at one with the <code>-dir</code> flag.",
-      "cd path/to/repo && gh signoff-ui"
-    );
+    if (response.status === 204) return null;
+    return response.json();
   }
 
-  function empty(title, body, cmd) {
-    return `<div class="empty">
-      <h3>${esc(title)}</h3>
-      <p>${body}</p>
-      ${cmd ? `<code class="cmd-chip">${esc(cmd)}</code>` : ""}
-    </div>`;
-  }
-
-  function banner(text, kind = "amber") {
-    return `<div class="banner ${kind === "red" ? "red" : ""}">${WARN_SVG}<span>${text}</span></div>`;
-  }
-
-  function dashboard() {
-    const { pr, repo, checks, rules } = state;
-    let html = "";
-
-    if (state.error) return banner(esc(state.error), "red") + extensionNotice();
-    if (state.warning) html += banner(esc(state.warning));
-    html += extensionNotice();
-
-    if (!pr) {
-      html += `<div class="empty">
-        <h3>No pull request for <code class="cmd-chip">${esc(repo.currentBranch || "this branch")}</code></h3>
-        <p>Signoff follows the PR for your current branch. Open one and this fills in — signoff status still applies to the commit either way.</p>
-        <code class="cmd-chip">gh pr create</code>
-      </div>`;
-      return html;
-    }
-
-    html += headerBlock(pr);
-
-    if (rules.readable && !rules.enforced) {
-      const why = rules.protected
-        ? `Branch protection on <code class="cmd-chip">${esc(rules.branch)}</code> exists but doesn't require a signoff`
-        : `<code class="cmd-chip">${esc(rules.branch)}</code> has no branch protection`;
-      html += banner(
-        `${why}, so nothing here blocks a merge. ` +
-        `Run <code class="cmd-chip">gh signoff install</code> to make signoff a requirement.`
-      );
-    }
-
-    html += checksTable(checks);
-    html += terminalBlock();
-    html += footnoteBlock(rules);
-    return html;
-  }
-
-  function extensionNotice() {
-    if (state.env.signoffInstalled) return "";
-    return banner(
-      "The <code class=\"cmd-chip\">gh-signoff</code> extension isn't installed, so signing off from this window will fail. " +
-      "Status shown here is read straight from GitHub and is still accurate. " +
-      "<code class=\"cmd-chip\">gh extension install basecamp/gh-signoff</code>"
-    );
-  }
-
-  function headerBlock(pr) {
-    const total = state.total || 0;
-    const passed = state.passed || 0;
-    const pct = total ? passed / total : 0;
-    const R = 34, C = 2 * Math.PI * R;
-    const offset = C - pct * C;
-    const ringColor = total === 0 ? "var(--mute)" : state.ready ? "var(--green)" : "var(--amber)";
-
-    let pill;
-    if (total === 0) {
-      pill = `<span class="status-pill grey">${DOT_SVG} No signoff required</span>`;
-    } else if (state.ready) {
-      pill = `<span class="status-pill green">${CHECK_SVG} Ready to merge</span>`;
-    } else if (checksHaveFailure()) {
-      pill = `<span class="status-pill red">${X_SVG} ${esc(failingName())} failed</span>`;
-    } else {
-      pill = `<span class="status-pill amber">${DOT_SVG} Waiting on ${esc(state.blocking || "signoff")}</span>`;
-    }
-
-    // Blue appears exactly once per screen, and only when it is actionable.
-    const merge = state.ready
-      ? `<a class="btn blue merge-cta" href="${esc(pr.url)}" target="_blank" rel="noopener">
-           Merge pull request
-           <svg viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
-         </a>`
-      : "";
-
-    return `<div class="dash-head">
-      <div style="min-width:0">
-        <h1 class="pr-title"><a href="${esc(pr.url)}" target="_blank" rel="noopener">${esc(pr.title)}</a></h1>
-        <div class="pr-sub">
-          PR #${esc(pr.number)} · ${esc(state.repo.nameWithOwner)} · opened by ${esc(pr.author || "unknown")}
-          · into <code class="cmd-chip">${esc(pr.baseRef)}</code>
-        </div>
-        <div class="status-line">${pill}${merge}</div>
-      </div>
-      <div class="ring-wrap" role="img" aria-label="${passed} of ${total} required checks signed off">
-        <svg width="80" height="80" viewBox="0 0 80 80">
-          <circle class="ring-track" cx="40" cy="40" r="${R}" fill="none" stroke-width="8"/>
-          <circle cx="40" cy="40" r="${R}" fill="none" stroke="${ringColor}" stroke-width="8"
-                  stroke-linecap="round" stroke-dasharray="${C.toFixed(1)}" stroke-dashoffset="${offset.toFixed(1)}"
-                  style="transition:stroke-dashoffset .6s ease, stroke .3s ease"/>
-        </svg>
-        <div class="ring-center">
-          <div class="num">${passed}/${total}</div>
-          <div class="lbl">signed off</div>
-        </div>
-      </div>
-    </div>`;
-  }
-
-  const checksHaveFailure = () =>
-    (state.checks || []).some((c) => c.required && (c.state === "failure" || c.state === "error"));
-  const failingName = () =>
-    ((state.checks || []).find((c) => c.required && (c.state === "failure" || c.state === "error")) || {}).name || "";
-
-  function checksTable(checks) {
-    if (!checks || !checks.length) {
-      return `<div class="empty">
-        <h3>No signoff contexts yet</h3>
-        <p>Nothing on this commit and nothing required by branch protection.</p>
-        <code class="cmd-chip">gh signoff install</code>
-      </div>`;
-    }
-
-    const rows = checks.map((c) => {
-      let chip;
-      if (c.state === "success") {
-        chip = `<span class="status-chip pass">${CHECK_SVG}${esc(relTime(c.at))}</span>`;
-      } else if (c.state === "failure" || c.state === "error") {
-        chip = `<span class="status-chip fail">${X_SVG}${esc(c.description || "failed")}</span>`;
-      } else if (c.state === "pending") {
-        chip = `<span class="status-chip spin">${SPIN_SVG}pending</span>`;
-      } else {
-        chip = `<span class="status-chip pending">not signed off</span>`;
-      }
-
-      const signedOff = c.state === "success";
-      const action = signedOff
-        ? `<button class="btn ghost" type="button" data-copy="${esc(c.command)}">Copy command</button>`
-        : `<button class="btn primary" type="button" data-signoff="${esc(c.name === "signoff" ? "" : c.name)}">Sign off</button>`;
-
-      const who = c.actor ? ` · by ${esc(c.actor)}` : "";
-
-      return `<div class="chk-row ${c.required ? "" : "not-required"}" data-key="${esc(c.name)}">
-        <div class="chk-id">
-          ${badge(c.category)}
-          <div class="chk-meta">
-            <div class="name">${esc(c.name)}${c.required ? "" : '<span class="tag-optional">not required</span>'}</div>
-            <div class="sub mono" title="${esc(c.command)}">${esc(c.command)}${who}</div>
-          </div>
-        </div>
-        ${chip}
-        <div class="chk-actions">${action}</div>
-      </div>`;
-    });
-
-    return `<div class="checks-card">
-      <div class="chk-head"><div>Check</div><div>Status</div><div></div></div>
-      ${rows.join("")}
-    </div>`;
-  }
-
-  function terminalBlock() {
-    const body = termLines
-      .map((l) => `<div class="${l.cls || ""}">${esc(l.text)}</div>`)
-      .join("");
-    return `<div class="term-wrap ${termOpen ? "open" : ""}" id="termWrap">
-      <div class="term-head">
-        <span>Command output</span>
-        <span class="spacer"></span>
-        <button class="btn ghost" type="button" id="termClose">Hide</button>
-      </div>
-      <div class="term" id="term">${body}</div>
-    </div>`;
-  }
-
-  function footnoteBlock(rules) {
-    if (!rules.readable) {
-      return `<div class="section-title">Required for merge</div>
-        <div class="footnote">Branch protection for <span class="code">${esc(rules.branch)}</span> isn't readable with your permissions — that endpoint needs admin. Readiness above assumes the default <span class="code">signoff</span> context.</div>`;
-    }
-    if (!(rules.signoffContexts || []).length) {
-      const why = rules.protected
-        ? `No signoff context is required on <span class="code">${esc(rules.branch)}</span>.`
-        : `<span class="code">${esc(rules.branch)}</span> has no branch protection, so no signoff is required.`;
-      return `<div class="section-title">Required for merge</div><div class="footnote">${why}</div>`;
-    }
-    const chips = rules.signoffContexts
-      .map((c) => `<span class="code">${esc(c.replace(/^signoff\//, ""))}</span>`)
-      .join(" ");
-    return `<div class="section-title">Required for merge</div>
-      <div class="footnote">
-        Branch protection on <span class="code">${esc(rules.branch)}</span> requires ${chips}.
-        Set via <span class="code">gh signoff install</span> — see
-        <a href="#" data-nav="rules">Required checks</a>.
-      </div>`;
-  }
-
-  function historyPage() {
-    const events = state.history || [];
-    if (!events.length) {
-      return `<div class="section-title" style="margin-bottom:14px">Signoff activity</div>
-        ${empty("No signoff activity on this commit", "Every signoff written to this commit shows up here, including failures and re-signoffs.")}`;
-    }
-    const rows = events
-      .map((e) => {
-        const cls = e.state === "success" ? "" : e.state === "pending" ? "p" : "f";
-        const detail = e.state === "success"
-          ? `signed off by <b>${esc(e.actor || "unknown")}</b>`
-          : `${esc(e.state)}${e.detail ? ` — ${esc(e.detail)}` : ""}`;
-        return `<div class="history-row">
-          <div class="hdot ${cls}"></div>
-          <div class="t">${esc(clockTime(e.at))}</div>
-          <div>${esc(e.name)} <span class="who">— ${detail}</span></div>
-        </div>`;
-      })
-      .join("");
-    return `<div class="section-title" style="margin-bottom:14px">Signoff activity on this commit</div>${rows}`;
-  }
-
-  function rulesPage() {
-    const r = state.rules;
-    let html = `<div class="section-title" style="margin-bottom:14px">Required checks</div>`;
-
-    if (!r.readable) {
-      return html + empty(
-        "Branch protection isn't readable",
-        "GitHub only exposes branch protection to repository admins. Signoff shows what it can read and never guesses at the rest.",
-        `gh api repos/${state.repo.nameWithOwner}/branches/${r.branch}/protection`
-      );
-    }
-
-    const contexts = r.contexts || [];
-    const rows = contexts.length
-      ? contexts
-          .map((c) => {
-            const isSignoff = c.startsWith("signoff");
-            return `<div class="rule-row">
-              <span class="rr-name">${isSignoff ? badge("default") : ""}<span>${esc(c)}</span></span>
-              <span class="state-chip ${isSignoff ? "on" : ""}">${isSignoff ? "signoff" : "external check"}</span>
-            </div>`;
-          })
-          .join("")
-      : `<div class="rule-row"><span class="rr-name">No required status checks</span></div>`;
-
-    html += `<div class="rules-card">
-      <div class="sc-head">
-        <h3>${esc(r.branch)}</h3>
-        <p><code class="cmd-chip">${esc(r.installCommand)}</code></p>
-      </div>
-      ${rows}
-    </div>`;
-
-    html += `<div class="footnote" style="margin-top:12px">
-      Read-only. Editing protection rewrites the whole required-checks list, so v1 shows the
-      <span class="code">gh signoff install</span> command to run rather than a switch that silently
-      re-issues it.
-    </div>`;
-    return html;
-  }
-
-  // ------------------------------------------------------------- interaction
-
-  function wireDashboard() {
-    document.querySelectorAll("[data-signoff]").forEach((btn) => {
-      btn.addEventListener("click", () => signoff(btn.dataset.signoff, btn));
-    });
-    document.querySelectorAll("[data-copy]").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        await navigator.clipboard.writeText(btn.dataset.copy);
-        const old = btn.textContent;
-        btn.textContent = "Copied";
-        setTimeout(() => { btn.textContent = old; }, 1200);
-      });
-    });
-    document.querySelectorAll("[data-nav]").forEach((a) => {
-      a.addEventListener("click", (e) => { e.preventDefault(); go(a.dataset.nav); });
-    });
-    const close = $("#termClose");
-    // Local view state isn't part of the state signature, so this needs to
-    // force a re-render rather than be skipped as "nothing changed".
-    if (close) close.addEventListener("click", () => { termOpen = false; render(true); });
-  }
-
-  function log(text, cls) {
-    termLines.push({ text, cls });
-    const term = $("#term");
-    if (!term) return;
-    const div = document.createElement("div");
-    if (cls) div.className = cls;
-    div.textContent = text;
-    term.appendChild(div);
-    term.scrollTop = term.scrollHeight;
-  }
-
-  async function signoff(name, btn) {
-    if (busy) return;
-    busy = true;
-    if (btn) { btn.disabled = true; btn.textContent = "Signing off…"; }
-
-    termLines = [];
-    termOpen = true;
-    const wrap = $("#termWrap");
-    if (wrap) wrap.classList.add("open");
-    const term = $("#term");
-    if (term) term.innerHTML = "";
-
-    announce(`Signing off ${name || "signoff"}`);
-
+  async function loadProduct(force = false) {
+    if (force) loading = true;
+    loadError = "";
+    if (force) render();
     try {
-      const res = await fetch("/api/signoff", {
+      product = await api(force ? "/api/refresh" : "/api/product", { method: force ? "POST" : "GET" });
+      if (selectedPRID && !product.pullRequests.some((pr) => pr.id === selectedPRID)) selectedPRID = null;
+      if (!selectedSettingsRepoID && product.repositories[0]) selectedSettingsRepoID = product.repositories[0].id;
+    } catch (error) {
+      loadError = error.message;
+    } finally {
+      loading = false;
+      render();
+    }
+  }
+
+  function stateLabel(pr) {
+    if (pr.status === "ready") return "Ready to merge";
+    if (pr.status === "failing") return pr.blocking ? `${pr.blocking} failed` : "Blocked";
+    if (pr.status === "attention") return `Waiting on ${pr.blocking || "signoff"}`;
+    return "No signoff required";
+  }
+
+  function summaryText() {
+    if (!product) return "Loading";
+    const count = product.summary.needsAttention;
+    if (product.summary.status === "failing") return `${product.summary.failing} failing · ${count} need attention`;
+    if (count) return `${count} PR${count === 1 ? "" : "s"} need attention`;
+    if (product.summary.totalPullRequests) return `${product.summary.totalPullRequests} PR${product.summary.totalPullRequests === 1 ? "" : "s"} clear`;
+    return "No open pull requests";
+  }
+
+  function environmentProblem() {
+    if (!product) return null;
+    if (!product.env.ghInstalled) return { title: "GitHub CLI is required", detail: "Install gh, then reopen Signoff. Authentication remains in gh's keychain.", command: "brew install gh" };
+    if (!product.env.authenticated) return { title: "Sign in to GitHub", detail: "Authenticate once in Terminal. Signoff never reads or stores the token.", command: "gh auth login" };
+    if (!product.env.signoffInstalled) return { title: "Install gh-signoff", detail: "The companion can read status, but run-and-sign-off requires Basecamp's extension.", command: "gh extension install basecamp/gh-signoff" };
+    return null;
+  }
+
+  function popoverHeader(focusedPR = null) {
+    if (focusedPR) {
+      return `<header class="popover-header">
+        <button class="back-button" data-action="back" aria-label="Back to pull requests">${icon("back")}</button>
+        <div class="brand"><span>${esc(focusedPR.repo)}</span></div>
+        <span class="header-spacer"></span>
+        <button class="icon-button" data-action="refresh" aria-label="Refresh">${icon("refresh")}</button>
+        <button class="icon-button" data-action="settings" aria-label="Open settings">${icon("settings")}</button>
+      </header>`;
+    }
+    const status = product?.summary?.status || "neutral";
+    return `<header class="popover-header">
+      <div class="brand">${icon("brand", "brand-mark")}<span>Signoff</span></div>
+      <span class="live-dot ${esc(status)} ${loading ? "busy" : ""}"></span>
+      <span class="brand-summary">${esc(summaryText())}</span>
+      <span class="header-spacer"></span>
+      <button class="icon-button" data-action="refresh" aria-label="Refresh">${icon("refresh")}</button>
+      <button class="icon-button" data-action="settings" aria-label="Open settings">${icon("settings")}</button>
+    </header>`;
+  }
+
+  function emptyState(title, detail, action = "", command = "") {
+    return `<section class="empty-state"><div class="empty-state-inner">
+      <div class="empty-icon">${icon("repo")}</div>
+      <h2>${esc(title)}</h2><p>${esc(detail)}</p>
+      ${action ? `<div class="empty-actions">${action}</div>` : ""}
+      ${command ? `<code class="setup-code">${esc(command)}</code>` : ""}
+    </div></section>`;
+  }
+
+  function renderPopover() {
+    if (loading && !product) {
+      return `<div class="popover-shell">${popoverHeader()}${emptyState("Reading pull requests", "Checking tracked repositories and branch protection…")}</div>`;
+    }
+    if (loadError && !product) {
+      return `<div class="popover-shell">${popoverHeader()}${emptyState("Signoff could not start", loadError, '<button class="button primary" data-action="refresh">Try again</button>')}</div>`;
+    }
+    const problem = environmentProblem();
+    if (problem) {
+      return `<div class="popover-shell">${popoverHeader()}${emptyState(problem.title, problem.detail, '<button class="button ghost" data-action="settings">Open diagnostics</button>', problem.command)}</div>`;
+    }
+    if (!product.onboarded) {
+      return `<div class="popover-shell">${popoverHeader()}${emptyState("Track your first repository", "Choose a local checkout. Signoff will watch your pull requests and keep GitHub credentials in gh.", '<button class="button primary" data-action="add-repository">Choose repository…</button><button class="button ghost" data-action="settings">Open setup</button>')}</div>`;
+    }
+    const focusedPR = product.pullRequests.find((pr) => pr.id === selectedPRID);
+    if (focusedPR) return renderFocusedPopover(focusedPR);
+
+    const visible = product.pullRequests.filter((pr) => filter === "all" || pr.status === "attention" || pr.status === "failing");
+    let content;
+    if (!visible.length) {
+      content = emptyState(filter === "attention" ? "Everything is clear" : "No open pull requests", filter === "attention" ? "No tracked pull request is waiting on a signoff." : "Signoff will update when you open a pull request in a tracked repository.");
+    } else {
+      content = `<div class="pr-list">${visible.map((pr) => `<button class="pr-row" data-pr-id="${esc(pr.id)}">
+        <span class="status-dot ${esc(pr.status)}"></span>
+        <span class="pr-copy"><span class="pr-row-title">${esc(pr.pr.title)}</span><span class="pr-meta"><span>${esc(pr.repo)}</span><span>·</span><span>#${pr.pr.number}</span><span>·</span><span class="branch mono">${esc(pr.pr.headRef)}</span></span></span>
+        <span class="readiness ${esc(pr.status)}"><strong>${pr.total ? `${pr.passed}/${pr.total}` : "—"}</strong><span>checks</span></span>
+      </button>`).join("")}</div>`;
+    }
+    return `<div class="popover-shell">
+      ${popoverHeader()}
+      <div class="filter-bar">
+        <button class="filter-button ${filter === "attention" ? "active" : ""}" data-filter="attention">Needs attention <span class="filter-count">${product.summary.needsAttention}</span></button>
+        <button class="filter-button ${filter === "all" ? "active" : ""}" data-filter="all">All <span class="filter-count">${product.summary.totalPullRequests}</span></button>
+      </div>
+      <div class="popover-content">${content}</div>
+      <footer class="popover-footer"><button class="footer-button" data-action="settings">Manage repositories</button><button class="footer-button" data-action="history">History</button></footer>
+    </div>`;
+  }
+
+  function renderFocusedPopover(pr) {
+    const otherPRs = product.pullRequests.filter((item) => item.id !== pr.id).slice(0, 2);
+    const checks = pr.checks.map((check) => {
+      const passed = check.state === "success";
+      const failed = check.state === "failure" || check.state === "error";
+      let action = `<span class="check-state">Not signed off</span>`;
+      if (passed) action = `<span class="check-state pass">✓ ${esc(relativeTime(check.at))}</span>`;
+      else if (failed) action = `<span class="check-state fail">Failed</span>`;
+      else if (check.configured && pr.checkedOut) action = `<button class="button primary" data-run-check="${esc(check.name)}">Run & sign off</button>`;
+      else if (check.configured) action = `<span class="check-state checkout">Checkout PR</span>`;
+      else action = `<button class="button ghost" data-configure-check="${esc(check.name)}">Configure</button>`;
+      return `<div class="check-row ${!passed && !failed ? "actionable" : ""}">
+        ${categoryIcon(check.category)}
+        <div class="check-copy"><div class="check-name">${esc(check.name)}</div>
+          <div class="check-command mono ${check.configured && !passed ? "local" : ""}">${esc(check.configured ? `Local: ${check.localCommand}` : check.command)}</div>
+        </div>${action}
+      </div>`;
+    }).join("");
+    const terminalHTML = terminal.prID === pr.id && (terminal.open || terminal.running || terminal.lines.length) ? renderTerminal() : "";
+    const merge = pr.ready && pr.pr.url ? `<button class="button accent" data-open-url="${esc(pr.pr.url)}">Open pull request</button>` : `<button class="footer-button" data-open-url="${esc(pr.pr.url)}">Open on GitHub</button>`;
+    return `<div class="popover-shell">
+      ${popoverHeader(pr)}
+      <div class="popover-content">
+        <section class="focus-hero">
+          <div class="eyebrow"><span class="repo">${esc(pr.repo)}</span><span>·</span><span>#${pr.pr.number}</span><span>·</span><span class="branch mono">${esc(pr.pr.headRef)}</span></div>
+          <h1 class="focus-title">${esc(pr.pr.title)}</h1>
+          <div class="focus-status"><span class="status-pill ${esc(pr.status)}">${esc(stateLabel(pr))}</span><span class="focus-progress"><strong>${pr.total ? `${pr.passed}/${pr.total}` : "—"}</strong> readiness</span></div>
+        </section>
+        ${!pr.ready && !pr.checkedOut ? `<div class="notice">This checkout is not at the PR commit. Check out <span class="mono">${esc(pr.pr.headRef)}</span> locally, then refresh before running a check.</div>` : ""}
+        ${pr.warning ? `<div class="notice">${esc(pr.warning)}</div>` : ""}
+        <div class="section-label">Required checks</div>
+        <div class="checks">${checks || '<div class="check-row"><span></span><div class="check-copy"><div class="check-name">No signoff checks required</div></div><span></span></div>'}</div>
+        ${terminalHTML}
+        ${otherPRs.length ? `<div class="section-label">Other pull requests</div>${otherPRs.map((other) => `<button class="other-pr" data-pr-id="${esc(other.id)}"><span class="status-dot ${esc(other.status)}"></span><span class="title"><strong>#${other.pr.number}</strong> ${esc(other.pr.title)}</span><span class="branch mono">${esc(other.pr.headRef)}</span></button>`).join("")}` : ""}
+      </div>
+      <footer class="popover-footer">${merge}<span class="footer-spacer"></span><button class="footer-button" data-action="settings">Settings</button></footer>
+    </div>`;
+  }
+
+  function renderTerminal() {
+    const lines = terminal.lines.map((line) => `<div class="${esc(line.kind || "")}">${esc(line.text)}</div>`).join("");
+    return `<section class="terminal-wrap"><div class="terminal-head">${icon("terminal")} Command output <span>${esc(terminal.phase || "")}</span><button data-action="toggle-terminal">${terminal.open ? "Hide" : "Show"}</button></div>${terminal.open ? `<div class="terminal" id="terminalOutput">${lines || '<span class="phase">Starting…</span>'}</div>` : ""}</section>`;
+  }
+
+  function settingsMeta() {
+    const tabs = [
+      ["repositories", "Repositories"], ["commands", "Commands"], ["rules", "Branch rules"],
+      ["history", "History"], ["diagnostics", "Diagnostics"],
+    ];
+    return `<aside class="settings-sidebar"><div class="settings-brand">${icon("brand", "brand-mark")} Signoff</div><nav class="settings-nav">${tabs.map(([id, label]) => `<button class="${settingsTab === id ? "active" : ""}" data-settings-tab="${id}">${label}</button>`).join("")}</nav><footer>Menu-bar companion for <span class="mono">gh signoff</span><br>${esc(product?.env?.signoffVersion ? `gh-signoff ${product.env.signoffVersion}` : "")}</footer></aside>`;
+  }
+
+  function renderSettings() {
+    if (loading && !product) return `<div class="settings-shell">${settingsMeta()}<section class="settings-main">${emptyState("Loading Signoff", "Reading configuration and GitHub status…")}</section></div>`;
+    if (loadError && !product) return `<div class="settings-shell">${settingsMeta()}<section class="settings-main">${emptyState("Could not load settings", loadError, '<button class="button primary" data-action="refresh">Try again</button>')}</section></div>`;
+    let page = "";
+    if (settingsTab === "commands") page = settingsCommands();
+    else if (settingsTab === "rules") page = settingsRules();
+    else if (settingsTab === "history") page = settingsHistory();
+    else if (settingsTab === "diagnostics") page = settingsDiagnostics();
+    else page = settingsRepositories();
+    return `<div class="settings-shell">${settingsMeta()}<section class="settings-main">${page}</section></div>`;
+  }
+
+  function settingsHeader(title, detail, action = "") {
+    return `<header class="settings-header"><div><h1>${esc(title)}</h1><p>${esc(detail)}</p></div>${action}</header>`;
+  }
+
+  function settingsRepositories() {
+    const rows = product.repositories.map((repo) => `<div class="repo-setting-row">
+      <div><div class="repo-name">${esc(repo.nameWithOwner)}</div><div class="repo-path mono">${esc(repo.path)}</div>${repo.error ? `<div class="history-state failure">${esc(repo.error)}</div>` : ""}</div>
+      <select class="select" data-repo-scope="${esc(repo.id)}" aria-label="Pull request scope"><option value="mine" ${repo.pullRequestScope !== "all" ? "selected" : ""}>My PRs</option><option value="all" ${repo.pullRequestScope === "all" ? "selected" : ""}>All open PRs</option></select>
+      <div style="display:flex;align-items:center;gap:10px"><input class="toggle" type="checkbox" data-repo-enabled="${esc(repo.id)}" ${repo.enabled ? "checked" : ""} aria-label="Track ${esc(repo.nameWithOwner)}"><button class="button danger" data-remove-repo="${esc(repo.id)}">Remove</button></div>
+    </div>`).join("");
+    return `${settingsHeader("Tracked repositories", "Signoff watches pull requests in these local checkouts.", '<button class="button primary" data-action="add-repository">Add repository…</button>')}
+      <div class="settings-section">${READ_ONLY ? '<div class="notice">Read-only mode is active. Configuration can change, but commands and GitHub writes remain disabled.</div>' : ""}${rows ? `<div class="list-card">${rows}</div>` : emptyState("No repositories yet", "Add a local Git checkout to start tracking pull requests.", '<button class="button primary" data-action="add-repository">Choose repository…</button>')}</div>`;
+  }
+
+  function activeSettingsRepo() {
+    return product.repositories.find((repo) => repo.id === selectedSettingsRepoID) || product.repositories[0] || null;
+  }
+
+  function repoSelector(repo, attr = "settings-repo") {
+    return `<select class="select" data-${attr}>${product.repositories.map((item) => `<option value="${esc(item.id)}" ${repo && item.id === repo.id ? "selected" : ""}>${esc(item.nameWithOwner)}</option>`).join("")}</select>`;
+  }
+
+  function settingsCommands() {
+    const repo = activeSettingsRepo();
+    if (!repo) return `${settingsHeader("Local commands", "Map each signoff context to the command that must pass first.")}${emptyState("Add a repository first", "Command mappings belong to a tracked local checkout.", '<button class="button primary" data-action="add-repository">Add repository…</button>')}`;
+    const known = new Set(Object.keys(repo.commands || {}));
+    product.pullRequests.filter((pr) => pr.repoId === repo.id).forEach((pr) => pr.checks.forEach((check) => known.add(check.name)));
+    const rows = [...known].sort().map((name) => {
+      const mapping = repo.commands?.[name] || { command: "", timeoutSeconds: 1800 };
+      return `<div class="inline-form" data-command-row="${esc(name)}"><div class="field"><label>Check</label><input class="input mono" value="${esc(name)}" disabled></div><div class="field"><label>Local command</label><input class="input mono" data-command-value value="${esc(mapping.command)}" placeholder="bin/test"></div><div class="field"><label>Timeout</label><input class="input" data-command-timeout type="number" min="10" max="7200" value="${mapping.timeoutSeconds || 1800}"></div><button class="button ghost" data-save-command="${esc(name)}">Save</button></div>`;
+    }).join("");
+    return `${settingsHeader("Local commands", "A command runs in the repository checkout. Only exit 0 proceeds to gh signoff.", repoSelector(repo))}<div class="settings-section"><div class="notice">Commands are explicit local configuration. Run requests cannot supply or override shell text.</div><div class="list-card">${rows || '<div class="repo-setting-row"><div>No required checks have been discovered yet.</div></div>'}</div><form id="addCommandForm" class="form-actions"><input class="input mono" name="check" placeholder="check name" required><input class="input mono" name="command" placeholder="local command" required><button class="button primary" type="submit">Add mapping</button></form></div>`;
+  }
+
+  function settingsRules() {
+    const repo = activeSettingsRepo();
+    if (!repo) return `${settingsHeader("Branch rules", "Edit signoff contexts without disturbing unrelated protection.")}${emptyState("Add a repository first", "Branch rules are read from a tracked GitHub repository.")}`;
+    const pr = product.pullRequests.find((item) => item.repoId === repo.id);
+    const branch = pr?.rules?.branch || repo.defaultBranch || "main";
+    const checks = (pr?.rules?.signoffContexts || []).map((name) => name === "signoff" ? "signoff" : name.replace(/^signoff\//, "")).join(", ");
+    const unreadable = pr && !pr.rules.readable;
+    return `${settingsHeader("Branch rules", "Change only required status-check contexts; reviews, restrictions, and other protection remain intact.", repoSelector(repo))}<div class="settings-section">
+      ${unreadable ? '<div class="notice red">Branch protection is not readable with your current GitHub permissions, so editing is disabled.</div>' : '<div class="notice">Unlike gh signoff uninstall, this editor never deletes the branch protection rule. External status checks are preserved.</div>'}
+      <form id="rulesForm" class="list-card" style="padding:16px">
+        <div class="field"><label>Branch</label><input class="input mono" name="branch" value="${esc(branch)}" required></div>
+        <div class="field"><label>Required signoff checks</label><input class="input mono" name="checks" value="${esc(checks)}" placeholder="tests, lint, security"><span style="color:var(--mute);font-size:10px">Comma-separated. Leave empty to remove only Signoff contexts.</span></div>
+        <div class="form-actions"><button class="button primary" type="submit" ${unreadable || READ_ONLY ? "disabled" : ""}>Update branch rule</button><code>${esc(pr?.rules?.installCommand || `gh signoff install --branch ${branch}`)}</code></div>
+      </form></div>`;
+  }
+
+  function settingsHistory() {
+    const rows = product.history.map((event) => `<div class="history-row"><span class="status-dot ${event.state === "success" ? "ready" : event.state === "failure" || event.state === "error" ? "failing" : "attention"}"></span><span class="history-time">${esc(formatDate(event.at))}</span><span class="history-repo">${esc(event.repo || "Local")}${event.prNumber ? ` #${event.prNumber}` : ""}</span><span class="history-detail"><strong>${esc(event.check || event.kind)}</strong>${event.prTitle ? ` — ${esc(event.prTitle)}` : ""}${event.detail ? ` — ${esc(event.detail)}` : ""}</span><span class="history-state ${esc(event.state)}">${esc(event.state)}</span></div>`).join("");
+    return `${settingsHeader("Activity history", "Runs, signoffs, and GitHub commit statuses across tracked pull requests.", '<button class="button ghost" data-action="refresh">Refresh</button>')}<div class="settings-section">${rows ? `<div class="list-card">${rows}</div>` : emptyState("No activity yet", "Run a configured check or sign off a pull request and it will appear here.")}</div>`;
+  }
+
+  function settingsDiagnostics() {
+    const env = product.env;
+    const row = (label, value) => `<dt>${esc(label)}</dt><dd class="mono">${esc(value || "—")}</dd>`;
+    return `${settingsHeader("Diagnostics", "Current local integration state. Authentication remains owned by GitHub CLI.", '<button class="button ghost" data-action="refresh">Run checks again</button>')}<div class="settings-section">${product.demo ? '<div class="notice">Demo mode is active. Nothing is read from or written to GitHub.</div>' : ""}<dl class="diagnostic-grid">${row("GitHub CLI", env.ghInstalled ? env.ghVersion : "Not installed")}${row("GitHub account", env.authenticated ? env.login : "Not authenticated")}${row("gh-signoff", env.signoffInstalled ? env.signoffVersion : "Not installed")}${row("Tracked repositories", product.repositories.length)}${row("Open pull requests", product.summary.totalPullRequests)}${row("Config", product.configPath)}${row("Last refresh", formatDate(product.fetchedAt))}${row("Mode", READ_ONLY ? "Read only" : "Read and write")}</dl></div>`;
+  }
+
+  function render() {
+    app.innerHTML = surface === "settings" || surface === "full" ? renderSettings() : renderPopover();
+    wire();
+  }
+
+  function wire() {
+    document.querySelectorAll("[data-pr-id]").forEach((element) => element.addEventListener("click", () => {
+      selectedPRID = element.dataset.prId;
+      terminal = { open: false, running: false, phase: "", lines: [], prID: "", check: "" };
+      render();
+    }));
+    document.querySelectorAll("[data-filter]").forEach((element) => element.addEventListener("click", () => { filter = element.dataset.filter; render(); }));
+    document.querySelectorAll("[data-settings-tab]").forEach((element) => element.addEventListener("click", () => { settingsTab = element.dataset.settingsTab; render(); }));
+    document.querySelectorAll("[data-action]").forEach((element) => element.addEventListener("click", () => handleAction(element.dataset.action)));
+    document.querySelectorAll("[data-open-url]").forEach((element) => element.addEventListener("click", () => openExternal(element.dataset.openUrl)));
+    document.querySelectorAll("[data-run-check]").forEach((element) => element.addEventListener("click", () => runCheck(element.dataset.runCheck)));
+    document.querySelectorAll("[data-configure-check]").forEach((element) => element.addEventListener("click", () => openSettings("commands")));
+    document.querySelectorAll("[data-repo-enabled]").forEach((element) => element.addEventListener("change", () => updateRepositorySetting(element.dataset.repoEnabled, { enabled: element.checked })));
+    document.querySelectorAll("[data-repo-scope]").forEach((element) => element.addEventListener("change", () => updateRepositorySetting(element.dataset.repoScope, { pullRequestScope: element.value })));
+    document.querySelectorAll("[data-remove-repo]").forEach((element) => element.addEventListener("click", () => removeRepository(element.dataset.removeRepo)));
+    document.querySelectorAll("[data-save-command]").forEach((element) => element.addEventListener("click", () => saveCommand(element.dataset.saveCommand, element.closest("[data-command-row]"))));
+    const repoSelect = document.querySelector("[data-settings-repo]");
+    if (repoSelect) repoSelect.addEventListener("change", () => { selectedSettingsRepoID = repoSelect.value; render(); });
+    const addCommand = document.querySelector("#addCommandForm");
+    if (addCommand) addCommand.addEventListener("submit", addCommandMapping);
+    const rules = document.querySelector("#rulesForm");
+    if (rules) rules.addEventListener("submit", saveRules);
+  }
+
+  async function handleAction(action) {
+    if (action === "back") { selectedPRID = null; render(); return; }
+    if (action === "refresh") { await loadProduct(true); return; }
+    if (action === "settings") { await openSettings("repositories"); return; }
+    if (action === "history") { await openSettings("history"); return; }
+    if (action === "add-repository") { await addRepository(); return; }
+    if (action === "toggle-terminal") { terminal.open = !terminal.open; render(); scrollTerminal(); }
+  }
+
+  async function openSettings(tab) {
+    if (desktop?.openSettings) {
+      await desktop.openSettings(tab);
+      return;
+    }
+    location.href = `/?surface=settings&tab=${encodeURIComponent(tab)}`;
+  }
+
+  async function openExternal(url) {
+    if (!/^https:\/\/github\.com\//.test(url || "")) return;
+    if (desktop?.openExternal) await desktop.openExternal(url);
+    else window.open(url, "_blank", "noopener");
+  }
+
+  async function addRepository() {
+    try {
+      let path = "";
+      if (desktop?.chooseRepository) path = await desktop.chooseRepository();
+      else path = window.prompt("Absolute path to a local Git repository") || "";
+      if (!path) return;
+      await api("/api/repositories", { method: "POST", body: JSON.stringify({ path }) });
+      showToast("Repository added");
+      await loadProduct(true);
+    } catch (error) { showToast(error.message, true); }
+  }
+
+  async function updateRepositorySetting(id, changes) {
+    const repo = product.repositories.find((item) => item.id === id);
+    if (!repo) return;
+    try {
+      await api(`/api/repositories/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify({ ...repo, ...changes }) });
+      showToast("Repository updated");
+      await loadProduct(true);
+    } catch (error) { showToast(error.message, true); }
+  }
+
+  async function removeRepository(id) {
+    const repo = product.repositories.find((item) => item.id === id);
+    if (!repo || !window.confirm(`Stop tracking ${repo.nameWithOwner}? Local files and GitHub data will not be changed.`)) return;
+    try {
+      await api(`/api/repositories/${encodeURIComponent(id)}`, { method: "DELETE" });
+      selectedSettingsRepoID = null;
+      showToast("Repository removed");
+      await loadProduct(true);
+    } catch (error) { showToast(error.message, true); }
+  }
+
+  async function saveCommand(name, row) {
+    const repo = activeSettingsRepo();
+    if (!repo || !row) return;
+    const command = row.querySelector("[data-command-value]").value.trim();
+    const timeoutSeconds = Number(row.querySelector("[data-command-timeout]").value) || 1800;
+    const commands = { ...(repo.commands || {}) };
+    if (command) commands[name] = { command, timeoutSeconds };
+    else delete commands[name];
+    await persistCommands(repo, commands);
+  }
+
+  async function addCommandMapping(event) {
+    event.preventDefault();
+    const repo = activeSettingsRepo();
+    const form = new FormData(event.currentTarget);
+    const name = String(form.get("check") || "").trim();
+    const command = String(form.get("command") || "").trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/.test(name)) { showToast("Check names may use letters, numbers, dot, dash, and underscore", true); return; }
+    if (!command) return;
+    const commands = { ...(repo.commands || {}), [name]: { command, timeoutSeconds: 1800 } };
+    await persistCommands(repo, commands);
+  }
+
+  async function persistCommands(repo, commands) {
+    try {
+      await api(`/api/repositories/${encodeURIComponent(repo.id)}`, { method: "PUT", body: JSON.stringify({ ...repo, commands }) });
+      showToast("Command mapping saved");
+      await loadProduct(true);
+    } catch (error) { showToast(error.message, true); }
+  }
+
+  async function saveRules(event) {
+    event.preventDefault();
+    const repo = activeSettingsRepo();
+    const form = new FormData(event.currentTarget);
+    const branch = String(form.get("branch") || "").trim();
+    const checks = String(form.get("checks") || "").split(",").map((item) => item.trim()).filter(Boolean);
+    if (!window.confirm(`Update required Signoff checks on ${repo.nameWithOwner}:${branch}? Unrelated branch-protection settings and external contexts will be preserved.`)) return;
+    try {
+      await api("/api/rules", { method: "PUT", body: JSON.stringify({ repoId: repo.id, branch, checks }) });
+      showToast("Branch rule updated");
+      await loadProduct(true);
+    } catch (error) { showToast(error.message, true); }
+  }
+
+  async function runCheck(checkName) {
+    const pr = product.pullRequests.find((item) => item.id === selectedPRID);
+    if (!pr || terminal.running) return;
+    terminal = { open: true, running: true, phase: "Starting", lines: [], prID: pr.id, check: checkName };
+    render();
+    try {
+      const response = await fetch("/api/run", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-Signoff-Token": TOKEN },
-        body: JSON.stringify({ name }),
+        body: JSON.stringify({ repoId: pr.repoId, prNumber: pr.pr.number, check: checkName }),
       });
-      if (!res.ok || !res.body) throw new Error(`request failed: ${res.status}`);
-
-      const reader = res.body.getReader();
+      if (!response.ok || !response.body) throw new Error((await response.text()).trim() || `Run failed: ${response.status}`);
+      const reader = response.body.getReader();
       const decoder = new TextDecoder();
-      let buf = "";
-      let exitCode = 0;
-
+      let buffer = "";
+      let result = { code: 1 };
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        buf += decoder.decode(value, { stream: true });
-
-        let idx;
-        while ((idx = buf.indexOf("\n\n")) !== -1) {
-          const frame = buf.slice(0, idx);
-          buf = buf.slice(idx + 2);
-
-          let event = "message", data = "";
-          for (const line of frame.split("\n")) {
-            if (line.startsWith("event: ")) event = line.slice(7);
-            else if (line.startsWith("data: ")) data = line.slice(6);
+        buffer += decoder.decode(value, { stream: true });
+        let boundary;
+        while ((boundary = buffer.indexOf("\n\n")) >= 0) {
+          const frame = buffer.slice(0, boundary);
+          buffer = buffer.slice(boundary + 2);
+          let eventName = "message";
+          let data = "";
+          frame.split("\n").forEach((line) => {
+            if (line.startsWith("event: ")) eventName = line.slice(7);
+            if (line.startsWith("data: ")) data = line.slice(6).replace(/\\n/g, "\n");
+          });
+          if (eventName === "phase") {
+            terminal.phase = data === "run" ? "Running local command" : "Signing off commit";
+            terminal.lines.push({ kind: "phase", text: `— ${terminal.phase}` });
+          } else if (eventName === "line") {
+            terminal.lines.push({ kind: /^✓/.test(data) ? "success" : /^✗|failed|error/i.test(data) ? "failure" : "", text: data });
+          } else if (eventName === "done") {
+            try { result = JSON.parse(data); } catch { result = { code: 1 }; }
           }
-          const text = data.replace(/\\n/g, "\n");
-
-          if (event === "line") {
-            const cls = text.startsWith("$") ? "prompt" : text.startsWith("✓") ? "ok" : "";
-            log(text, cls);
-          } else if (event === "done") {
-            try { exitCode = JSON.parse(text).code ?? 0; } catch { exitCode = 0; }
-          }
+          render();
+          scrollTerminal();
         }
       }
-
-      if (exitCode === 0) {
-        log(`✓ exit 0`, "ok");
-        announce("Signed off");
-        const row = document.querySelector(`.chk-row[data-key="${CSS.escape(name || "signoff")}"]`);
-        if (row) row.classList.add("flash");
-        setTimeout(fetchState, 700);
-      } else {
-        log(`✗ exit ${exitCode}`, "err");
-        announce("Sign off failed");
-        if (btn) { btn.disabled = false; btn.textContent = "Retry sign off"; }
-      }
-    } catch (err) {
-      log(String(err), "err");
-      if (btn) { btn.disabled = false; btn.textContent = "Retry sign off"; }
-    } finally {
-      busy = false;
+      terminal.running = false;
+      terminal.phase = result.code === 0 ? "Complete" : "Failed";
+      showToast(result.code === 0 ? `${checkName} passed and was signed off` : `${checkName} did not complete`, result.code !== 0);
+      await loadProduct(false);
+    } catch (error) {
+      terminal.running = false;
+      terminal.phase = "Failed";
+      terminal.lines.push({ kind: "failure", text: error.message });
+      showToast(error.message, true);
+      render();
+      scrollTerminal();
     }
   }
 
-  function go(next) {
-    page = next;
-    document.querySelectorAll(".page").forEach((p) => p.classList.add("hidden"));
-    $(`#page-${next}`).classList.remove("hidden");
-    document.querySelectorAll(".nav-item[data-page]").forEach((n) => {
-      if (n.dataset.page === next) n.setAttribute("aria-current", "page");
-      else n.removeAttribute("aria-current");
+  function scrollTerminal() {
+    requestAnimationFrame(() => {
+      const output = document.querySelector("#terminalOutput");
+      if (output) output.scrollTop = output.scrollHeight;
     });
   }
 
-  document.querySelectorAll(".nav-item[data-page]").forEach((n) => {
-    n.addEventListener("click", () => go(n.dataset.page));
-  });
+  function showToast(message, failure = false) {
+    toast.textContent = message;
+    toast.style.background = failure ? "var(--red)" : "var(--text)";
+    toast.hidden = false;
+    clearTimeout(showToast.timer);
+    showToast.timer = setTimeout(() => { toast.hidden = true; }, 2600);
+  }
 
-  // ---------------------------------------------------------------- palette
-
-  let filtered = [], selIdx = 0;
-
-  function paletteActions() {
-    const acts = [];
-    (state?.checks || []).forEach((c) => {
-      if (c.state !== "success") {
-        acts.push({
-          label: `Sign off: ${c.name}`,
-          sub: c.command,
-          run: () => signoff(c.name === "signoff" ? "" : c.name, null),
+  function buildPaletteActions() {
+    const actions = [];
+    (product?.pullRequests || []).forEach((pr) => {
+      actions.push({
+        label: `Open #${pr.pr.number} ${pr.pr.title}`, meta: pr.repo,
+        run: () => { selectedPRID = pr.id; render(); },
+      });
+      pr.checks.filter((check) => check.required && check.state !== "success").forEach((check) => {
+        if (check.configured && pr.checkedOut) actions.push({
+          label: `Run ${check.name} on #${pr.pr.number}`, meta: pr.repo,
+          run: () => { selectedPRID = pr.id; render(); runCheck(check.name); },
         });
-      }
-      acts.push({
-        label: `Copy command: ${c.command}`,
-        sub: "clipboard",
-        run: () => navigator.clipboard.writeText(c.command),
+        actions.push({
+          label: `Copy ${check.command}`, meta: `${pr.repo} #${pr.pr.number}`,
+          run: () => copyCommand(check.command),
+        });
       });
     });
-    acts.push({ label: "Go to Dashboard", sub: "nav", run: () => go("dashboard") });
-    acts.push({ label: "Go to History", sub: "nav", run: () => go("history") });
-    acts.push({ label: "Go to Required checks", sub: "nav", run: () => go("rules") });
-    acts.push({ label: "Refresh", sub: "reload state", run: fetchState });
-    if (state?.pr?.url) {
-      acts.push({ label: "Open pull request on GitHub", sub: "browser", run: () => window.open(state.pr.url, "_blank", "noopener") });
+    actions.push({ label: "Refresh all repositories", meta: "status", run: () => loadProduct(true) });
+    actions.push({ label: "Manage repositories", meta: "settings", run: () => openSettings("repositories") });
+    actions.push({ label: "Configure commands", meta: "settings", run: () => openSettings("commands") });
+    actions.push({ label: "Edit branch rules", meta: "settings", run: () => openSettings("rules") });
+    actions.push({ label: "Open activity history", meta: "history", run: () => openSettings("history") });
+    actions.push({ label: "Open diagnostics", meta: "settings", run: () => openSettings("diagnostics") });
+    return actions;
+  }
+
+  async function copyCommand(command) {
+    try {
+      if (desktop?.copyText) await desktop.copyText(command);
+      else await navigator.clipboard.writeText(command);
+      showToast("Command copied");
+    } catch (error) { showToast(error.message || "Could not copy command", true); }
+  }
+
+  function fuzzyScore(candidate, query) {
+    if (!query) return 0;
+    const exact = candidate.indexOf(query);
+    if (exact >= 0) return 1000 - exact;
+    let score = 0;
+    let cursor = 0;
+    let previous = -1;
+    for (const character of query) {
+      const found = candidate.indexOf(character, cursor);
+      if (found < 0) return null;
+      score += previous >= 0 && found === previous + 1 ? 8 : 2;
+      score -= found - cursor;
+      previous = found;
+      cursor = found + 1;
     }
-    return acts;
+    return score;
   }
 
   function openPalette() {
-    $("#paletteOverlay").classList.add("show");
-    const input = $("#paletteInput");
-    input.value = "";
-    filtered = paletteActions();
-    selIdx = 0;
+    if (!product) return;
+    paletteActions = buildPaletteActions();
+    paletteIndex = 0;
+    paletteInput.value = "";
+    paletteOverlay.hidden = false;
     renderPalette();
-    setTimeout(() => input.focus(), 40);
+    setTimeout(() => paletteInput.focus(), 10);
   }
 
-  function closePalette() {
-    $("#paletteOverlay").classList.remove("show");
-  }
+  function closePalette() { paletteOverlay.hidden = true; }
 
   function renderPalette() {
-    const wrap = $("#paletteResults");
-    if (!filtered.length) {
-      wrap.innerHTML = `<div class="palette-empty">No matching command</div>`;
-      return;
-    }
-    wrap.innerHTML = filtered
-      .map(
-        (a, i) => `<button class="palette-item" type="button" role="option"
-          aria-selected="${i === selIdx}" data-idx="${i}">
-          <span class="pi-ic">›</span>
-          <span class="pi-label">${esc(a.label)}</span>
-          <span class="pi-sub">${esc(a.sub)}</span>
-        </button>`
-      )
-      .join("");
-    wrap.querySelectorAll(".palette-item").forEach((el) => {
-      el.addEventListener("click", () => {
-        const a = filtered[Number(el.dataset.idx)];
-        closePalette();
-        a.run();
-      });
-    });
+    const query = paletteInput.value.trim().toLowerCase();
+    const filtered = paletteActions.map((action, order) => ({
+      ...action, order, score: fuzzyScore(`${action.label} ${action.meta}`.toLowerCase(), query),
+    })).filter((action) => action.score !== null).sort((a, b) => b.score - a.score || a.order - b.order);
+    paletteIndex = Math.min(paletteIndex, Math.max(0, filtered.length - 1));
+    paletteResults.innerHTML = filtered.map((action, index) => `<button class="palette-item" role="option" aria-selected="${index === paletteIndex}" data-palette-index="${index}"><strong>${esc(action.label)}</strong><span>${esc(action.meta)}</span></button>`).join("") || '<div class="empty-state" style="min-height:100px">No matching action</div>';
+    paletteResults.querySelectorAll("[data-palette-index]").forEach((element) => element.addEventListener("click", () => {
+      const action = filtered[Number(element.dataset.paletteIndex)];
+      closePalette();
+      action?.run();
+    }));
+    renderPalette.filtered = filtered;
   }
 
-  $("#paletteBtn").addEventListener("click", openPalette);
-  $("#paletteOverlay").addEventListener("click", (e) => {
-    if (e.target === $("#paletteOverlay")) closePalette();
-  });
-  $("#paletteInput").addEventListener("input", (e) => {
-    const q = e.target.value.toLowerCase();
-    filtered = paletteActions().filter((a) => a.label.toLowerCase().includes(q));
-    selIdx = 0;
-    renderPalette();
-  });
-
-  document.addEventListener("keydown", (e) => {
-    const overlay = $("#paletteOverlay");
-    const isOpen = overlay.classList.contains("show");
-    if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-      e.preventDefault();
-      isOpen ? closePalette() : openPalette();
+  paletteInput.addEventListener("input", () => { paletteIndex = 0; renderPalette(); });
+  paletteOverlay.addEventListener("click", (event) => { if (event.target === paletteOverlay) closePalette(); });
+  document.addEventListener("keydown", (event) => {
+    if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
+      event.preventDefault();
+      paletteOverlay.hidden ? openPalette() : closePalette();
       return;
     }
-    if (!isOpen) return;
-    if (e.key === "Escape") closePalette();
-    else if (e.key === "ArrowDown") { e.preventDefault(); selIdx = Math.min(selIdx + 1, filtered.length - 1); renderPalette(); }
-    else if (e.key === "ArrowUp") { e.preventDefault(); selIdx = Math.max(selIdx - 1, 0); renderPalette(); }
-    else if (e.key === "Enter" && filtered[selIdx]) { const a = filtered[selIdx]; closePalette(); a.run(); }
+    if (paletteOverlay.hidden) return;
+    if (event.key === "Escape") closePalette();
+    if (event.key === "ArrowDown") { event.preventDefault(); paletteIndex = Math.min(paletteIndex + 1, (renderPalette.filtered || []).length - 1); renderPalette(); }
+    if (event.key === "ArrowUp") { event.preventDefault(); paletteIndex = Math.max(0, paletteIndex - 1); renderPalette(); }
+    if (event.key === "Enter") { event.preventDefault(); const action = (renderPalette.filtered || [])[paletteIndex]; closePalette(); action?.run(); }
   });
 
-  // ---------------------------------------------------------------- polling
-
-  // Poll while focused, and immediately on regaining focus. Acceptance
-  // criterion §14: no manual refresh while the window is focused.
-  let timer = null;
   function startPolling() {
-    stopPolling();
-    timer = setInterval(() => { if (!busy) fetchState(); }, 15000);
+    clearInterval(pollTimer);
+    if (surface !== "popover") return;
+    pollTimer = setInterval(() => { if (!terminal.running && !document.hidden) loadProduct(false); }, 30000);
   }
-  function stopPolling() { if (timer) clearInterval(timer); timer = null; }
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.hidden) stopPolling();
-    else { fetchState(); startPolling(); }
-  });
-  window.addEventListener("focus", () => { if (!busy) fetchState(); });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && surface === "popover") loadProduct(false); });
+  if (desktop?.onPopoverShown) desktop.onPopoverShown(() => loadProduct(false));
 
-  fetchState().then(startPolling);
+  loadProduct(false).then(startPolling);
 })();

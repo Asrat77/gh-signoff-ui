@@ -129,8 +129,15 @@ func probeEnvironment(ctx context.Context, dir string) Environment {
 // runIn is run() with a working directory, needed because every git and gh
 // call is relative to the repo the user launched us from.
 func runIn(ctx context.Context, dir, name string, args ...string) (string, string, int, error) {
+	return runInWithInput(ctx, dir, "", name, args...)
+}
+
+func runInWithInput(ctx context.Context, dir, input, name string, args ...string) (string, string, int, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	if input != "" {
+		cmd.Stdin = strings.NewReader(input)
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -201,14 +208,17 @@ func readRepo(ctx context.Context, dir string) (RepoInfo, error) {
 }
 
 type PRInfo struct {
-	Number    int    `json:"number"`
-	Title     string `json:"title"`
-	Author    string `json:"author"`
-	URL       string `json:"url"`
-	State     string `json:"state"`
-	HeadSHA   string `json:"headSha"`
-	BaseRef   string `json:"baseRef"`
-	Mergeable string `json:"mergeable"`
+	Number    int       `json:"number"`
+	Title     string    `json:"title"`
+	Author    string    `json:"author"`
+	URL       string    `json:"url"`
+	State     string    `json:"state"`
+	HeadSHA   string    `json:"headSha"`
+	HeadRef   string    `json:"headRef"`
+	BaseRef   string    `json:"baseRef"`
+	Mergeable string    `json:"mergeable"`
+	IsDraft   bool      `json:"isDraft"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // readPR returns the PR for the current branch. A missing PR is an expected
@@ -222,12 +232,15 @@ func readPR(ctx context.Context, dir string) (*PRInfo, error) {
 		Author struct {
 			Login string `json:"login"`
 		} `json:"author"`
-		HeadRefOid  string `json:"headRefOid"`
-		BaseRefName string `json:"baseRefName"`
-		Mergeable   string `json:"mergeable"`
+		HeadRefOid  string    `json:"headRefOid"`
+		HeadRefName string    `json:"headRefName"`
+		BaseRefName string    `json:"baseRefName"`
+		Mergeable   string    `json:"mergeable"`
+		IsDraft     bool      `json:"isDraft"`
+		UpdatedAt   time.Time `json:"updatedAt"`
 	}
 	err := ghJSONIn(ctx, dir, &raw, "pr", "view", "--json",
-		"number,title,url,state,author,headRefOid,baseRefName,mergeable")
+		"number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt")
 	if err != nil {
 		if notFound(err) || strings.Contains(err.Error(), "no pull requests found") ||
 			strings.Contains(err.Error(), "no open pull requests") {
@@ -242,9 +255,51 @@ func readPR(ctx context.Context, dir string) (*PRInfo, error) {
 		URL:       raw.URL,
 		State:     raw.State,
 		HeadSHA:   raw.HeadRefOid,
+		HeadRef:   raw.HeadRefName,
 		BaseRef:   raw.BaseRefName,
 		Mergeable: raw.Mergeable,
+		IsDraft:   raw.IsDraft,
+		UpdatedAt: raw.UpdatedAt,
 	}, nil
+}
+
+// readPullRequests returns the open pull requests Signoff should track for a
+// repository. "mine" follows the original All my PRs intent; "all" is useful
+// for small teams sharing one workstation context.
+func readPullRequests(ctx context.Context, dir, scope string) ([]PRInfo, error) {
+	var raw []struct {
+		Number int    `json:"number"`
+		Title  string `json:"title"`
+		URL    string `json:"url"`
+		State  string `json:"state"`
+		Author struct {
+			Login string `json:"login"`
+		} `json:"author"`
+		HeadRefOid  string    `json:"headRefOid"`
+		HeadRefName string    `json:"headRefName"`
+		BaseRefName string    `json:"baseRefName"`
+		Mergeable   string    `json:"mergeable"`
+		IsDraft     bool      `json:"isDraft"`
+		UpdatedAt   time.Time `json:"updatedAt"`
+	}
+	args := []string{"pr", "list", "--state", "open", "--limit", "30"}
+	if scope != "all" {
+		args = append(args, "--author", "@me")
+	}
+	args = append(args, "--json", "number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt")
+	if err := ghJSONIn(ctx, dir, &raw, args...); err != nil {
+		return nil, err
+	}
+	out := make([]PRInfo, 0, len(raw))
+	for _, pr := range raw {
+		out = append(out, PRInfo{
+			Number: pr.Number, Title: pr.Title, Author: pr.Author.Login,
+			URL: pr.URL, State: pr.State, HeadSHA: pr.HeadRefOid,
+			HeadRef: pr.HeadRefName, BaseRef: pr.BaseRefName,
+			Mergeable: pr.Mergeable, IsDraft: pr.IsDraft, UpdatedAt: pr.UpdatedAt,
+		})
+	}
+	return out, nil
 }
 
 // CommitStatus is one entry from the combined status API.
