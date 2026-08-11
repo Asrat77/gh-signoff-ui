@@ -18,17 +18,18 @@ type ProductSummary struct {
 }
 
 type RepositoryState struct {
-	ID               string                    `json:"id"`
-	Path             string                    `json:"path"`
-	NameWithOwner    string                    `json:"nameWithOwner"`
-	DefaultBranch    string                    `json:"defaultBranch"`
-	CurrentBranch    string                    `json:"currentBranch"`
-	CurrentSHA       string                    `json:"currentSha"`
-	Enabled          bool                      `json:"enabled"`
-	PullRequestScope string                    `json:"pullRequestScope"`
-	Commands         map[string]CommandMapping `json:"commands"`
-	PullRequestCount int                       `json:"pullRequestCount"`
-	Error            string                    `json:"error"`
+	ID                    string                    `json:"id"`
+	Path                  string                    `json:"path"`
+	NameWithOwner         string                    `json:"nameWithOwner"`
+	DefaultBranch         string                    `json:"defaultBranch"`
+	CurrentBranch         string                    `json:"currentBranch"`
+	CurrentSHA            string                    `json:"currentSha"`
+	Enabled               bool                      `json:"enabled"`
+	PullRequestScope      string                    `json:"pullRequestScope"`
+	Commands              map[string]CommandMapping `json:"commands"`
+	PullRequestCount      int                       `json:"pullRequestCount"`
+	PullRequestsTruncated bool                      `json:"pullRequestsTruncated"`
+	Error                 string                    `json:"error"`
 }
 
 type PullRequestState struct {
@@ -262,12 +263,13 @@ func buildRepositoryState(ctx context.Context, tracked TrackedRepository) (Repos
 	view.CurrentBranch = info.CurrentBranch
 	view.CurrentSHA = info.HeadSHA
 
-	prs, err := readPullRequests(ctx, tracked.Path, tracked.PullRequestScope)
+	prs, truncated, err := readPullRequests(ctx, tracked.Path, tracked.PullRequestScope)
 	if err != nil {
 		view.Error = err.Error()
 		return view, []PullRequestState{}, []ActivityEvent{}
 	}
 	view.PullRequestCount = len(prs)
+	view.PullRequestsTruncated = truncated
 	states := make([]PullRequestState, 0, len(prs))
 	events := []ActivityEvent{}
 	protection := map[string]struct {

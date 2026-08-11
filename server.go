@@ -531,6 +531,9 @@ func (s *server) handleRunAndSignoff(w http.ResponseWriter, r *http.Request) {
 func streamProcess(ctx context.Context, dir, name string, args []string, send func(string, string)) int {
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
+	configureProcessGroup(cmd)
+	cmd.Cancel = func() error { return cancelProcessGroup(cmd) }
+	cmd.WaitDelay = 2 * time.Second
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		send("line", "could not capture output: "+err.Error())
@@ -591,7 +594,7 @@ func (s *server) handleRules(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	body.Branch = strings.TrimSpace(body.Branch)
-	if _, _, code, err := runIn(r.Context(), repo.Path, "git", "check-ref-format", "--branch", body.Branch); err != nil || code != 0 {
+	if !validBranchName(r.Context(), repo.Path, body.Branch) {
 		http.Error(w, "invalid branch name", http.StatusBadRequest)
 		return
 	}
@@ -713,6 +716,14 @@ func validContextName(s string) bool {
 		}
 	}
 	return true
+}
+
+func validBranchName(ctx context.Context, dir, branch string) bool {
+	if branch == "" || strings.HasPrefix(branch, "-") {
+		return false
+	}
+	_, _, code, err := runIn(ctx, dir, "git", "check-ref-format", "--branch", branch)
+	return err == nil && code == 0
 }
 
 func mergeSignoffContexts(existing, desired []string) []string {

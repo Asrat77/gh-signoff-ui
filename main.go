@@ -45,8 +45,10 @@ func renderIndex(token string, readOnly bool) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	nonce := newToken()
 	b = bytes.ReplaceAll(b, []byte("{{TOKEN}}"), []byte(token))
 	b = bytes.ReplaceAll(b, []byte("{{READONLY}}"), []byte(fmt.Sprint(readOnly)))
+	b = bytes.ReplaceAll(b, []byte("{{NONCE}}"), []byte(nonce))
 	return b, nil
 }
 
