@@ -25,6 +25,7 @@
   let paletteActions = [];
   let paletteIndex = 0;
   let pollTimer = null;
+  let terminalRenderQueued = false;
 
   const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -158,6 +159,17 @@
     </div></section>`;
   }
 
+  function staleDataNotice() {
+    return loadError ? `<div class="notice red" role="status">Refresh failed: ${esc(loadError)}. Showing the last successful state.</div>` : "";
+  }
+
+  function pullRequestLimitNotice() {
+    const repositories = (product?.repositories || []).filter((repo) => repo.pullRequestsTruncated);
+    if (!repositories.length) return "";
+    const names = repositories.map((repo) => repo.nameWithOwner).join(", ");
+    return `<div class="notice">Showing the first 30 open pull requests for ${esc(names)}. Open the repository on GitHub to inspect the remaining pull requests.</div>`;
+  }
+
   function renderPopover() {
     if (loading && !product) {
       return `<div class="popover-shell">${popoverHeader()}${emptyState("Reading pull requests", "Checking tracked repositories and branch protection…")}</div>`;
@@ -188,6 +200,8 @@
     }
     return `<div class="popover-shell">
       ${popoverHeader()}
+      ${staleDataNotice()}
+      ${pullRequestLimitNotice()}
       <div class="filter-bar">
         <button class="filter-button ${filter === "attention" ? "active" : ""}" data-filter="attention">Needs attention <span class="filter-count">${product.summary.needsAttention}</span></button>
         <button class="filter-button ${filter === "all" ? "active" : ""}" data-filter="all">All <span class="filter-count">${product.summary.totalPullRequests}</span></button>
@@ -220,6 +234,8 @@
     return `<div class="popover-shell">
       ${popoverHeader(pr)}
       <div class="popover-content">
+        ${staleDataNotice()}
+        ${pullRequestLimitNotice()}
         <section class="focus-hero">
           <div class="eyebrow"><span class="repo">${esc(pr.repo)}</span><span>·</span><span>#${pr.pr.number}</span><span>·</span><span class="branch mono">${esc(pr.pr.headRef)}</span></div>
           <h1 class="focus-title">${esc(pr.pr.title)}</h1>
@@ -258,7 +274,7 @@
     else if (settingsTab === "history") page = settingsHistory();
     else if (settingsTab === "diagnostics") page = settingsDiagnostics();
     else page = settingsRepositories();
-    return `<div class="settings-shell">${settingsMeta()}<section class="settings-main">${page}</section></div>`;
+    return `<div class="settings-shell">${settingsMeta()}<section class="settings-main">${staleDataNotice()}${page}</section></div>`;
   }
 
   function settingsHeader(title, detail, action = "") {
@@ -267,7 +283,7 @@
 
   function settingsRepositories() {
     const rows = product.repositories.map((repo) => `<div class="repo-setting-row">
-      <div><div class="repo-name">${esc(repo.nameWithOwner)}</div><div class="repo-path mono">${esc(repo.path)}</div>${repo.error ? `<div class="history-state failure">${esc(repo.error)}</div>` : ""}</div>
+      <div><div class="repo-name">${esc(repo.nameWithOwner)}</div><div class="repo-path mono">${esc(repo.path)}</div>${repo.error ? `<div class="history-state failure">${esc(repo.error)}</div>` : ""}${repo.pullRequestsTruncated ? '<div class="notice">Showing the first 30 open pull requests.</div>' : ""}</div>
       <select class="select" data-repo-scope="${esc(repo.id)}" aria-label="Pull request scope"><option value="mine" ${repo.pullRequestScope !== "all" ? "selected" : ""}>My PRs</option><option value="all" ${repo.pullRequestScope === "all" ? "selected" : ""}>All open PRs</option></select>
       <div style="display:flex;align-items:center;gap:10px"><input class="toggle" type="checkbox" data-repo-enabled="${esc(repo.id)}" ${repo.enabled ? "checked" : ""} aria-label="Track ${esc(repo.nameWithOwner)}"><button class="button danger" data-remove-repo="${esc(repo.id)}">Remove</button></div>
     </div>`).join("");
@@ -301,7 +317,7 @@
     const pr = product.pullRequests.find((item) => item.repoId === repo.id);
     const branch = pr?.rules?.branch || repo.defaultBranch || "main";
     const checks = (pr?.rules?.signoffContexts || []).map((name) => name === "signoff" ? "signoff" : name.replace(/^signoff\//, "")).join(", ");
-    const unreadable = pr && !pr.rules.readable;
+    const unreadable = Boolean(pr) && !pr?.rules?.readable;
     return `${settingsHeader("Branch rules", "Change only required status-check contexts; reviews, restrictions, and other protection remain intact.", repoSelector(repo))}<div class="settings-section">
       ${unreadable ? '<div class="notice red">Branch protection is not readable with your current GitHub permissions, so editing is disabled.</div>' : '<div class="notice">Unlike gh signoff uninstall, this editor never deletes the branch protection rule. External status checks are preserved.</div>'}
       <form id="rulesForm" class="list-card" style="padding:16px">
@@ -318,7 +334,7 @@
 
   function settingsDiagnostics() {
     const env = product.env;
-    const row = (label, value) => `<dt>${esc(label)}</dt><dd class="mono">${esc(value || "—")}</dd>`;
+    const row = (label, value) => `<dt>${esc(label)}</dt><dd class="mono">${esc(value === 0 ? "0" : value || "—")}</dd>`;
     return `${settingsHeader("Diagnostics", "Current local integration state. Authentication remains owned by GitHub CLI.", '<button class="button ghost" data-action="refresh">Run checks again</button>')}<div class="settings-section">${product.demo ? '<div class="notice">Demo mode is active. Nothing is read from or written to GitHub.</div>' : ""}<dl class="diagnostic-grid">${row("GitHub CLI", env.ghInstalled ? env.ghVersion : "Not installed")}${row("GitHub account", env.authenticated ? env.login : "Not authenticated")}${row("gh-signoff", env.signoffInstalled ? env.signoffVersion : "Not installed")}${row("Tracked repositories", product.repositories.length)}${row("Open pull requests", product.summary.totalPullRequests)}${row("Config", product.configPath)}${row("Last refresh", formatDate(product.fetchedAt))}${row("Mode", READ_ONLY ? "Read only" : "Read and write")}</dl></div>`;
   }
 
@@ -490,8 +506,7 @@
           } else if (eventName === "done") {
             try { result = JSON.parse(data); } catch { result = { code: 1 }; }
           }
-          render();
-          scrollTerminal();
+          scheduleTerminalRender();
         }
       }
       terminal.running = false;
@@ -512,6 +527,16 @@
     requestAnimationFrame(() => {
       const output = document.querySelector("#terminalOutput");
       if (output) output.scrollTop = output.scrollHeight;
+    });
+  }
+
+  function scheduleTerminalRender() {
+    if (terminalRenderQueued) return;
+    terminalRenderQueued = true;
+    requestAnimationFrame(() => {
+      terminalRenderQueued = false;
+      render();
+      scrollTerminal();
     });
   }
 

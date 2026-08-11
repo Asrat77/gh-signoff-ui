@@ -221,26 +221,40 @@ type PRInfo struct {
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
+const pullRequestLimit = 30
+
+const pullRequestJSONFields = "number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt"
+
+type rawPR struct {
+	Number int    `json:"number"`
+	Title  string `json:"title"`
+	URL    string `json:"url"`
+	State  string `json:"state"`
+	Author struct {
+		Login string `json:"login"`
+	} `json:"author"`
+	HeadRefOid  string    `json:"headRefOid"`
+	HeadRefName string    `json:"headRefName"`
+	BaseRefName string    `json:"baseRefName"`
+	Mergeable   string    `json:"mergeable"`
+	IsDraft     bool      `json:"isDraft"`
+	UpdatedAt   time.Time `json:"updatedAt"`
+}
+
+func (raw rawPR) toPRInfo() PRInfo {
+	return PRInfo{
+		Number: raw.Number, Title: raw.Title, Author: raw.Author.Login,
+		URL: raw.URL, State: raw.State, HeadSHA: raw.HeadRefOid,
+		HeadRef: raw.HeadRefName, BaseRef: raw.BaseRefName,
+		Mergeable: raw.Mergeable, IsDraft: raw.IsDraft, UpdatedAt: raw.UpdatedAt,
+	}
+}
+
 // readPR returns the PR for the current branch. A missing PR is an expected
 // state, not an error: you are often on a branch before opening one.
 func readPR(ctx context.Context, dir string) (*PRInfo, error) {
-	var raw struct {
-		Number int    `json:"number"`
-		Title  string `json:"title"`
-		URL    string `json:"url"`
-		State  string `json:"state"`
-		Author struct {
-			Login string `json:"login"`
-		} `json:"author"`
-		HeadRefOid  string    `json:"headRefOid"`
-		HeadRefName string    `json:"headRefName"`
-		BaseRefName string    `json:"baseRefName"`
-		Mergeable   string    `json:"mergeable"`
-		IsDraft     bool      `json:"isDraft"`
-		UpdatedAt   time.Time `json:"updatedAt"`
-	}
-	err := ghJSONIn(ctx, dir, &raw, "pr", "view", "--json",
-		"number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt")
+	var raw rawPR
+	err := ghJSONIn(ctx, dir, &raw, "pr", "view", "--json", pullRequestJSONFields)
 	if err != nil {
 		if notFound(err) || strings.Contains(err.Error(), "no pull requests found") ||
 			strings.Contains(err.Error(), "no open pull requests") {
@@ -248,58 +262,37 @@ func readPR(ctx context.Context, dir string) (*PRInfo, error) {
 		}
 		return nil, err
 	}
-	return &PRInfo{
-		Number:    raw.Number,
-		Title:     raw.Title,
-		Author:    raw.Author.Login,
-		URL:       raw.URL,
-		State:     raw.State,
-		HeadSHA:   raw.HeadRefOid,
-		HeadRef:   raw.HeadRefName,
-		BaseRef:   raw.BaseRefName,
-		Mergeable: raw.Mergeable,
-		IsDraft:   raw.IsDraft,
-		UpdatedAt: raw.UpdatedAt,
-	}, nil
+	info := raw.toPRInfo()
+	return &info, nil
 }
 
 // readPullRequests returns the open pull requests Signoff should track for a
 // repository. "mine" follows the original All my PRs intent; "all" is useful
 // for small teams sharing one workstation context.
-func readPullRequests(ctx context.Context, dir, scope string) ([]PRInfo, error) {
-	var raw []struct {
-		Number int    `json:"number"`
-		Title  string `json:"title"`
-		URL    string `json:"url"`
-		State  string `json:"state"`
-		Author struct {
-			Login string `json:"login"`
-		} `json:"author"`
-		HeadRefOid  string    `json:"headRefOid"`
-		HeadRefName string    `json:"headRefName"`
-		BaseRefName string    `json:"baseRefName"`
-		Mergeable   string    `json:"mergeable"`
-		IsDraft     bool      `json:"isDraft"`
-		UpdatedAt   time.Time `json:"updatedAt"`
-	}
-	args := []string{"pr", "list", "--state", "open", "--limit", "30"}
+func readPullRequests(ctx context.Context, dir, scope string) ([]PRInfo, bool, error) {
+	var raw []rawPR
+	args := []string{"pr", "list", "--state", "open", "--limit", fmt.Sprintf("%d", pullRequestLimit+1)}
 	if scope != "all" {
 		args = append(args, "--author", "@me")
 	}
-	args = append(args, "--json", "number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt")
+	args = append(args, "--json", pullRequestJSONFields)
 	if err := ghJSONIn(ctx, dir, &raw, args...); err != nil {
-		return nil, err
+		return nil, false, err
 	}
+	truncated := false
+	raw, truncated = limitPullRequests(raw)
 	out := make([]PRInfo, 0, len(raw))
 	for _, pr := range raw {
-		out = append(out, PRInfo{
-			Number: pr.Number, Title: pr.Title, Author: pr.Author.Login,
-			URL: pr.URL, State: pr.State, HeadSHA: pr.HeadRefOid,
-			HeadRef: pr.HeadRefName, BaseRef: pr.BaseRefName,
-			Mergeable: pr.Mergeable, IsDraft: pr.IsDraft, UpdatedAt: pr.UpdatedAt,
-		})
+		out = append(out, pr.toPRInfo())
 	}
-	return out, nil
+	return out, truncated, nil
+}
+
+func limitPullRequests(raw []rawPR) ([]rawPR, bool) {
+	if len(raw) <= pullRequestLimit {
+		return raw, false
+	}
+	return raw[:pullRequestLimit], true
 }
 
 // CommitStatus is one entry from the combined status API.
