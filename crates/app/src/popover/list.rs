@@ -31,6 +31,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
         if ui.add(IconButton::new(icons::SETTINGS, "Settings")).clicked() {
             app.settings_open = true;
         }
+        parts::palette_button(ui, app);
         refresh_button(ui, app);
     });
     let mut action = None;

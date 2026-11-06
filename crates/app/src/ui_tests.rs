@@ -931,3 +931,92 @@ fn settings_offers_install_only_when_the_extension_is_missing() {
     harness.run_ok();
     assert!(harness.query_by_label("Install").is_none());
 }
+
+fn palette_open(harness: &Harness<'static, Signoff>) -> bool {
+    harness.state().glance.palette.is_some()
+}
+
+#[test]
+fn the_command_shortcut_opens_and_closes_the_palette() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    assert!(!palette_open(&harness));
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    assert!(palette_open(&harness));
+    assert!(harness.query_by_label_contains("Open #").is_some());
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    assert!(!palette_open(&harness));
+}
+
+#[test]
+fn the_band_button_opens_the_palette() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.get_by_label_contains("Search and run actions").click();
+    harness.run_ok();
+    assert!(palette_open(&harness));
+}
+
+#[test]
+fn typing_filters_the_palette_and_enter_opens_the_pull_request() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    harness.event(egui::Event::Text("poller".into()));
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("Refresh all repositories").is_none(), "filtered out");
+    assert!(harness.query_by_label_contains("#485 Fix race condition in poller").is_some());
+    harness.key_press(egui::Key::Enter);
+    harness.run_ok();
+    assert!(!palette_open(&harness));
+    let page = harness.state().glance.page.clone();
+    let popover::Page::PullRequest { repo_id, number } = page else { panic!("a pull request page, got {page:?}") };
+    let pr = harness.state().state.pull_request(&repo_id, number).expect("pr");
+    assert!(pr.pr.title.contains("poller"));
+}
+
+#[test]
+fn arrow_keys_move_the_selection_before_enter() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_ok();
+    harness.key_press(egui::Key::ArrowUp);
+    harness.run_ok();
+    harness.key_press(egui::Key::ArrowDown);
+    harness.run_ok();
+    assert_eq!(harness.state().glance.palette.as_ref().map(|p| p.selected()), Some(1));
+}
+
+#[test]
+fn clicking_a_result_runs_it() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    harness.event(egui::Event::Text("manage".into()));
+    harness.run_ok();
+    harness.get_by_label_contains("Manage repositories").click();
+    harness.run_ok();
+    assert!(!palette_open(&harness));
+    assert!(harness.state().settings_open);
+    assert_eq!(harness.state().settings.section, settings::Section::Repositories);
+}
+
+#[test]
+fn escape_closes_the_palette_and_is_taken_from_the_window() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(!palette_open(&harness));
+    // The window's own handler hides the popover on Escape only while the
+    // palette is closed; it is open when that handler runs for this key.
+}

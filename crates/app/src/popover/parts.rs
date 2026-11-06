@@ -41,6 +41,14 @@ pub(super) fn refresh_button(ui: &mut Ui, app: &Signoff) {
     }
 }
 
+/// The band's search button, which opens the command palette; its tooltip
+/// names the shortcut.
+pub(super) fn palette_button(ui: &mut Ui, app: &mut Signoff) {
+    if ui.add(IconButton::new(icons::SEARCH, &super::command_palette::hint())).clicked() {
+        super::command_palette::toggle(app);
+    }
+}
+
 /// A raised row with a glyph and wrapped text, for errors and warnings
 /// that are not a pull request of their own.
 pub(super) fn notice(ui: &mut Ui, status: Status, text: &str) {
