@@ -490,6 +490,14 @@ impl ProductService {
         Self { source, state: RwLock::new(ProductState::default()), refreshing: Mutex::new(()) }
     }
 
+    /// Serves `state` as if just refreshed, for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn with_state(state: ProductState) -> Self {
+        let service = Self::demo();
+        *service.state.write().unwrap_or_else(PoisonError::into_inner) = state;
+        service
+    }
+
     /// Whether this serves demo data.
     pub fn is_demo(&self) -> bool {
         matches!(self.source, Source::Demo)
@@ -515,7 +523,12 @@ impl ProductService {
         self.state.write().unwrap_or_else(PoisonError::into_inner).refreshing = true;
 
         let mut next = match &self.source {
-            Source::Demo => crate::demo::product_state(Timestamp::now()),
+            // Demo data only changes through demo runs; a refresh must not
+            // undo them.
+            Source::Demo => {
+                let current = self.cached();
+                if current.fetched_at.is_some() { current } else { crate::demo::product_state(Timestamp::now()) }
+            }
             Source::GitHub { gh, config, history, seed_dir, cache } => {
                 let config_path = config.path().to_owned();
                 build_product_state(
@@ -639,6 +652,7 @@ mod tests {
         assert!(pr.ready);
         assert_eq!(pr.status, Health::Ready);
         assert_eq!(service.cached().history[0].kind, ActivityKind::Run);
+        assert!(service.refresh().pull_request("demo-signoff", 482).expect("pr").ready, "kept across refresh");
     }
 
     /// One repository end to end against recorded `gh` output: a failing

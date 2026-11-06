@@ -8,6 +8,7 @@ use fastframe_shell::{Closed, Headless, Held, Lease, Resident};
 use fastframe_tray::{Event, Tray};
 use signoff_core::{Health, ProductState};
 
+use crate::runs::Runs;
 use crate::worker::Refresher;
 use crate::{theme, tray, views};
 
@@ -15,6 +16,8 @@ use crate::{theme, tray, views};
 pub(crate) struct Signoff {
     tray: Option<Tray>,
     refresher: Refresher,
+    /// Verify-and-sign-off runs.
+    pub(crate) runs: Runs,
     /// The latest state copied from the refresher.
     pub(crate) state: ProductState,
     seen: u64,
@@ -29,10 +32,11 @@ pub(crate) struct Signoff {
 }
 
 impl Signoff {
-    pub(crate) fn new(tray: Option<Tray>, refresher: Refresher, demo: bool) -> Self {
+    pub(crate) fn new(tray: Option<Tray>, refresher: Refresher, runs: Runs, demo: bool) -> Self {
         Self {
             tray,
             refresher,
+            runs,
             state: ProductState::default(),
             seen: 0,
             shown_health: None,
@@ -87,6 +91,10 @@ impl Signoff {
             }
         }
 
+        // A signoff changes GitHub's statuses; show them.
+        if self.runs.take_signed_off() {
+            self.refresh();
+        }
         if let Some(state) = self.refresher.changed_since(&mut self.seen) {
             self.state = state;
         }
@@ -142,6 +150,7 @@ impl Resident for Signoff {
     }
 
     fn shutdown(&mut self) {
+        self.runs.stop_all();
         self.refresher.stop();
     }
 }

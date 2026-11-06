@@ -7,6 +7,7 @@
 
 mod app;
 mod paths;
+mod runs;
 mod theme;
 mod tray;
 mod views;
@@ -17,7 +18,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use fastframe_shell::{Shell, Waker};
-use signoff_core::{ConfigStore, Gh, HistoryStore, ProductService};
+use signoff_core::{ConfigStore, Gh, HistoryStore, ProductService, Runner, SystemRunner, Verifier};
 
 /// What the command line asked for.
 #[derive(Debug, Default)]
@@ -72,8 +73,8 @@ fn main() -> ExitCode {
         }
     };
 
-    let service = match build_service(&args) {
-        Ok(service) => Arc::new(service),
+    let (service, verifier) = match build_service(&args) {
+        Ok(built) => built,
         Err(message) => {
             log::error!("{message}");
             eprintln!("Signoff could not start: {message}");
@@ -86,6 +87,10 @@ fn main() -> ExitCode {
         let wake = waker.clone();
         worker::Refresher::spawn(service, move || wake.wake())
     };
+    let runs = {
+        let wake = waker.clone();
+        runs::Runs::new(verifier, move || wake.wake())
+    };
     let tray = {
         let wake = waker.clone();
         tray::spawn(move || wake.wake())
@@ -94,7 +99,7 @@ fn main() -> ExitCode {
         log::warn!("no tray is available; closing the window will quit");
     }
 
-    let app = app::Signoff::new(tray, refresher, args.demo);
+    let app = app::Signoff::new(tray, refresher, runs, args.demo);
     let result = Shell::new(app, &waker).idle(fastframe_tray::idle).start_hidden(args.hidden).run(|lease| {
         eframe::run_native("Signoff", app::native_options(), Box::new(move |cc| Ok(app::window(cc, lease))))
     });
@@ -107,10 +112,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn build_service(args: &Args) -> Result<ProductService, String> {
+/// The state service and the verifier that runs checks against it.
+fn build_service(args: &Args) -> Result<(Arc<ProductService>, Arc<Verifier>), String> {
     if args.demo {
         log::info!("demo mode: nothing is read from or written to GitHub");
-        return Ok(ProductService::demo());
+        let service = Arc::new(ProductService::demo());
+        let verifier = Arc::new(Verifier::demo(service.clone()));
+        return Ok((service, verifier));
     }
     let config_path = match &args.config {
         Some(path) => path.clone(),
@@ -120,6 +128,10 @@ fn build_service(args: &Args) -> Result<ProductService, String> {
     let config = ConfigStore::open(&config_path).map_err(|err| err.to_string())?;
     let history =
         HistoryStore::open(signoff_core::history::default_history_path(&config_path)).map_err(|err| err.to_string())?;
+    let (config, history) = (Arc::new(config), Arc::new(history));
+    let runner: Arc<dyn Runner> = Arc::new(SystemRunner::default());
     let seed_dir = std::env::current_dir().ok();
-    Ok(ProductService::new(Gh::default(), Arc::new(config), Arc::new(history), seed_dir))
+    let service = Arc::new(ProductService::new(Gh::new(runner.clone()), config.clone(), history.clone(), seed_dir));
+    let verifier = Arc::new(Verifier::new(service.clone(), runner, config, history));
+    Ok((service, verifier))
 }

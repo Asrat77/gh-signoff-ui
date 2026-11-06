@@ -4,9 +4,11 @@
 //! directory and timeouts are handled in one place, and tests can replay
 //! recorded `gh` output instead of reaching the network.
 
-use std::io::{self, Read, Write as _};
+use std::io::{self, BufRead as _, BufReader, Read, Write as _};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,13 @@ pub struct Output {
 
 /// Exit code reported for a process killed by its timeout, as `timeout(1)`.
 pub const TIMED_OUT: i32 = 124;
+/// Exit code reported for a process stopped by the user, as a shell does
+/// for Ctrl-C.
+pub const CANCELLED: i32 = 130;
+
+/// How long output is still read after a process exits, for grandchildren
+/// that inherited its pipes.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
 
 /// Runs a program to completion.
 pub trait Runner: Send + Sync {
@@ -33,6 +42,36 @@ pub trait Runner: Send + Sync {
     ///
     /// Only when the program could not be started at all.
     fn run(&self, dir: Option<&Path>, input: Option<&str>, program: &str, args: &[&str]) -> io::Result<Output>;
+
+    /// Runs `program` with `args` in `dir`, passing each line it writes to
+    /// stdout or stderr to `on_line` as it arrives, and returns its exit
+    /// code.
+    ///
+    /// The process, and everything it started, is killed after `timeout`
+    /// ([`TIMED_OUT`]) or once `cancel` is set ([`CANCELLED`]).
+    ///
+    /// The default runs [`Runner::run`] and replays its output afterwards,
+    /// which is enough for recorded output in tests.
+    ///
+    /// # Errors
+    ///
+    /// Only when the program could not be started at all.
+    fn stream(
+        &self,
+        dir: Option<&Path>,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+        cancel: &AtomicBool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> io::Result<i32> {
+        let _ = (timeout, cancel);
+        let out = self.run(dir, None, program, args)?;
+        for line in out.stdout.lines().chain(out.stderr.lines()) {
+            on_line(line);
+        }
+        Ok(out.code)
+    }
 }
 
 /// Runs real processes, killing any that outlive `timeout`.
@@ -59,13 +98,7 @@ impl Runner for SystemRunner {
         if let Some(dir) = dir {
             command.current_dir(dir);
         }
-        // A GUI app on Windows must not flash a console for every `gh` call.
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
+        hide_console(&mut command);
 
         let mut child = command.spawn()?;
         if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
@@ -106,6 +139,154 @@ impl Runner for SystemRunner {
             stderr: stderr.trim().to_owned(),
             code: status.code().unwrap_or(-1),
         })
+    }
+
+    fn stream(
+        &self,
+        dir: Option<&Path>,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+        cancel: &AtomicBool,
+        on_line: &mut dyn FnMut(&str),
+    ) -> io::Result<i32> {
+        let mut command = Command::new(program);
+        pass_args(&mut command, program, args);
+        command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        if let Some(dir) = dir {
+            command.current_dir(dir);
+        }
+        hide_console(&mut command);
+        // Its own process group, so a timeout can stop everything a build
+        // script started, not just the shell.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
+
+        let mut child = command.spawn()?;
+        let (lines, inbox) = mpsc::channel();
+        if let Some(pipe) = child.stdout.take() {
+            forward_lines(pipe, lines.clone());
+        }
+        if let Some(pipe) = child.stderr.take() {
+            forward_lines(pipe, lines);
+        }
+
+        let deadline = Instant::now() + timeout;
+        let code = loop {
+            while let Ok(line) = inbox.recv_timeout(Duration::from_millis(15)) {
+                on_line(&line);
+            }
+            if let Some(status) = child.try_wait()? {
+                break status.code().unwrap_or(-1);
+            }
+            if cancel.load(Ordering::Acquire) {
+                kill_tree(&mut child);
+                on_line("stopped");
+                break CANCELLED;
+            }
+            if Instant::now() >= deadline {
+                kill_tree(&mut child);
+                on_line(&format!("timed out after {}", human_duration(timeout)));
+                break TIMED_OUT;
+            }
+        };
+
+        // Lines still in flight, until every writer closed its end or a
+        // background grandchild is clearly keeping a pipe open.
+        let grace = Instant::now() + DRAIN_GRACE;
+        while let Some(left) = grace.checked_duration_since(Instant::now()) {
+            match inbox.recv_timeout(left) {
+                Ok(line) => on_line(&line),
+                Err(_) => break,
+            }
+        }
+        Ok(code)
+    }
+}
+
+/// A GUI app on Windows must not flash a console for every process.
+fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
+/// `cmd` does its own parsing of `/S /C "..."`, which Rust's quoting for
+/// ordinary programs would break, so its arguments go through verbatim.
+fn pass_args(command: &mut Command, program: &str, args: &[&str]) {
+    #[cfg(windows)]
+    if program.eq_ignore_ascii_case("cmd") {
+        use std::os::windows::process::CommandExt as _;
+        for arg in args {
+            command.raw_arg(arg);
+        }
+        return;
+    }
+    let _ = program;
+    command.args(args);
+}
+
+/// Kills `child` and every process it started.
+fn kill_tree(child: &mut Child) {
+    let pid = child.id().to_string();
+    // `unsafe` is off, so the group is signalled through the system tools
+    // rather than libc.
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(windows)]
+    {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/T", "/F", "/PID", &pid]).stdout(Stdio::null()).stderr(Stdio::null());
+        hide_console(&mut taskkill);
+        let _ = taskkill.status();
+    }
+    #[cfg(not(any(unix, windows)))]
+    let _ = pid;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Sends each line `pipe` writes, without its line ending, until it closes.
+fn forward_lines(pipe: impl Read + Send + 'static, lines: mpsc::Sender<String>) {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(pipe);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf);
+                    if lines.send(line.trim_end_matches(['\r', '\n']).to_owned()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// `90s`, `5m`, `1h 30m`.
+pub fn human_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    match (secs / 3600, secs % 3600 / 60, secs % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, 0) => format!("{m}m"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, 0, _) => format!("{h}h"),
+        (h, m, _) => format!("{h}h {m}m"),
     }
 }
 
@@ -197,6 +378,73 @@ mod tests {
     fn a_missing_program_is_a_launch_error() {
         let runner = SystemRunner::default();
         assert!(runner.run(None, None, "signoff-no-such-program", &[]).is_err());
+    }
+
+    fn stream(program: &str, args: &[&str], timeout: Duration, cancel: &AtomicBool) -> (i32, Vec<String>) {
+        let mut lines = Vec::new();
+        let code = SystemRunner::default()
+            .stream(None, program, args, timeout, cancel, &mut |line| lines.push(line.to_owned()))
+            .expect("spawn");
+        (code, lines)
+    }
+
+    #[test]
+    fn streams_both_pipes_line_by_line() {
+        let (program, args): (&str, &[&str]) = if cfg!(windows) {
+            ("cmd", &["/D", "/S", "/C", "\"echo one& echo two 1>&2& exit 4\""])
+        } else {
+            ("sh", &["-c", "echo one; echo two >&2; exit 4"])
+        };
+        let (code, lines) = stream(program, args, Duration::from_secs(10), &AtomicBool::new(false));
+        assert_eq!(code, 4);
+        let mut sorted: Vec<&str> = lines.iter().map(|l| l.trim_end()).collect();
+        sorted.sort_unstable();
+        assert_eq!(sorted, ["one", "two"]);
+    }
+
+    #[test]
+    fn streaming_a_missing_program_is_a_launch_error() {
+        let runner = SystemRunner::default();
+        let cancel = AtomicBool::new(false);
+        assert!(
+            runner.stream(None, "signoff-no-such-program", &[], Duration::from_secs(1), &cancel, &mut |_| {}).is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_timeout_kills_the_whole_process_group() {
+        let started = Instant::now();
+        let (code, lines) = stream(
+            "sh",
+            &["-c", "echo started; sleep 30 & sleep 30; echo never"],
+            Duration::from_millis(300),
+            &AtomicBool::new(false),
+        );
+        assert_eq!(code, TIMED_OUT);
+        assert_eq!(lines.first().map(String::as_str), Some("started"));
+        assert!(lines.iter().any(|l| l.starts_with("timed out")));
+        assert!(!lines.iter().any(|l| l == "never"));
+        // The background sleep held the pipes; it was killed with the group.
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_stops_when_cancelled() {
+        let cancel = AtomicBool::new(true);
+        let (code, lines) = stream("sh", &["-c", "sleep 30"], Duration::from_secs(60), &cancel);
+        assert_eq!(code, CANCELLED);
+        assert_eq!(lines.last().map(String::as_str), Some("stopped"));
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(human_duration(Duration::from_secs(45)), "45s");
+        assert_eq!(human_duration(Duration::from_secs(90)), "1m 30s");
+        assert_eq!(human_duration(Duration::from_secs(1800)), "30m");
+        assert_eq!(human_duration(Duration::from_secs(5400)), "1h 30m");
+        assert_eq!(human_duration(Duration::from_secs(7200)), "2h");
     }
 
     #[cfg(unix)]
