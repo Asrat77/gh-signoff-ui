@@ -3,7 +3,7 @@
 use egui::{Align, Frame, Layout, Margin, Rect, RichText, Sense, Ui, Vec2, ViewportCommand};
 use signoff_core::Environment;
 use signoff_ui::theme::{radius, size, space};
-use signoff_ui::widgets::{Band, IconButton, Mood, spinner};
+use signoff_ui::widgets::{Band, Button, ButtonKind, IconButton, Mood, spinner};
 use signoff_ui::{Status, Type, icons, palette};
 
 use crate::app::Signoff;
@@ -54,6 +54,36 @@ pub(super) fn notice(ui: &mut Ui, status: Status, text: &str) {
         });
     });
     ui.add_space(space::S);
+}
+
+/// Whether the popover should offer to install `gh signoff`: `gh` is ready
+/// and only the extension is missing.
+pub(super) fn needs_extension(env: &Environment) -> bool {
+    env.gh_installed && env.authenticated && !env.signoff_installed
+}
+
+/// The notice that offers to install `gh signoff`, with its button. True
+/// when the button was pressed. `failure` is why the last try failed.
+pub(super) fn install_notice(ui: &mut Ui, installing: bool, failure: Option<&str>) -> bool {
+    let p = palette(ui.ctx());
+    let mut clicked = false;
+    Frame::new().fill(p.surface).corner_radius(radius::ROW).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
+            let status = if failure.is_some() { Status::Failing } else { Status::Attention };
+            ui.label(RichText::new(status.icon()).font(signoff_ui::fonts::icon(15.0)).color(status.color(&p)));
+            let text = failure.unwrap_or(
+                "gh signoff is not installed, so Signoff cannot write signoffs. It adds the gh signoff extension for you.",
+            );
+            ui.add(egui::Label::new(RichText::new(text).font(Type::Caption.font()).color(p.text)).wrap());
+        });
+        ui.add_space(space::S);
+        let label = if installing { "Installing gh signoff…" } else { "Install gh signoff" };
+        clicked = ui.add(Button::new(label).kind(ButtonKind::Secondary).enabled(!installing)).clicked();
+    });
+    ui.add_space(space::S);
+    clicked
 }
 
 /// A quiet centred line, such as "Updated 12s ago".

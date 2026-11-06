@@ -4,7 +4,7 @@
 use egui::{RichText, Slider, Ui};
 use signoff_core::ProductState;
 use signoff_ui::theme::space;
-use signoff_ui::widgets::{ToggleRow, toast};
+use signoff_ui::widgets::{Button, ButtonKind, ToggleRow, toast};
 use signoff_ui::{Status, Type, palette};
 
 use super::{Effects, Settings, parts};
@@ -30,7 +30,7 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
     ui.add_space(space::S);
 
     refresh_interval(ui, settings, effects);
-    environment(ui, state);
+    environment(ui, state, settings.installing, !settings.read_only(), effects);
 }
 
 fn notifications(ui: &mut Ui, settings: &Settings) {
@@ -73,7 +73,7 @@ fn refresh_interval(ui: &mut Ui, settings: &Settings, effects: &mut Effects) {
     });
 }
 
-fn environment(ui: &mut Ui, state: &ProductState) {
+fn environment(ui: &mut Ui, state: &ProductState, installing: bool, can_install: bool, effects: &mut Effects) {
     let env = &state.env;
     parts::label(ui, "This computer");
     parts::card(ui, |ui| {
@@ -108,6 +108,13 @@ fn environment(ui: &mut Ui, state: &ProductState) {
                 "run gh extension install basecamp/gh-signoff".into()
             },
         );
+        if env.gh_installed && env.authenticated && !env.signoff_installed && can_install {
+            ui.add_space(space::S);
+            let label = if installing { "Installing…" } else { "Install" };
+            if ui.add(Button::new(label).kind(ButtonKind::Secondary).enabled(!installing)).clicked() {
+                effects.install = true;
+            }
+        }
         if !state.config_path.as_os_str().is_empty() {
             ui.add_space(space::XS);
             parts::caption(ui, &format!("Config: {}", state.config_path.display()));
