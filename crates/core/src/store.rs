@@ -66,6 +66,9 @@ pub(crate) struct RepositoryRead {
     pub(crate) pull_requests: Vec<PullRequestState>,
     /// GitHub statuses, as activity.
     pub(crate) history: Vec<ActivityEvent>,
+    /// Not read for now (a rate limit): keep what the repository shows, and
+    /// show this read's error only if it shows nothing yet.
+    pub(crate) deferred: bool,
 }
 
 /// Permission to land a read of one repository, if nothing overtook it.
@@ -170,6 +173,12 @@ impl Store {
         self.probe.probed_for.is_some() && !ready(&self.state.env)
     }
 
+    /// Says in [`ProductState::warning`] that GitHub's rate limit stops
+    /// reads until `until`, or clears it. The warning is this one's alone.
+    pub(crate) fn set_rate_limit(&mut self, until: Option<Timestamp>) {
+        self.state.warning = until.map(crate::product::rate_limit_message);
+    }
+
     // --- Local patches ---------------------------------------------------
 
     /// Applies `config` at once and returns the repositories that need a
@@ -258,6 +267,9 @@ impl Store {
         let id = ticket.repo_id.clone();
         let fingerprint = fingerprint(&read);
         let shown = self.state.repositories.iter().any(|r| r.id == id && r.fetched_at.is_some());
+        if read.deferred && shown {
+            return false;
+        }
         let unchanged = shown
             && self.fingerprints.get(&id) == Some(&fingerprint)
             && !self.optimistic.iter().any(|o| o.repo_id == id);
@@ -269,7 +281,7 @@ impl Store {
             return true;
         }
         self.fingerprints.insert(id.clone(), fingerprint);
-        let RepositoryRead { mut repository, mut pull_requests, history } = read;
+        let RepositoryRead { mut repository, mut pull_requests, history, .. } = read;
         repository.fetched_at = Some(now);
         self.keep_optimistic(&id, &mut pull_requests, now);
         if let Some(slot) = self.state.repositories.iter_mut().find(|r| r.id == id) {
@@ -509,6 +521,7 @@ mod tests {
             },
             pull_requests: prs,
             history: Vec::new(),
+            deferred: false,
         }
     }
 

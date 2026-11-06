@@ -311,10 +311,28 @@ fn initial_view(tracked: &TrackedRepository) -> RepositoryState {
 }
 
 /// A read that ended in `err`.
+///
+/// A rate limit is not the repository's fault: the read is deferred, so
+/// what it showed stays, and only a repository never read shows why.
 fn failed(mut repository: RepositoryState, err: GhError) -> (RepositoryRead, bool) {
-    repository.error = Some(err.to_string());
+    let deferred = match &err {
+        GhError::Api(ApiError::RateLimited { until }) => {
+            repository.error = Some(rate_limit_message(*until));
+            true
+        }
+        _ => {
+            repository.error = Some(err.to_string());
+            false
+        }
+    };
     let environment_failed = err.is_environment_failure();
-    (RepositoryRead { repository, ..RepositoryRead::default() }, environment_failed)
+    (RepositoryRead { repository, deferred, ..RepositoryRead::default() }, environment_failed)
+}
+
+/// What to tell the user while GitHub's rate limit stops reads.
+pub(crate) fn rate_limit_message(until: Timestamp) -> String {
+    let at = until.to_zoned(jiff::tz::TimeZone::system()).strftime("%H:%M");
+    format!("GitHub's API rate limit is used up; Signoff reads again at {at}.")
 }
 
 /// Commit statuses read at once per repository over the API.
@@ -403,7 +421,7 @@ fn read_with_api(gh: &Gh, api: &Api, tracked: &TrackedRepository) -> Result<(Rep
         pull_requests.push(state);
         history.extend(events);
     }
-    Ok((RepositoryRead { repository: view, pull_requests, history }, false))
+    Ok((RepositoryRead { repository: view, pull_requests, history, deferred: false }, false))
 }
 
 /// `f` applied to every item, `workers` at a time, in order.
@@ -464,7 +482,7 @@ fn read_with_gh(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCache) -> (R
         pull_requests.push(state);
         history.extend(events);
     }
-    (RepositoryRead { repository: view, pull_requests, history }, false)
+    (RepositoryRead { repository: view, pull_requests, history, deferred: false }, false)
 }
 
 fn build_pull_request_state(
@@ -719,12 +737,24 @@ impl ProductService {
         let _busy = self.busy();
         let Some((ticket, tracked)) = self.mutate(|store| store.begin_read(id)) else { return false };
         let (read, environment_failed) = read_repository(gh, &tracked, cache);
+        let next_allowed = gh.next_allowed();
         self.mutate(|store| {
             if environment_failed {
                 store.invalidate_environment();
             }
+            store.set_rate_limit(next_allowed);
             store.land(&ticket, read, Timestamp::now())
         })
+    }
+
+    /// When GitHub's rate limit lets reads start again, if it stopped them.
+    /// Reads started before then do not reach GitHub, so a scheduler should
+    /// wait for it.
+    pub fn next_allowed(&self) -> Option<Timestamp> {
+        match &self.source {
+            Source::GitHub { gh, .. } => gh.next_allowed(),
+            Source::Demo => None,
+        }
     }
 
     /// Applies the config to the state at once: a removed or paused
@@ -1175,6 +1205,49 @@ mod tests {
         assert!(state.repositories[0].error.as_deref().is_some_and(|e| e.contains("gh auth login")));
         f.service.plan_refresh(false);
         assert_eq!(probes(&fake), 2);
+    }
+
+    fn rate_limited() -> crate::api::HttpResponse {
+        let reset = Timestamp::now().as_second() + 600;
+        crate::api::HttpResponse {
+            status: 403,
+            headers: vec![
+                ("X-RateLimit-Remaining".into(), "0".into()),
+                ("X-RateLimit-Reset".into(), reset.to_string()),
+            ],
+            body: r#"{"message":"API rate limit exceeded for user"}"#.into(),
+        }
+    }
+
+    /// A rate limit keeps what is shown, says why nothing moves, and stops
+    /// asking GitHub until it resets.
+    #[test]
+    fn a_rate_limit_keeps_the_last_read_and_warns() {
+        let (f, _, transport) = api_fixture(api_gh(true));
+        rest_answers(&transport);
+        let first = f.service.refresh();
+        assert_eq!((first.warning.as_ref(), f.service.next_allowed()), (None, None));
+
+        transport.answer("/pulls?", rate_limited());
+        let second = f.service.refresh();
+        assert_eq!(second.pull_requests, first.pull_requests, "still shown");
+        assert_eq!(second.repositories[0].error, None);
+        assert!(second.warning.as_deref().is_some_and(|w| w.contains("rate limit")));
+        assert!(f.service.next_allowed().is_some_and(|at| at > Timestamp::now()));
+
+        let sent = transport.sent().len();
+        f.service.refresh();
+        assert_eq!(transport.sent().len(), sent, "nothing is sent until it resets");
+    }
+
+    #[test]
+    fn a_rate_limit_before_the_first_read_says_why() {
+        let (f, _, transport) = api_fixture(api_gh(true));
+        transport.answer("/pulls?", rate_limited());
+        let state = f.service.refresh();
+        let repo = &state.repositories[0];
+        assert!(!repo.loading, "an answer, not a spinner");
+        assert!(repo.error.as_deref().is_some_and(|e| e.contains("reads again at")));
     }
 
     #[test]
