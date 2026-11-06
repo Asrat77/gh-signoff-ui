@@ -185,6 +185,23 @@ mod tests {
         assert!(affected(&routes, &[git.join("index"), git.join("HEAD.lock")]).is_empty());
     }
 
+    /// Signoff's own worktree of a tracked checkout is not tracked: what
+    /// preparing it writes (its HEAD, index and FETCH_HEAD under
+    /// `.git/worktrees`) is not the checkout changing.
+    #[test]
+    fn a_managed_worktree_changing_is_not_the_checkout_changing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = checkout(&dir.path().join("main"));
+        let own = git.join("worktrees").join("a1b2c3d4e5f60718");
+        fs::create_dir_all(&own).expect("mkdir");
+        let routes = vec![("main".to_owned(), watch_paths(&dir.path().join("main")).expect("main"))];
+        let written: Vec<PathBuf> =
+            ["HEAD", "index", "FETCH_HEAD", "ORIG_HEAD", "HEAD.lock"].iter().map(|name| own.join(name)).collect();
+        assert!(affected(&routes, &written).is_empty());
+        assert!(affected(&routes, &[git.join("worktrees"), own.clone()]).is_empty());
+        assert_eq!(affected(&routes, &[git.join("HEAD")]), ["main"], "the checkout itself still counts");
+    }
+
     #[test]
     fn watching_follows_the_tracked_repositories() {
         let dir = tempfile::tempdir().expect("tempdir");
