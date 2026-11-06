@@ -12,6 +12,7 @@ publish = false
 egui.workspace = true
 fastframe-fonts.workspace = true
 egui-phosphor.workspace = true
+fastframe-theme.workspace = true
 
 [lints]
 workspace = true

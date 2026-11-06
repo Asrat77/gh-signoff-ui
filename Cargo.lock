@@ -2717,6 +2717,7 @@ dependencies = [
  "egui",
  "egui-phosphor",
  "fastframe-fonts",
+ "fastframe-theme",
 ]
 
 [[package]]
