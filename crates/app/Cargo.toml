@@ -50,7 +50,7 @@ before-packaging-command = "cargo build --release -p signoff"
 out-dir = "../../target/packages"
 binaries-dir = "../../target/release"
 binaries = [{ path = "signoff", main = true }]
-icons = ["../../assets/icon.png"]
+icons = ["../../assets/icons/*.png"]
 
 [package.metadata.packager.macos]
 minimum-system-version = "11.0"
