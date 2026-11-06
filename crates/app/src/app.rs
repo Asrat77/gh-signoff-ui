@@ -16,6 +16,7 @@ use signoff_ui::widgets::toast;
 
 use crate::anchor::{self, Corner, POPOVER};
 use crate::checkouts::Checkouts;
+use crate::glance::{self, Liveness};
 use crate::hotkey::Hotkeys;
 use crate::installer::Installer;
 use crate::notifier;
@@ -133,6 +134,14 @@ impl Signoff {
     /// Whether a refresh is running.
     pub(crate) fn refreshing(&self) -> bool {
         self.refresher.is_refreshing()
+    }
+
+    /// What the live indicator says now.
+    pub(crate) fn live(&self) -> Liveness {
+        let pulse = self.refresher.pulse();
+        let retry_in = pulse.next_read.map(|at| at.saturating_duration_since(Instant::now()));
+        let limited = self.refresher.rate_limited_until();
+        glance::live(pulse.failures, pulse.last_ok, self.refreshing(), retry_in, limited, Timestamp::now())
     }
 
     /// Asks the background threads to read everything again.
@@ -290,6 +299,8 @@ impl Signoff {
             let enabled = self.settings.notifications_on();
             notifier::deliver(notifier::notices(enabled, hidden, &transitions, &runs, &self.state));
         }
+        // Read more often while a window is open or a check runs locally.
+        self.refresher.set_activity(ctx.is_some(), self.runs.any_running());
         let health = self.state.summary.status;
         if self.shown_health != Some(health)
             && let Some(tray) = &mut self.tray

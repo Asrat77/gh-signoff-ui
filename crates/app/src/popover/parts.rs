@@ -1,12 +1,15 @@
 //! Pieces both popover pages share.
 
 use egui::{Align, Frame, Layout, Margin, Rect, RichText, Sense, Ui, Vec2, ViewportCommand};
+use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use signoff_core::Environment;
 use signoff_ui::theme::{radius, size, space};
-use signoff_ui::widgets::{Band, Button, ButtonKind, IconButton, Mood, spinner};
+use signoff_ui::widgets::{Band, Button, ButtonKind, IconButton, LiveIndicator, Mood, spinner};
 use signoff_ui::{Status, Type, icons, palette};
 
 use crate::app::Signoff;
+use crate::glance::{self, Liveness};
 
 /// The ember band across the top. The window has no title bar, so the
 /// band is also where it is dragged from. `trailing` adds the band's
@@ -94,7 +97,20 @@ pub(super) fn install_notice(ui: &mut Ui, installing: bool, failure: Option<&str
     clicked
 }
 
-/// A quiet centred line, such as "Updated 12s ago".
+/// The live indicator at the foot of the list: a dot and "Live", "Reading…",
+/// "Offline · retrying in 20s" or "Rate limited until 14:05". Hovering it
+/// says when the last read landed.
+pub(crate) fn live_line(ui: &mut Ui, live: Liveness, reading: bool, fetched_at: Option<Timestamp>) {
+    let label = live.label(&TimeZone::system());
+    let busy = reading && live == Liveness::Live;
+    let response = ui.add(LiveIndicator::new(live.status(), &label).busy(busy));
+    response.on_hover_text(glance::updated(fetched_at, Timestamp::now()));
+    // Keep a countdown and the hover text honest while the window is open.
+    let every = if matches!(live, Liveness::Offline { retry_in: Some(_) }) { 1.0 } else { 5.0 };
+    ui.ctx().request_repaint_after_secs(every);
+}
+
+/// A quiet centred line, such as a hint under a button.
 pub(super) fn caption(ui: &mut Ui, text: &str) {
     let p = palette(ui.ctx());
     ui.with_layout(Layout::top_down(Align::Center), |ui| {

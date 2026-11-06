@@ -4,7 +4,10 @@
 //! decisions here (which pull requests a filter keeps, what the headline
 //! says, which check needs you) means they are tested without a window.
 
+use std::time::Duration;
+
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use signoff_core::{Check, CheckState, Health, ProductState, PullRequestState};
 use signoff_ui::Status;
 use signoff_ui::widgets::Segment;
@@ -183,6 +186,77 @@ pub(crate) fn updated(fetched_at: Option<Timestamp>, now: Timestamp) -> String {
     }
 }
 
+/// What the live indicator at the foot of the list says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Liveness {
+    /// Reads are working: what is shown is current.
+    Live,
+    /// Reading, and what is shown may be old: nothing read yet, the last
+    /// read is a while ago, or the last ones failed.
+    Reading,
+    /// The last reads failed; the next try is in `retry_in`, if known.
+    Offline { retry_in: Option<Duration> },
+    /// GitHub's rate limit stops reads until `until`.
+    RateLimited { until: Timestamp },
+}
+
+/// While the last successful read is this recent, a read in progress keeps
+/// "Live" showing (its dot breathes) rather than flickering to "Reading…"
+/// every ten seconds.
+const RECENT_SECS: i64 = 30;
+
+/// What the live indicator says. `failures` and `last_ok` come from the
+/// scheduler's [`crate::worker::Pulse`]; `retry_in` is how long until its
+/// next read.
+pub(crate) fn live(
+    failures: u32,
+    last_ok: Option<Timestamp>,
+    reading: bool,
+    retry_in: Option<Duration>,
+    rate_limited_until: Option<Timestamp>,
+    now: Timestamp,
+) -> Liveness {
+    let recent = last_ok.is_some_and(|at| now.duration_since(at).as_secs() < RECENT_SECS);
+    match rate_limited_until {
+        Some(until) if until > now => Liveness::RateLimited { until },
+        _ if reading && !(failures == 0 && recent) => Liveness::Reading,
+        _ if failures > 0 => Liveness::Offline { retry_in },
+        _ if last_ok.is_some() => Liveness::Live,
+        _ => Liveness::Reading,
+    }
+}
+
+impl Liveness {
+    /// The words, with times in `tz`.
+    pub(crate) fn label(self, tz: &TimeZone) -> String {
+        match self {
+            Self::Live => "Live".to_owned(),
+            Self::Reading => "Reading…".to_owned(),
+            Self::Offline { retry_in: None } => "Offline · retrying".to_owned(),
+            Self::Offline { retry_in: Some(wait) } => {
+                // Whole seconds, rounded up: "in 0s" would be a lie.
+                let seconds = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+                match seconds.max(1) {
+                    seconds @ ..90 => format!("Offline · retrying in {seconds}s"),
+                    seconds => format!("Offline · retrying in {}m", seconds.div_ceil(60)),
+                }
+            }
+            Self::RateLimited { until } => {
+                format!("Rate limited until {}", until.to_zoned(tz.clone()).strftime("%H:%M"))
+            }
+        }
+    }
+
+    /// The dot's colour.
+    pub(crate) fn status(self) -> Status {
+        match self {
+            Self::Live => Status::Ready,
+            Self::Reading => Status::Running,
+            Self::Offline { .. } | Self::RateLimited { .. } => Status::Attention,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use jiff::SignedDuration;
@@ -301,6 +375,46 @@ mod tests {
         assert_eq!(updated(ago(7300), now), "Updated 2h ago");
         assert_eq!(updated(Some(now + SignedDuration::from_secs(3)), now), "Updated just now", "clock skew");
     }
+    #[test]
+    fn the_live_indicator_says_whether_what_is_shown_is_current() {
+        let now = Timestamp::UNIX_EPOCH + SignedDuration::from_hours(5);
+        let ago = |secs: i64| Some(now - SignedDuration::from_secs(secs));
+        let retry = Some(Duration::from_millis(19_200));
+
+        assert_eq!(live(0, None, true, None, None, now), Liveness::Reading, "the first read");
+        assert_eq!(live(0, None, false, None, None, now), Liveness::Reading, "about to start");
+        assert_eq!(live(0, ago(5), false, None, None, now), Liveness::Live);
+        assert_eq!(live(0, ago(5), true, None, None, now), Liveness::Live, "a routine read does not flicker");
+        assert_eq!(live(0, ago(400), false, None, None, now), Liveness::Live, "quiet, not stale");
+        assert_eq!(live(0, ago(400), true, None, None, now), Liveness::Reading, "catching up on old data");
+        assert_eq!(live(2, ago(5), false, retry, None, now), Liveness::Offline { retry_in: retry });
+        assert_eq!(live(2, ago(5), true, retry, None, now), Liveness::Reading, "retrying now");
+        let until = now + SignedDuration::from_mins(20);
+        assert_eq!(
+            live(3, ago(5), true, retry, Some(until), now),
+            Liveness::RateLimited { until },
+            "the limit says most"
+        );
+        assert_eq!(live(0, ago(5), false, None, ago(1), now), Liveness::Live, "a limit that has lifted");
+    }
+
+    #[test]
+    fn the_live_indicator_reads_well() {
+        let utc = TimeZone::UTC;
+        let offline = |ms: u64| Liveness::Offline { retry_in: Some(Duration::from_millis(ms)) }.label(&utc);
+        assert_eq!(Liveness::Live.label(&utc), "Live");
+        assert_eq!(Liveness::Reading.label(&utc), "Reading…");
+        assert_eq!(Liveness::Offline { retry_in: None }.label(&utc), "Offline · retrying");
+        assert_eq!(offline(19_200), "Offline · retrying in 20s");
+        assert_eq!(offline(0), "Offline · retrying in 1s");
+        assert_eq!(offline(300_000), "Offline · retrying in 5m");
+        let until = Timestamp::UNIX_EPOCH + SignedDuration::from_mins(14 * 60 + 5);
+        assert_eq!(Liveness::RateLimited { until }.label(&utc), "Rate limited until 14:05");
+        assert_eq!(Liveness::Live.status(), Status::Ready);
+        assert_eq!(Liveness::Reading.status(), Status::Running);
+        assert_eq!(Liveness::RateLimited { until }.status(), Status::Attention);
+    }
+
     #[test]
     fn short_sha_keeps_seven_characters() {
         assert_eq!(short_sha("3db401c9a8f"), "3db401c");

@@ -11,6 +11,9 @@ mod detail;
 mod list;
 mod parts;
 
+#[cfg(test)]
+pub(crate) use parts::live_line;
+
 use egui::{Frame, Ui};
 use signoff_ui::palette;
 use signoff_ui::theme::radius;

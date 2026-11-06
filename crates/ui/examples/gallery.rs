@@ -7,7 +7,7 @@ use eframe::egui::{self, CentralPanel, Frame, Margin, ScrollArea, Ui, Vec2};
 use signoff_ui::theme::{self, space};
 use signoff_ui::widgets::{
     AddButton, Band, Button, ButtonKind, CheckRow, Chip, EmptyState, Eyes, Headline, IconButton, IconButtonKind,
-    LogLine, LogView, Mood, PrRow, Segment, Segments, ToggleRow, sheet, show_toasts, toast,
+    LiveIndicator, LogLine, LogView, Mood, PrRow, Segment, Segments, ToggleRow, sheet, show_toasts, toast,
 };
 use signoff_ui::{Status, ThemeMode, icons, palette};
 
@@ -215,13 +215,7 @@ impl Gallery {
                 ui.add_space(space::M);
                 ui.add(Button::new("Fix #479 first").trailing_icon(icons::FORWARD));
                 ui.add_space(space::S);
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("Updated 12s ago")
-                            .font(signoff_ui::Type::Caption.font())
-                            .color(palette(ui.ctx()).secondary),
-                    );
-                });
+                ui.add(LiveIndicator::new(Status::Ready, "Live"));
             });
         });
     }
