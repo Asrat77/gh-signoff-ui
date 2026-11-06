@@ -757,6 +757,12 @@ impl ProductService {
         }
     }
 
+    /// Whether the repository `id` shows an error from its last read, for a
+    /// scheduler to tell a failing read from one that landed.
+    pub fn read_failed(&self, id: &str) -> bool {
+        self.store().state.repositories.iter().any(|repo| repo.id == id && repo.error.is_some())
+    }
+
     /// Applies the config to the state at once: a removed or paused
     /// repository's pull requests go, an added one shows as loading, and
     /// command mappings change in place. Returns the repositories to read
@@ -1203,6 +1209,7 @@ mod tests {
         transport.answer("/pulls?", json(401, None, r#"{"message":"Bad credentials"}"#));
         let state = f.service.refresh();
         assert!(state.repositories[0].error.as_deref().is_some_and(|e| e.contains("gh auth login")));
+        assert!(f.service.read_failed("r1") && !f.service.read_failed("elsewhere"));
         f.service.plan_refresh(false);
         assert_eq!(probes(&fake), 2);
     }
@@ -1218,6 +1225,7 @@ mod tests {
             .answer("/commits/gone/", json(422, None, r#"{"message":"No commit found for SHA: gone"}"#));
         let state = f.service.refresh();
         assert_eq!(state.repositories[0].error, None);
+        assert!(!f.service.read_failed("r1"));
         let gone = f.service.find_pull_request("r1", 2).expect("still listed");
         assert!(gone.warning.as_deref().is_some_and(|w| w.contains("No commit found")));
         assert_eq!(f.service.find_pull_request("r1", 1).expect("pr").status, Health::Ready);
