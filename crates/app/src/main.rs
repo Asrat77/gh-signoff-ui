@@ -8,6 +8,7 @@
 mod anchor;
 mod app;
 mod autostart;
+mod checkouts;
 mod glance;
 mod paths;
 mod popover;
@@ -78,7 +79,7 @@ fn main() -> ExitCode {
         }
     };
 
-    let (service, verifier) = match build_service(&args) {
+    let (service, verifier, gh) = match build_service(&args) {
         Ok(built) => built,
         Err(message) => {
             log::error!("{message}");
@@ -100,6 +101,10 @@ fn main() -> ExitCode {
         let wake = waker.clone();
         runs::Runs::new(verifier, move || wake.wake())
     };
+    let checkouts = {
+        let wake = waker.clone();
+        checkouts::Checkouts::new(gh, args.demo, move || wake.wake())
+    };
     let tray = {
         let wake = waker.clone();
         tray::spawn(move || wake.wake())
@@ -108,7 +113,7 @@ fn main() -> ExitCode {
         log::warn!("no tray is available; closing the window will quit");
     }
 
-    let app = app::Signoff::new(tray, refresher, runs, settings, args.demo);
+    let app = app::Signoff::new(tray, refresher, runs, checkouts, settings, args.demo);
     let result = Shell::new(app, &waker).idle(fastframe_tray::idle).start_hidden(args.hidden).run(|lease| {
         let options = lease.peek(|app| app::native_options(app.is_popover(), app.anchor()));
         eframe::run_native("Signoff", options, Box::new(move |cc| Ok(app::window(cc, lease))))
@@ -122,13 +127,14 @@ fn main() -> ExitCode {
     }
 }
 
-/// The state service and the verifier that runs checks against it.
-fn build_service(args: &Args) -> Result<(Arc<ProductService>, Arc<Verifier>), String> {
+/// The state service, the verifier that runs checks against it and the
+/// `gh` client for checking pull requests out.
+fn build_service(args: &Args) -> Result<(Arc<ProductService>, Arc<Verifier>, Gh), String> {
     if args.demo {
         log::info!("demo mode: nothing is read from or written to GitHub");
         let service = Arc::new(ProductService::demo());
         let verifier = Arc::new(Verifier::demo(service.clone()));
-        return Ok((service, verifier));
+        return Ok((service, verifier, Gh::default()));
     }
     let config_path = match &args.config {
         Some(path) => path.clone(),
@@ -141,7 +147,8 @@ fn build_service(args: &Args) -> Result<(Arc<ProductService>, Arc<Verifier>), St
     let (config, history) = (Arc::new(config), Arc::new(history));
     let runner: Arc<dyn Runner> = Arc::new(SystemRunner::default());
     let seed_dir = std::env::current_dir().ok();
-    let service = Arc::new(ProductService::new(Gh::new(runner.clone()), config.clone(), history.clone(), seed_dir));
+    let gh = Gh::new(runner.clone());
+    let service = Arc::new(ProductService::new(gh.clone(), config.clone(), history.clone(), seed_dir));
     let verifier = Arc::new(Verifier::new(service.clone(), runner, config, history));
-    Ok((service, verifier))
+    Ok((service, verifier, gh))
 }

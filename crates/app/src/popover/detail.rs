@@ -14,6 +14,7 @@ use signoff_ui::{Status, Type, icons, palette};
 use super::Page;
 use super::parts::{band, caption, height_above, notice, refresh_button};
 use crate::app::Signoff;
+use crate::checkouts::Checkout;
 use crate::glance;
 use crate::runs::RunView;
 
@@ -241,7 +242,9 @@ fn problems(ui: &mut Ui, pr: &PullRequestState) {
 /// The page's main button: run and sign off the target check, stop it
 /// while it runs, or open a ready pull request to merge.
 fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) {
-    let can_run = app.demo || pr.checked_out;
+    let number = pr.pr.number;
+    let checkout = app.checkouts.view(&pr.repo_id, number);
+    let at_head = pr.checked_out || app.checkouts.simulated(&pr.repo_id, number);
     let unmapped = to_configure(pr, target);
     match (target, run) {
         (Some(check), Some(run)) if run.running() => {
@@ -250,10 +253,13 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
                 app.runs.stop(&request(pr, check));
             }
         }
+        (Some(check), _) if check.configured && check.state != CheckState::Success && !at_head => {
+            check_out_button(ui, app, pr, checkout.as_ref());
+        }
         (Some(check), _) if check.configured && check.state != CheckState::Success => {
             let label = format!("Run & sign off {}", check.name);
             let button = ui
-                .add(Button::new(&label).icon(icons::RUN).enabled(can_run))
+                .add(Button::new(&label).icon(icons::RUN))
                 .on_hover_text(format!("Run `{}`, then sign off {} on this commit", check.local_command, check.name));
             if button.clicked() {
                 app.runs.start(request(pr, check));
@@ -277,7 +283,35 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
         }
     }
     ui.add_space(space::S);
-    let hint = match target {
+    let hint = match checkout {
+        Some(Checkout::Failed(message)) => message,
+        Some(Checkout::Running) => format!("Running gh pr checkout {number}…"),
+        _ => hint(app, pr, target, unmapped),
+    };
+    caption(ui, &hint);
+}
+
+/// The button that checks out the pull request, disabled while that runs.
+fn check_out_button(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, checkout: Option<&Checkout>) {
+    let number = pr.pr.number;
+    let (label, busy) = match checkout {
+        Some(Checkout::Running) => (format!("Checking out #{number}…"), true),
+        Some(Checkout::Done) => (format!("Reading #{number}…"), true),
+        _ => (format!("Check out #{number}"), false),
+    };
+    let button = Button::new(&label).icon(if busy { icons::RUNNING } else { icons::BRANCH }).enabled(!busy);
+    let button = ui.add(button).on_hover_text(format!(
+        "Run `gh pr checkout {number}` in {}; refused if tracked files have uncommitted changes",
+        pr.repo_path.display()
+    ));
+    if button.clicked() {
+        app.checkouts.start(&pr.repo_id, number, pr.repo_path.clone());
+    }
+}
+
+/// The line under the main button when nothing is running or failed.
+fn hint(app: &Signoff, pr: &PullRequestState, target: Option<&Check>, unmapped: Option<&Check>) -> String {
+    match target {
         _ if app.demo => "Demo: runs are simulated and nothing is signed off on GitHub.".to_owned(),
         _ if unmapped.is_some() => {
             format!(
@@ -287,6 +321,5 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
         }
         _ if pr.checked_out => "Your checkout is on this commit.".to_owned(),
         _ => format!("Check out {} at {} to verify it locally.", pr.pr.head_ref, glance::short_sha(&pr.pr.head_sha)),
-    };
-    caption(ui, &hint);
+    }
 }

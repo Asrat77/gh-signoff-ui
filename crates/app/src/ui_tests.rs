@@ -393,7 +393,8 @@ fn demo_app() -> Signoff {
     let settings = Settings::new(service.clone(), || {});
     let refresher = worker::Refresher::spawn(service.clone(), || {});
     let runs = crate::runs::Runs::new(Arc::new(signoff_core::Verifier::demo(service.clone())), || {});
-    let mut app = Signoff::new(None, refresher, runs, settings, true);
+    let checkouts = crate::checkouts::Checkouts::new(Gh::default(), true, || {});
+    let mut app = Signoff::new(None, refresher, runs, checkouts, settings, true);
     app.state = service.refresh();
     app
 }
@@ -754,4 +755,67 @@ fn configuring_a_check_selects_its_repository_and_offers_commands_from_the_check
     harness.run_ok();
     let repo = service.config().expect("config").find_repository("repo1").expect("repo");
     assert_eq!(repo.commands["lint"].command, "pnpm run lint");
+}
+
+/// A popover harness on the demo data where `gh` and `git` answer through
+/// `script`, as outside demo mode, opened on the pull request that is not
+/// checked out.
+fn unchecked_page(script: Arc<Script>) -> Harness<'static, Signoff> {
+    let mut app = demo_app();
+    app.demo = false;
+    app.checkouts = crate::checkouts::Checkouts::new(Gh::new(script), false, || {});
+    let (repo_id, number) = {
+        let pr = app.state.pull_requests.iter().find(|pr| !pr.checked_out).expect("an unchecked pull request");
+        (pr.repo_id.clone(), pr.pr.number)
+    };
+    app.glance.page = popover::Page::PullRequest { repo_id, number };
+    Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+        |ui, app: &mut Signoff| {
+            if installed(ui.ctx()) {
+                app.tick(Some(ui.ctx()));
+                popover::show(ui, app);
+            }
+        },
+        app,
+    )
+}
+
+#[test]
+fn a_pull_request_that_is_not_checked_out_offers_to_check_it_out() {
+    let script = Arc::new(Script::default().reply("status --porcelain", "").reply("pr checkout", ""));
+    let mut harness = unchecked_page(script.clone());
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("Run & sign off").is_none());
+    harness.get_by_label("Check out #485").click();
+    step_until(&mut harness, "gh pr checkout to run", |_| {
+        script.calls().iter().any(|(line, _)| line.contains("gh pr checkout 485"))
+    });
+    let lines: Vec<String> = script.calls().into_iter().map(|(line, _)| line).collect();
+    assert_eq!(lines, ["git status --porcelain --untracked-files=no", "gh pr checkout 485"]);
+}
+
+#[test]
+fn a_dirty_checkout_is_refused_with_a_reason_and_gh_never_runs() {
+    let script = Arc::new(Script::default().reply("status --porcelain", " M src/lib.rs").reply("pr checkout", ""));
+    let mut harness = unchecked_page(script.clone());
+    harness.run_ok();
+    harness.get_by_label("Check out #485").click();
+    step_until(&mut harness, "the refusal", |h| h.query_by_label_contains("uncommitted change").is_some());
+    harness.get_by_label("Check out #485");
+    assert!(!script.calls().iter().any(|(line, _)| line.contains("pr checkout")));
+}
+
+#[test]
+fn the_demo_simulates_a_checkout_and_then_offers_to_run() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    {
+        let app = harness.state_mut();
+        let pr = app.state.pull_requests.iter().find(|pr| !pr.checked_out).expect("an unchecked pull request");
+        let (repo_id, number) = (pr.repo_id.clone(), pr.pr.number);
+        app.glance.page = popover::Page::PullRequest { repo_id, number };
+    }
+    harness.run_ok();
+    harness.get_by_label("Check out #485").click();
+    step_until(&mut harness, "the simulated checkout", |h| h.query_by_label_contains("Run & sign off").is_some());
 }
