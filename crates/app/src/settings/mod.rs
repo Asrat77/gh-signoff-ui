@@ -10,6 +10,7 @@ mod general;
 mod jobs;
 mod parts;
 mod repositories;
+mod rules;
 
 use std::sync::Arc;
 
@@ -33,16 +34,19 @@ pub(crate) enum Section {
     Repositories,
     /// The local command behind each check.
     Commands,
+    /// The signoff checks a branch requires.
+    BranchRules,
 }
 
 impl Section {
-    const ALL: [Self; 3] = [Self::General, Self::Repositories, Self::Commands];
+    const ALL: [Self; 4] = [Self::General, Self::Repositories, Self::Commands, Self::BranchRules];
 
     fn label(self) -> &'static str {
         match self {
             Self::General => "General",
             Self::Repositories => "Repositories",
             Self::Commands => "Commands",
+            Self::BranchRules => "Branch rules",
         }
     }
 
@@ -51,6 +55,7 @@ impl Section {
             Self::General => icons::GENERAL,
             Self::Repositories => icons::REPOSITORY,
             Self::Commands => icons::TERMINAL,
+            Self::BranchRules => icons::BRANCH,
         }
     }
 }
@@ -66,6 +71,7 @@ pub(crate) struct Settings {
     /// The repository the commands and branch rules sections show.
     selected_repo: Option<String>,
     commands: Option<commands::Draft>,
+    rules: Option<rules::Form>,
 }
 
 /// What the settings asked the app for this frame.
@@ -88,6 +94,7 @@ impl Settings {
             repositories: repositories::Form::default(),
             selected_repo: None,
             commands: None,
+            rules: None,
         }
     }
 
@@ -155,6 +162,7 @@ pub(crate) fn contents(ui: &mut Ui, settings: &mut Settings, state: &ProductStat
                         Section::General => general::show(ui, settings, state, &mut effects),
                         Section::Repositories => repositories::show(ui, settings, state, &mut effects),
                         Section::Commands => commands::show(ui, settings, state, &mut effects),
+                        Section::BranchRules => rules::show(ui, settings, state, &mut effects),
                     }
                 });
             });
