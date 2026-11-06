@@ -1,7 +1,10 @@
-//! General: launch at login, how often to refresh, and what Signoff found
-//! on this computer.
+//! General: launch at login, how Signoff keeps up to date, and what it
+//! found on this computer.
+//!
+//! There is no refresh interval to set: the worker picks its own cadence
+//! (`crate::cadence`), and `refreshSeconds` in older configs is ignored.
 
-use egui::{RichText, Slider, Ui};
+use egui::{RichText, Ui};
 use signoff_core::ProductState;
 use signoff_ui::theme::space;
 use signoff_ui::widgets::{Button, ButtonKind, ToggleRow, toast};
@@ -10,11 +13,8 @@ use signoff_ui::{Status, Type, palette};
 use super::{Effects, Settings, parts};
 use crate::{autostart, hotkey};
 
-/// The refresh interval's bounds, in seconds, as the config accepts them.
-const REFRESH_RANGE: std::ops::RangeInclusive<u32> = 10..=3600;
-
 pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, effects: &mut Effects) {
-    parts::heading(ui, "General", "How Signoff starts and how often it reads GitHub.");
+    parts::heading(ui, "General", "How Signoff starts and keeps up to date.");
 
     let mut launch = *settings.launch_at_login.get_or_insert_with(autostart::is_enabled);
     let hint = "Start Signoff in the tray when you sign in.";
@@ -32,7 +32,7 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
     shortcut(ui, settings, effects);
     ui.add_space(space::S);
 
-    refresh_interval(ui, settings, effects);
+    updates(ui);
     environment(ui, state, settings.installing, !settings.read_only(), effects);
 }
 
@@ -49,29 +49,16 @@ fn notifications(ui: &mut Ui, settings: &Settings) {
     }
 }
 
-fn refresh_interval(ui: &mut Ui, settings: &Settings, effects: &mut Effects) {
-    let config = settings.service.config();
-    let mut seconds = config.map_or(30, |config| config.snapshot().refresh_seconds);
+/// How Signoff keeps up to date. Nothing to set: it reads as often as what
+/// is on screen needs.
+fn updates(ui: &mut Ui) {
     parts::card(ui, |ui| {
         let p = palette(ui.ctx());
-        ui.label(RichText::new("Refresh every").font(Type::Row.font()).color(p.text));
+        ui.label(RichText::new("Updates").font(Type::Row.font()).color(p.text));
         ui.add_space(space::XS);
-        let slider = Slider::new(&mut seconds, REFRESH_RANGE).logarithmic(true).suffix(" s");
-        let response = ui.add_enabled(!settings.read_only(), slider);
-        if response.changed()
-            && let Some(config) = config
-            && let Err(err) = config.set_refresh_seconds(seconds)
-        {
-            toast(ui.ctx(), err.to_string(), Status::Failing);
-        }
-        // Refreshing now starts the new interval at once; wait for the drag
-        // to end so a drag is one refresh, not many.
-        if response.drag_stopped() || (response.changed() && !response.dragged()) {
-            effects.refresh = true;
-        }
         parts::caption(
             ui,
-            "Signoff also reads again when you open the popover, if the last read is over 10 seconds old, or when you press refresh.",
+            "Signoff reads GitHub every few seconds while the popover is open or a check is pending, about once a minute in the background, and at once when you refresh or check out a branch. It reads less when nothing is open, and backs off while GitHub can't be reached.",
         );
     });
 }

@@ -1071,3 +1071,14 @@ fn the_popover_goes_live_after_the_first_read() {
     step_until(&mut harness, "the first read to settle", |h| h.query_by_label("Live").is_some());
     assert!(harness.query_by_label_contains("Updated").is_none());
 }
+
+/// General explains how updates work instead of offering an interval.
+#[test]
+fn general_has_no_refresh_interval_to_set() {
+    let (service, state) = demo_state();
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("Refresh every").is_none());
+    assert!(harness.query_by_role(egui::accesskit::Role::Slider).is_none());
+    assert!(harness.query_by_label_contains("every few seconds while the popover is open").is_some());
+}
