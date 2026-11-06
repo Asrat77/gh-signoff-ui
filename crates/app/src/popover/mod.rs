@@ -6,6 +6,7 @@
 //! pull request's page. Everything shown comes from the latest state the
 //! background refresh copied in, so drawing never waits on `gh`.
 
+mod detail;
 mod list;
 mod parts;
 
@@ -21,6 +22,23 @@ use crate::glance::Filter;
 pub(crate) struct Glance {
     /// The chip chosen above the list.
     pub(crate) filter: Filter,
+    /// The page on the sheet.
+    pub(crate) page: Page,
+}
+
+/// The page the sheet shows.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Page {
+    /// Every pull request.
+    #[default]
+    List,
+    /// One pull request's signoffs.
+    PullRequest {
+        /// Its repository's id.
+        repo_id: String,
+        /// Its number.
+        number: u64,
+    },
 }
 
 /// Draws the popover into the window.
@@ -29,6 +47,9 @@ pub(crate) fn show(ui: &mut Ui, app: &mut Signoff) {
     Frame::new().fill(p.accent).corner_radius(radius::SHEET).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.spacing_mut().item_spacing.y = 0.0;
-        list::show(ui, app);
+        match app.glance.page.clone() {
+            Page::List => list::show(ui, app),
+            Page::PullRequest { repo_id, number } => detail::show(ui, app, &repo_id, number),
+        }
     });
 }

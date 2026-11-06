@@ -8,6 +8,7 @@ use signoff_ui::theme::space;
 use signoff_ui::widgets::{Button, ButtonKind, Chip, EmptyState, Headline, IconButton, Mood, PrRow, sheet};
 use signoff_ui::{Status, icons};
 
+use super::Page;
 use super::parts::{self, band, caption, notice, refresh_button};
 use crate::app::Signoff;
 use crate::glance::{self, Filter};
@@ -17,7 +18,8 @@ const FOOTER: f32 = 96.0;
 
 /// What the list asks for this frame.
 enum Action {
-    Open(String),
+    /// Open this pull request's page.
+    Page(Page),
 }
 
 /// Draws the list page.
@@ -38,7 +40,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
         }
     });
     match action {
-        Some(Action::Open(url)) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+        Some(Action::Page(page)) => app.glance.page = page,
         None => {}
     }
 }
@@ -103,7 +105,7 @@ fn body(ui: &mut Ui, state: &ProductState, filter: &mut Filter) -> Option<Action
             }
             for pr in prs {
                 if row(ui, pr).clicked() {
-                    action = Some(Action::Open(pr.pr.url.clone()));
+                    action = Some(Action::Page(page_of(pr)));
                 }
             }
         });
@@ -114,7 +116,7 @@ fn body(ui: &mut Ui, state: &ProductState, filter: &mut Filter) -> Option<Action
                 _ => format!("Sign off #{} next", pr.pr.number),
             };
             if ui.add(Button::new(&label).trailing_icon(icons::FORWARD)).clicked() {
-                action = Some(Action::Open(pr.pr.url.clone()));
+                action = Some(Action::Page(page_of(pr)));
             }
         } else {
             ui.add(Button::new("Nothing waiting on you").kind(ButtonKind::Secondary).enabled(false));
@@ -125,6 +127,11 @@ fn body(ui: &mut Ui, state: &ProductState, filter: &mut Filter) -> Option<Action
     // Keep "Updated 12s ago" honest while the window is open.
     ui.ctx().request_repaint_after_secs(5.0);
     action
+}
+
+/// The page for `pr`.
+fn page_of(pr: &PullRequestState) -> Page {
+    Page::PullRequest { repo_id: pr.repo_id.clone(), number: pr.pr.number }
 }
 
 /// One pull request's row.

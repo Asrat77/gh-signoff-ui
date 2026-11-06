@@ -118,6 +118,17 @@ pub(crate) fn required(pr: &PullRequestState) -> impl Iterator<Item = &Check> {
     pr.checks.iter().filter(|check| check.required)
 }
 
+/// Where one required check stands on the head commit. The check the
+/// pull request is waiting on (the first one not signed off) needs you.
+pub(crate) fn check_status(pr: &PullRequestState, check: &Check) -> Status {
+    match check.state {
+        CheckState::Success => Status::Ready,
+        CheckState::Failure | CheckState::Error => Status::Failing,
+        CheckState::Pending | CheckState::Absent if pr.blocking.as_deref() == Some(&check.name) => Status::Attention,
+        CheckState::Pending | CheckState::Absent => Status::Neutral,
+    }
+}
+
 /// The small progress bar at the end of a pull request's row.
 pub(crate) fn row_segments(pr: &PullRequestState) -> Vec<Segment> {
     required(pr)
@@ -127,6 +138,35 @@ pub(crate) fn row_segments(pr: &PullRequestState) -> Vec<Segment> {
             CheckState::Pending | CheckState::Absent => Segment::Empty,
         })
         .collect()
+}
+
+/// The big progress bar on a pull request's page, which also marks the
+/// check that needs you.
+pub(crate) fn page_segments(pr: &PullRequestState) -> Vec<Segment> {
+    required(pr)
+        .map(|check| match check_status(pr, check) {
+            Status::Ready => Segment::Done,
+            Status::Neutral => Segment::Empty,
+            status => Segment::Current(status),
+        })
+        .collect()
+}
+
+/// The line under a pull request's title on its page.
+pub(crate) fn progress(pr: &PullRequestState) -> String {
+    let failed = required(pr).find(|check| check.state.is_failed());
+    match (pr.total, failed, &pr.blocking) {
+        (0, _, _) => "No signoffs required on this branch".to_owned(),
+        (_, Some(check), _) => format!("{} failed · {} of {} signed off", check.name, pr.passed, pr.total),
+        (total, None, _) if pr.ready => format!("All {total} signoffs pass · ready to merge"),
+        (total, None, Some(blocking)) => format!("{} of {total} signed off · {blocking} needs you", pr.passed),
+        (total, None, None) => format!("{} of {total} signed off", pr.passed),
+    }
+}
+
+/// The first seven characters of a commit SHA.
+pub(crate) fn short_sha(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 /// "Updated 12s ago", for the foot of the list.
@@ -210,6 +250,27 @@ mod tests {
     }
 
     #[test]
+    fn the_first_unsigned_check_needs_you() {
+        let pr = with_checks(vec![
+            check("lint", CheckState::Success),
+            check("security", CheckState::Absent),
+            check("tests", CheckState::Pending),
+        ]);
+        let statuses: Vec<Status> = required(&pr).map(|c| check_status(&pr, c)).collect();
+        assert_eq!(statuses, [Status::Ready, Status::Attention, Status::Neutral]);
+        assert_eq!(row_segments(&pr), [Segment::Done, Segment::Empty, Segment::Empty]);
+        assert_eq!(page_segments(&pr), [Segment::Done, Segment::Current(Status::Attention), Segment::Empty]);
+        assert_eq!(progress(&pr), "1 of 3 signed off · security needs you");
+    }
+
+    #[test]
+    fn a_failed_check_is_named() {
+        let pr = with_checks(vec![check("lint", CheckState::Absent), check("tests", CheckState::Failure)]);
+        assert_eq!(row_segments(&pr), [Segment::Empty, Segment::Current(Status::Failing)]);
+        assert_eq!(progress(&pr), "tests failed · 0 of 2 signed off");
+    }
+
+    #[test]
     fn the_row_bar_marks_signed_and_failed_checks() {
         let pr = with_checks(vec![
             check("lint", CheckState::Success),
@@ -225,6 +286,8 @@ mod tests {
         optional.required = false;
         let pr = with_checks(vec![check("tests", CheckState::Success), optional]);
         assert_eq!(row_segments(&pr), [Segment::Done]);
+        assert_eq!(progress(&pr), "All 1 signoffs pass · ready to merge");
+        assert_eq!(progress(&with_checks(Vec::new())), "No signoffs required on this branch");
     }
 
     #[test]
@@ -237,5 +300,10 @@ mod tests {
         assert_eq!(updated(ago(150), now), "Updated 2m ago");
         assert_eq!(updated(ago(7300), now), "Updated 2h ago");
         assert_eq!(updated(Some(now + SignedDuration::from_secs(3)), now), "Updated just now", "clock skew");
+    }
+    #[test]
+    fn short_sha_keeps_seven_characters() {
+        assert_eq!(short_sha("3db401c9a8f"), "3db401c");
+        assert_eq!(short_sha("abc"), "abc");
     }
 }
