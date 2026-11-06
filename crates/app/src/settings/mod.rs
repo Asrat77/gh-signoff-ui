@@ -103,6 +103,15 @@ impl Settings {
         }
     }
 
+    /// Opens Branch rules on `branch` of the repository `repo_id` with the
+    /// `signoff` check ready to save: the way to set signoff up on a
+    /// repository. The caller opens the window.
+    pub(crate) fn set_up_signoff(&mut self, repo_id: &str, branch: &str) {
+        self.section = Section::BranchRules;
+        self.selected_repo = Some(repo_id.to_owned());
+        rules::set_up(self, repo_id, branch);
+    }
+
     /// Asks for a checkout with the folder picker and starts tracking it.
     pub(crate) fn choose_and_add(&mut self, ctx: &egui::Context) {
         repositories::choose_and_add(ctx, self);

@@ -426,3 +426,55 @@ fn the_first_run_screen_picks_a_folder_and_keeps_settings_second() {
     harness.run_ok();
     assert!(harness.state().settings_open);
 }
+
+#[test]
+fn set_up_signoff_opens_branch_rules_ready_to_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = Arc::new(
+        Script::default()
+            .reply("check-ref-format", "main")
+            .reply("protection --jq", r#"["ci/build"]"#)
+            .reply("--method", "{}"),
+    );
+    let service = service(dir.path(), vec![tracked(dir.path())], script.clone());
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+
+    harness.get_by_label("Set up signoff").click();
+    step_until(&mut harness, "the rules to load with signoff ready", |h| {
+        h.query_by_label_contains("`signoff` is ready below").is_some()
+    });
+    harness.get_by_label("ci/build");
+    harness.get_by_label("Save to GitHub").click();
+    step_until(&mut harness, "the rules to be written", |_| {
+        script.calls().iter().any(|(line, _)| line.contains("--method"))
+    });
+
+    let calls = script.calls();
+    let (_, input) = calls.iter().find(|(line, _)| line.contains("--method")).expect("a write");
+    let input = input.as_deref().unwrap_or_default();
+    assert!(input.contains(r#""signoff""#) && input.contains("ci/build"), "{input}");
+}
+
+#[test]
+fn a_pull_request_without_signoffs_offers_to_set_them_up() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    {
+        let app = harness.state_mut();
+        let pr = app.state.pull_requests.first_mut().expect("a pull request");
+        pr.checks.clear();
+        pr.rules.signoff_contexts.clear();
+        let (repo_id, number) = (pr.repo_id.clone(), pr.pr.number);
+        app.glance.page = popover::Page::PullRequest { repo_id, number };
+    }
+    harness.run_ok();
+    harness.get_by_label("No signoffs required");
+    harness.get_by_label("Set up signoff").click();
+    harness.run_ok();
+    assert!(harness.state().settings_open);
+    assert_eq!(harness.state().settings.section, settings::Section::BranchRules);
+}

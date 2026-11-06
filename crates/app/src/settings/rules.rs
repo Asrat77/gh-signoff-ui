@@ -34,11 +34,51 @@ pub(crate) struct Form {
     checks: Vec<String>,
     new_check: String,
     saving: bool,
+    /// Read the branch as soon as the section draws: set when another part
+    /// of the app opened this form.
+    reload: bool,
+    /// Add the `signoff` check once the branch is read: "Set up signoff".
+    want_signoff: bool,
+    /// `signoff` was added for the user and is not saved yet.
+    prefilled: bool,
+}
+
+/// Adds the bare `signoff` check to `checks`, keeping them sorted. False
+/// when it was already there.
+fn prefill_signoff(checks: &mut Vec<String>) -> bool {
+    if checks.iter().any(|check| check == "signoff") {
+        return false;
+    }
+    checks.push("signoff".to_owned());
+    checks.sort();
+    true
 }
 
 impl Form {
     fn new(repo: &RepositoryState) -> Self {
         Self { repo_id: repo.id.clone(), branch: repo.default_branch.clone(), ..Self::default() }
+    }
+
+    /// A form for `branch` of the repository `repo_id`, opened to set up
+    /// signoff: it reads the branch, then has the `signoff` check ready.
+    fn set_up(repo_id: &str, branch: &str) -> Self {
+        Self {
+            repo_id: repo_id.to_owned(),
+            branch: branch.to_owned(),
+            reload: true,
+            want_signoff: true,
+            ..Self::default()
+        }
+    }
+
+    /// Takes in what GitHub holds. The first read after a set-up request
+    /// also adds `signoff` to what is required, ready to save.
+    fn take(&mut self, read: BranchChecks) {
+        self.checks = read.checks.clone();
+        if std::mem::take(&mut self.want_signoff) {
+            self.prefilled = prefill_signoff(&mut self.checks);
+        }
+        self.load = Load::Loaded(read);
     }
 
     fn saved_checks(&self) -> Option<&[String]> {
@@ -82,10 +122,7 @@ fn start_loading(settings: &mut Settings, state: &ProductState) {
                 return;
             }
             match result {
-                Ok(read) => {
-                    form.checks = read.checks.clone();
-                    form.load = Load::Loaded(read);
-                }
+                Ok(read) => form.take(read),
                 Err(message) => form.load = Load::Failed(message),
             }
         })
@@ -95,6 +132,7 @@ fn start_loading(settings: &mut Settings, state: &ProductState) {
 fn start_saving(settings: &mut Settings) {
     let Some(form) = &mut settings.rules else { return };
     form.saving = true;
+    form.prefilled = false;
     let (repo_id, branch, checks) = (form.repo_id.clone(), form.loaded_branch.clone(), form.checks.clone());
     settings.jobs.start(move |service| {
         let result = service.set_signoff_checks(&repo_id, &branch, &checks);
@@ -141,6 +179,11 @@ fn reload_after_save(settings: &mut Settings, repo_id: String, branch: String) {
     });
 }
 
+/// Opens the form for `branch` of `repo_id` with `signoff` ready to save.
+pub(super) fn set_up(settings: &mut Settings, repo_id: &str, branch: &str) {
+    settings.rules = Some(Form::set_up(repo_id, branch));
+}
+
 pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _effects: &mut Effects) {
     parts::heading(
         ui,
@@ -154,6 +197,8 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
     };
     if settings.rules.as_ref().is_none_or(|form| form.repo_id != repo.id) {
         settings.rules = Some(Form::new(repo));
+        start_loading(settings, state);
+    } else if settings.rules.as_mut().is_some_and(|form| std::mem::take(&mut form.reload)) {
         start_loading(settings, state);
     }
 
@@ -206,6 +251,13 @@ fn editor(ui: &mut Ui, form: &mut Form, read: &BranchChecks, read_only: bool) ->
             ui,
             Status::Neutral,
             "This branch has no protection yet. Saving creates it with `gh signoff install`, which requires these checks.",
+        );
+    }
+    if form.prefilled && form.saved_checks().is_some_and(|saved| saved != form.checks.as_slice()) {
+        parts::notice(
+            ui,
+            Status::Attention,
+            "`signoff` is ready below. Save to GitHub to require it on this branch; nothing changes until you do.",
         );
     }
     parts::label(ui, "Required signoff checks");
@@ -273,6 +325,15 @@ fn editor(ui: &mut Ui, form: &mut Form, read: &BranchChecks, read_only: bool) ->
 mod tests {
     use super::*;
     use signoff_core::{PullRequestState, Rules};
+
+    #[test]
+    fn signoff_is_prefilled_once_and_kept_sorted() {
+        let mut checks = vec!["tests".to_owned()];
+        assert!(prefill_signoff(&mut checks));
+        assert_eq!(checks, ["signoff", "tests"]);
+        assert!(!prefill_signoff(&mut checks), "already required");
+        assert_eq!(checks, ["signoff", "tests"]);
+    }
 
     #[test]
     fn demo_rules_come_from_the_sample_pull_requests() {

@@ -65,11 +65,20 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
                 problems(ui, &pr);
                 let required: Vec<&Check> = glance::required(&pr).collect();
                 if required.is_empty() {
-                    ui.add(EmptyState::new(
-                        Mood::Relaxed,
-                        "No signoffs required",
-                        "This branch's protection asks for no signoff checks.",
-                    ));
+                    let mut set_up = false;
+                    ui.add(
+                        EmptyState::new(
+                            Mood::Relaxed,
+                            "No signoffs required",
+                            "This branch's protection asks for no signoff checks.",
+                        )
+                        .action("Set up signoff", &mut set_up),
+                    );
+                    if set_up {
+                        let branch = if pr.rules.branch.is_empty() { "main" } else { &pr.rules.branch };
+                        app.settings.set_up_signoff(&pr.repo_id, branch);
+                        app.settings_open = true;
+                    }
                 }
                 for check in required {
                     if check_row(ui, app, &pr, check, target.as_ref()).clicked() && check.configured {

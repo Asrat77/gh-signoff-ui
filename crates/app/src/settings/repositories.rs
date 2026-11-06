@@ -147,6 +147,14 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row, effects: &mut Effects) 
                 }
             });
         });
+        ui.add_space(space::XS);
+        if ui
+            .add(Button::new("Set up signoff").kind(ButtonKind::Secondary).compact().width(130.0))
+            .on_hover_text("Require the signoff check on this repository's default branch")
+            .clicked()
+        {
+            settings.set_up_signoff(&repo.id, &repo.default_branch);
+        }
         if let Some(change) = change {
             update_repository(ui, settings, &repo.id, |update| match change {
                 Change::Scope(scope) => update.pull_request_scope = scope,
