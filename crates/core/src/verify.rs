@@ -544,7 +544,7 @@ mod tests {
     fn signs_off_the_tested_commit_after_a_passing_run() {
         let f = fixture(vec![
             ok("rev-parse HEAD", SHA),
-            Reply { matches: "-c make test", stdout: "ok 12 tests", stderr: "", code: 0 },
+            Reply { matches: "make test", stdout: "ok 12 tests", stderr: "", code: 0 },
             pr_view(SHA, "OPEN"),
             ok("signoff --commit", "✓ Signed off"),
         ]);
@@ -579,7 +579,7 @@ mod tests {
     fn a_failing_command_records_the_run_and_never_signs_off() {
         let f = fixture(vec![
             ok("rev-parse HEAD", SHA),
-            Reply { matches: "-c make test", stdout: "", stderr: "1 failed", code: 2 },
+            Reply { matches: "make test", stdout: "", stderr: "1 failed", code: 2 },
         ]);
         let (result, _) = run(&f, "tests");
         let outcome = result.expect("started");
@@ -598,7 +598,7 @@ mod tests {
     /// GitHub's head does not, so the result no longer speaks for it.
     #[test]
     fn refuses_to_sign_off_when_the_pull_request_moved_during_the_run() {
-        let f = fixture(vec![ok("rev-parse HEAD", SHA), ok("-c make test", ""), pr_view(OTHER, "OPEN")]);
+        let f = fixture(vec![ok("rev-parse HEAD", SHA), ok("make test", ""), pr_view(OTHER, "OPEN")]);
         let (result, events) = run(&f, "tests");
         let outcome = result.expect("started");
         assert_eq!(outcome.phase, Phase::Checkout);
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn refuses_to_sign_off_a_merged_pull_request() {
-        let f = fixture(vec![ok("rev-parse HEAD", SHA), ok("-c make test", ""), pr_view(SHA, "MERGED")]);
+        let f = fixture(vec![ok("rev-parse HEAD", SHA), ok("make test", ""), pr_view(SHA, "MERGED")]);
         let (result, _) = run(&f, "tests");
         assert_eq!(result.expect("started").phase, Phase::Checkout);
         assert!(!f.fake.called("signoff"));
@@ -618,7 +618,7 @@ mod tests {
     fn a_failed_signoff_is_recorded_as_one() {
         let f = fixture(vec![
             ok("rev-parse HEAD", SHA),
-            ok("-c make test", ""),
+            ok("make test", ""),
             pr_view(SHA, "OPEN"),
             Reply { matches: "signoff --commit", stdout: "", stderr: "HTTP 403", code: 1 },
         ]);
