@@ -3,8 +3,12 @@
 //! Everything here is plain, blocking Rust: the app calls it from a
 //! background thread so the window never waits on `gh`.
 //!
-//! - [`gh`] reads GitHub through the `gh` CLI (never the network directly),
-//!   so the user's own auth and the extension's safety checks still apply.
+//! - [`gh`] talks to GitHub through the `gh` CLI, so the user's own auth
+//!   and the extension's safety checks still apply. Every write goes
+//!   through it.
+//! - [`api`] reads repositories over GitHub's REST API in-process with the
+//!   token `gh auth token` gives, using `ETag`s so an unchanged resource
+//!   answers a free 304; without a token, reads go through `gh`.
 //! - [`checks`] turns branch protection plus commit statuses into the rows
 //!   the popover shows, and decides readiness.
 //! - [`config`] and [`history`] are the two files Signoff keeps on disk.
@@ -20,11 +24,13 @@
 //!   `Makefile`, `package.json` and the like.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
+pub mod api;
 pub mod checks;
 pub mod config;
 pub mod demo;
 pub mod discover;
 pub mod gh;
+mod git;
 pub mod history;
 pub mod product;
 pub mod rules;

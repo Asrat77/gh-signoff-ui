@@ -21,7 +21,7 @@ It is a native Rust app built with [egui](https://github.com/emilk/egui) on [fas
 - `gh extension install basecamp/gh-signoff`
 - On Linux: `libxkbcommon-x11` for the window and a StatusNotifier host for the tray. GNOME needs the AppIndicator extension.
 
-Signoff never reads or stores a GitHub token. Every GitHub read and write goes through `gh`, with your own sign-in.
+Signoff never stores a GitHub token. It asks `gh auth token` for yours, keeps it in memory only, and reads GitHub's API directly with it, so a repository that hasn't changed costs nothing against your rate limit. Every write (signoffs, branch rules) goes through `gh`, with your own sign-in. Without a token, or with `--gh-only`, reads go through `gh` too.
 
 ## Install
 
@@ -46,6 +46,7 @@ Rust 1.98 is pinned in `rust-toolchain.toml`, so rustup installs it for you.
 cargo run -p signoff -- --demo      # sample data, no GitHub reads or writes
 cargo run -p signoff                # your tracked repositories
 cargo run -p signoff -- --hidden    # start in the tray without opening the window
+cargo run -p signoff -- --gh-only   # read GitHub through gh only, not over its API
 ```
 
 The first run copies the config and history the previous Go/Electron version wrote, so tracked repositories carry over.

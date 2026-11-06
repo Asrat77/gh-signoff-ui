@@ -1,5 +1,6 @@
-//! Reads from GitHub through the `gh` CLI, and from the local checkout
-//! through `git`.
+//! Reads from GitHub through the `gh` CLI or, when [`Gh::with_api`] gave it
+//! one, the in-process [`Api`] for repository reads; and from the local
+//! checkout through the files under `.git`, or `git`.
 
 use std::fmt;
 use std::path::Path;
@@ -9,6 +10,7 @@ use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::api::{Api, ApiError, Transport};
 use crate::checks::{CheckState, is_signoff_context};
 use crate::runner::{Runner, SystemRunner};
 
@@ -55,13 +57,17 @@ pub enum GhError {
         /// Why.
         source: serde_json::Error,
     },
+    /// A read through the REST API failed.
+    #[error("GitHub API: {0}")]
+    Api(#[from] ApiError),
 }
 
 impl GhError {
-    /// The message of a non-zero exit, if that is what this is.
+    /// The message of a non-zero exit or an API error answer, if that is
+    /// what this is.
     pub fn message(&self) -> Option<&str> {
         match self {
-            Self::Exit { message, .. } => Some(message),
+            Self::Exit { message, .. } | Self::Api(ApiError::Status { message, .. }) => Some(message),
             _ => None,
         }
     }
@@ -96,6 +102,7 @@ impl GhError {
                 .iter()
                 .any(|needle| message.contains(needle))
             }
+            Self::Api(err) => matches!(err, ApiError::Unauthorized),
             Self::Json { .. } => false,
         }
     }
@@ -128,6 +135,8 @@ pub struct Environment {
 pub struct RepoInfo {
     /// `owner/name`.
     pub name_with_owner: String,
+    /// The GitHub host: `github.com`, or a GitHub Enterprise one.
+    pub host: String,
     /// The default branch on GitHub.
     pub default_branch: String,
     /// The branch checked out locally.
@@ -210,6 +219,7 @@ pub enum ProtectionStatus {
 #[derive(Clone)]
 pub struct Gh {
     runner: Arc<dyn Runner>,
+    api: Option<Arc<Api>>,
 }
 
 impl fmt::Debug for Gh {
@@ -225,9 +235,27 @@ impl Default for Gh {
 }
 
 impl Gh {
-    /// A client that spawns processes through `runner`.
+    /// A client that spawns processes through `runner` for everything.
     pub fn new(runner: Arc<dyn Runner>) -> Self {
-        Self { runner }
+        Self { runner, api: None }
+    }
+
+    /// A client that reads repositories over the REST API through
+    /// `transport` when `gh auth token` gives a token, and spawns processes
+    /// through `runner` for everything else.
+    pub fn with_api(runner: Arc<dyn Runner>, transport: Arc<dyn Transport>) -> Self {
+        let api = Arc::new(Api::new(transport, runner.clone()));
+        Self { runner, api: Some(api) }
+    }
+
+    /// The REST client, if this has one.
+    pub fn api(&self) -> Option<&Arc<Api>> {
+        self.api.as_ref()
+    }
+
+    /// When reading may start again, if GitHub's rate limit stopped it.
+    pub fn next_allowed(&self) -> Option<Timestamp> {
+        self.api.as_ref().and_then(|api| api.next_allowed())
     }
 
     fn exec(&self, dir: Option<&Path>, program: &str, args: &[&str]) -> Result<String, GhError> {
@@ -310,18 +338,34 @@ impl Gh {
             name_with_owner: String,
             #[serde(default)]
             default_branch_ref: Option<Branch>,
+            #[serde(default)]
+            url: String,
         }
         #[derive(Deserialize)]
         struct Branch {
             name: String,
         }
-        let view: View = self.json(Some(dir), &["repo", "view", "--json", "nameWithOwner,defaultBranchRef"])?;
+        let view: View = self.json(Some(dir), &["repo", "view", "--json", "nameWithOwner,defaultBranchRef,url"])?;
         Ok(RepoInfo {
             name_with_owner: view.name_with_owner,
+            host: crate::api::host_of(&view.url),
             default_branch: view.default_branch_ref.map(|b| b.name).unwrap_or_default(),
+            ..self.local_head(dir)
+        })
+    }
+
+    /// The branch and commit checked out at `dir`, from the files under
+    /// `.git` when they say for certain, otherwise from `git`. Empty when
+    /// neither can tell (an unborn branch).
+    pub fn local_head(&self, dir: &Path) -> RepoInfo {
+        if let Some(head) = crate::git::read_head(dir) {
+            return RepoInfo { current_branch: head.branch, head_sha: head.sha, ..RepoInfo::default() };
+        }
+        RepoInfo {
             current_branch: self.git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default(),
             head_sha: self.git(dir, &["rev-parse", "HEAD"]).unwrap_or_default(),
-        })
+            ..RepoInfo::default()
+        }
     }
 
     /// The pull request for the branch checked out at `dir`. No pull request
@@ -377,51 +421,9 @@ impl Gh {
     ///
     /// When the status API call fails.
     pub fn commit_statuses(&self, dir: &Path, repo: &str, sha: &str) -> Result<Vec<CommitStatus>, GhError> {
-        #[derive(Deserialize)]
-        struct Combined {
-            #[serde(default)]
-            statuses: Vec<RawStatus>,
-        }
-        #[derive(Deserialize)]
-        struct RawStatus {
-            #[serde(default)]
-            context: String,
-            #[serde(default)]
-            state: CheckState,
-            #[serde(default)]
-            description: Option<String>,
-            #[serde(default, deserialize_with = "timestamp_or_default")]
-            created_at: Timestamp,
-            #[serde(default)]
-            target_url: Option<String>,
-            #[serde(default)]
-            creator: Option<Creator>,
-        }
-        #[derive(Deserialize)]
-        struct Creator {
-            #[serde(default)]
-            login: String,
-            #[serde(default)]
-            avatar_url: String,
-        }
         let path = format!("repos/{repo}/commits/{sha}/status");
-        let raw: Combined = self.json(Some(dir), &["api", &path])?;
-        Ok(raw
-            .statuses
-            .into_iter()
-            .map(|s| {
-                let (creator, avatar_url) = s.creator.map(|c| (c.login, c.avatar_url)).unwrap_or_default();
-                CommitStatus {
-                    context: s.context,
-                    state: s.state,
-                    description: s.description.unwrap_or_default(),
-                    creator,
-                    avatar_url,
-                    created_at: s.created_at,
-                    target_url: s.target_url.unwrap_or_default(),
-                }
-            })
-            .collect())
+        let stdout = self.exec(Some(dir), "gh", &["api", &path])?;
+        parse_combined_status(&stdout).map_err(|source| GhError::Json { command: format!("gh api {path}"), source })
     }
 
     /// The status contexts branch protection requires on `branch`, and which
@@ -586,8 +588,58 @@ pub(crate) fn limit_pull_requests<T>(mut raw: Vec<T>) -> (Vec<T>, bool) {
     (raw, true)
 }
 
+/// The statuses in a combined-status answer (`GET
+/// /repos/{o}/{r}/commits/{sha}/status`), whether `gh api` or the REST
+/// client fetched it.
+pub(crate) fn parse_combined_status(body: &str) -> Result<Vec<CommitStatus>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Combined {
+        #[serde(default)]
+        statuses: Vec<RawStatus>,
+    }
+    #[derive(Deserialize)]
+    struct RawStatus {
+        #[serde(default)]
+        context: String,
+        #[serde(default)]
+        state: CheckState,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default, deserialize_with = "timestamp_or_default")]
+        created_at: Timestamp,
+        #[serde(default)]
+        target_url: Option<String>,
+        #[serde(default)]
+        creator: Option<Creator>,
+    }
+    #[derive(Deserialize)]
+    struct Creator {
+        #[serde(default)]
+        login: String,
+        #[serde(default)]
+        avatar_url: String,
+    }
+    let raw: Combined = serde_json::from_str(body)?;
+    Ok(raw
+        .statuses
+        .into_iter()
+        .map(|s| {
+            let (creator, avatar_url) = s.creator.map(|c| (c.login, c.avatar_url)).unwrap_or_default();
+            CommitStatus {
+                context: s.context,
+                state: s.state,
+                description: s.description.unwrap_or_default(),
+                creator,
+                avatar_url,
+                created_at: s.created_at,
+                target_url: s.target_url.unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
 /// A timestamp, or the epoch for `null` or a missing value.
-fn timestamp_or_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+pub(crate) fn timestamp_or_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
     Ok(Option::<Timestamp>::deserialize(deserializer)?.unwrap_or_default())
 }
 

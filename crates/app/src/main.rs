@@ -24,6 +24,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use fastframe_shell::{Shell, Waker};
+use signoff_core::api::UreqTransport;
 use signoff_core::{ConfigStore, Gh, HistoryStore, ProductService, Runner, SystemRunner, Verifier};
 
 /// What the command line asked for.
@@ -31,6 +32,7 @@ use signoff_core::{ConfigStore, Gh, HistoryStore, ProductService, Runner, System
 struct Args {
     demo: bool,
     hidden: bool,
+    gh_only: bool,
     config: Option<PathBuf>,
 }
 
@@ -40,6 +42,7 @@ Usage: signoff [options]
 Options:
   --demo           Show fixed sample data; nothing is read from or written to GitHub
   --hidden         Start in the tray without opening the window
+  --gh-only        Read GitHub through gh only, not over its API in-process
   --config <path>  Use this config file instead of the default
   --version        Print the version and exit
   --help           Print this help and exit";
@@ -51,6 +54,7 @@ fn parse_args() -> Result<Option<Args>, String> {
         match arg.as_str() {
             "--demo" => args.demo = true,
             "--hidden" => args.hidden = true,
+            "--gh-only" => args.gh_only = true,
             "--config" => args.config = Some(argv.next().ok_or("--config needs a path")?.into()),
             "--version" | "-V" => {
                 println!("Signoff {}", env!("CARGO_PKG_VERSION"));
@@ -147,7 +151,14 @@ fn build_service(args: &Args) -> Result<(Arc<ProductService>, Arc<Verifier>, Gh)
     let (config, history) = (Arc::new(config), Arc::new(history));
     let runner: Arc<dyn Runner> = Arc::new(SystemRunner::default());
     let seed_dir = std::env::current_dir().ok();
-    let gh = Gh::new(runner.clone());
+    // Reads go over GitHub's API with gh's token, falling back to gh by
+    // themselves; --gh-only is the way out if the API path misbehaves.
+    let gh = if args.gh_only {
+        log::info!("reading GitHub through gh only");
+        Gh::new(runner.clone())
+    } else {
+        Gh::with_api(runner.clone(), Arc::new(UreqTransport::default()))
+    };
     let service = Arc::new(ProductService::new(gh.clone(), config.clone(), history.clone(), seed_dir));
     let verifier = Arc::new(Verifier::new(service.clone(), runner, config, history));
     Ok((service, verifier, gh))

@@ -14,6 +14,7 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::api::path_segment;
 use crate::checks::CheckState;
 use crate::checks::{merge_signoff_contexts, valid_context_name};
 use crate::gh::{Gh, GhError, ProtectionStatus};
@@ -117,20 +118,6 @@ pub fn plan(existing: &[String], protection: ProtectionStatus, desired: &[String
     }
 }
 
-/// `value` escaped for one segment of a URL path, so a branch such as
-/// `release/1.0` stays one segment.
-fn path_segment(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            out.push(char::from(byte));
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
 impl Gh {
     /// Makes `branch` of `repo` require exactly the signoff checks `names`
     /// (`tests`, `lint`, or `signoff` for the bare check), keeping every
@@ -185,6 +172,12 @@ impl Gh {
             Write::RemoveRequiredChecks => {
                 self.run(Some(dir), None, "gh", &["api", "--method", "DELETE", &base])?;
             }
+        }
+        if write != Write::Unchanged
+            && let Some(api) = self.api()
+        {
+            // The next read must show the new rules, not the kept ones.
+            api.forget_protection(repo, branch);
         }
         Ok(write)
     }
