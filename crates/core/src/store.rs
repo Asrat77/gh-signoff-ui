@@ -32,16 +32,20 @@
 //!   last probe found a problem, and after a read fails in a way that says
 //!   `gh` is missing or signed out.
 //!
-//! What comes later fits around this: a REST client with ETags only
-//! changes how a read is produced (a 304 can skip landing altogether), and
-//! a scheduler only changes when reads start. Neither needs to touch the
-//! patching here.
+//! - **Unchanged reads.** A read that finds exactly what the repository
+//!   already shows (the REST client's 304s make that the common case) only
+//!   moves its `fetched_at`: the pull requests are not replaced, so nothing
+//!   downstream sees a change. Reads still land in full while a signoff is
+//!   shown optimistically, so it can expire.
+//!
+//! A scheduler only changes when reads start, and needs nothing here.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use jiff::{SignedDuration, Timestamp};
+use sha2::{Digest as _, Sha256};
 
 use crate::checks::CheckState;
 use crate::config::{AppConfig, CommandMapping, TrackedRepository};
@@ -102,6 +106,9 @@ pub(crate) struct Store {
     last_epoch: u64,
     /// GitHub statuses per repository, merged into the history.
     statuses: HashMap<String, Vec<ActivityEvent>>,
+    /// What the last read of each repository found, to tell an unchanged
+    /// read from a new one.
+    fingerprints: HashMap<String, [u8; 32]>,
     optimistic: Vec<Optimistic>,
     probe: Probe,
 }
@@ -248,8 +255,21 @@ impl Store {
         if self.epochs.get(&ticket.repo_id) != Some(&ticket.epoch) || self.readable(&ticket.repo_id).is_none() {
             return false;
         }
-        let RepositoryRead { mut repository, mut pull_requests, history } = read;
         let id = ticket.repo_id.clone();
+        let fingerprint = fingerprint(&read);
+        let shown = self.state.repositories.iter().any(|r| r.id == id && r.fetched_at.is_some());
+        let unchanged = shown
+            && self.fingerprints.get(&id) == Some(&fingerprint)
+            && !self.optimistic.iter().any(|o| o.repo_id == id);
+        if unchanged {
+            if let Some(slot) = self.state.repositories.iter_mut().find(|r| r.id == id) {
+                slot.fetched_at = Some(now);
+            }
+            self.state.fetched_at = Some(now);
+            return true;
+        }
+        self.fingerprints.insert(id.clone(), fingerprint);
+        let RepositoryRead { mut repository, mut pull_requests, history } = read;
         repository.fetched_at = Some(now);
         self.keep_optimistic(&id, &mut pull_requests, now);
         if let Some(slot) = self.state.repositories.iter_mut().find(|r| r.id == id) {
@@ -292,6 +312,7 @@ impl Store {
             self.state.repositories.clear();
             self.state.pull_requests.clear();
             self.statuses.clear();
+            self.fingerprints.clear();
             self.optimistic.clear();
             return;
         }
@@ -315,6 +336,7 @@ impl Store {
             self.tracked.iter().filter(|r| r.enabled).map(|r| (r.id.as_str(), &r.commands)).collect();
         self.state.pull_requests.retain(|pr| live.contains_key(pr.repo_id.as_str()));
         self.statuses.retain(|id, _| live.contains_key(id.as_str()));
+        self.fingerprints.retain(|id, _| live.contains_key(id.as_str()));
         self.optimistic.retain(|o| live.contains_key(o.repo_id.as_str()));
         for pr in &mut self.state.pull_requests {
             if let Some(commands) = live.get(pr.repo_id.as_str()) {
@@ -352,6 +374,23 @@ impl Store {
         self.last_epoch += 1;
         self.epochs.insert(id.to_owned(), self.last_epoch);
         self.last_epoch
+    }
+}
+
+/// A digest of what `read` found, ignoring when it was read.
+fn fingerprint(read: &RepositoryRead) -> [u8; 32] {
+    let pull_requests: Vec<PullRequestState> = read
+        .pull_requests
+        .iter()
+        .map(|pr| PullRequestState { fetched_at: Timestamp::default(), ..pr.clone() })
+        .collect();
+    let mut repository = read.repository.clone();
+    repository.fetched_at = None;
+    // Serialising these plain structs does not fail; if it did, the empty
+    // digest would match and skip a land, so fall back to a unique one.
+    match serde_json::to_vec(&(&repository, &pull_requests, &read.history)) {
+        Ok(bytes) => Sha256::digest(bytes).into(),
+        Err(_) => Sha256::digest(Timestamp::now().as_nanosecond().to_le_bytes()).into(),
     }
 }
 
@@ -614,6 +653,44 @@ mod tests {
         land(&mut store, "r1", vec![pr("r1", 1, CheckState::Success, "me", 0)], at(3));
         land(&mut store, "r1", vec![pr("r1", 1, CheckState::Failure, "me", 0)], at(4));
         assert_eq!(tests_state(&store, 1), CheckState::Failure);
+    }
+
+    #[test]
+    fn an_unchanged_read_only_moves_fetched_at() {
+        let mut store = store(&[tracked("r1")]);
+        let found = || vec![pr("r1", 1, CheckState::Pending, "me", 0)];
+        land(&mut store, "r1", found(), at(0));
+        // Something the read never touches, to see the shown list stay put.
+        store.state.pull_requests[0].warning = Some("kept".into());
+
+        assert!(land(&mut store, "r1", found(), at(1)), "an unchanged read still lands");
+        assert_eq!(store.state.repositories[0].fetched_at, Some(at(1)));
+        assert_eq!(store.state.fetched_at, Some(at(1)));
+        assert_eq!(store.state.pull_requests[0].warning.as_deref(), Some("kept"), "not replaced");
+
+        land(&mut store, "r1", vec![pr("r1", 1, CheckState::Success, "me", 0)], at(2));
+        assert_eq!(tests_state(&store, 1), CheckState::Success, "a change replaces it");
+        assert_eq!(store.state.pull_requests[0].warning, None);
+    }
+
+    #[test]
+    fn unchanged_reads_land_in_full_after_a_pause_or_while_a_signoff_waits() {
+        let mut store = store(&[tracked("r1")]);
+        let found = || vec![pr("r1", 1, CheckState::Pending, "me", 0)];
+        land(&mut store, "r1", found(), at(0));
+
+        let mut paused = tracked("r1");
+        paused.enabled = false;
+        store.sync(&config(&[paused]), "/c/config.json".into());
+        store.sync(&config(&[tracked("r1")]), "/c/config.json".into());
+        assert!(store.state.pull_requests.is_empty());
+        land(&mut store, "r1", found(), at(1));
+        assert_eq!(numbers(&store), [1], "the same read shows again after resuming");
+
+        assert!(store.mark_signed_off("r1", 1, "tests", "sha1", "me", at(1)));
+        let later = at(1) + OPTIMISTIC_FOR + SignedDuration::from_secs(1);
+        land(&mut store, "r1", found(), later);
+        assert_eq!(tests_state(&store, 1), CheckState::Pending, "the expired signoff goes");
     }
 
     #[test]
