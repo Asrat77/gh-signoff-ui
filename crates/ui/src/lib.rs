@@ -11,3 +11,6 @@ pub mod status;
 pub use fonts::Type;
 pub use palette::Palette;
 pub use status::Status;
+pub mod theme;
+
+pub use theme::{ThemeMode, install, palette};
