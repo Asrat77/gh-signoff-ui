@@ -1,7 +1,9 @@
 //! Pieces the settings sections share.
 
 use egui::{Frame, Margin, RichText, TextEdit, Ui};
+use signoff_core::{ProductState, RepositoryState};
 use signoff_ui::theme::{radius, space};
+use signoff_ui::widgets::Chip;
 use signoff_ui::{Status, Type, palette};
 
 /// A section's title and the line under it.
@@ -66,4 +68,28 @@ pub(super) fn input(ui: &mut Ui, text: &mut String, hint: &str, step: Type, widt
 pub(super) fn caption(ui: &mut Ui, text: &str) {
     let p = palette(ui.ctx());
     ui.add(egui::Label::new(RichText::new(text).font(Type::Caption.font()).color(p.secondary)).wrap());
+}
+
+/// Chips to choose one of the tracked repositories, remembered in
+/// `selected`. Returns the chosen one; the first when none was chosen.
+pub(super) fn repository_picker<'a>(
+    ui: &mut Ui,
+    selected: &mut Option<String>,
+    state: &'a ProductState,
+) -> Option<&'a RepositoryState> {
+    let repos = &state.repositories;
+    let current = selected.as_deref().and_then(|id| repos.iter().find(|r| r.id == id)).or_else(|| repos.first())?;
+    if repos.len() > 1 {
+        ui.horizontal_wrapped(|ui| {
+            for repo in repos {
+                let chip = Chip::new(&repo.name_with_owner).icon(signoff_ui::icons::REPOSITORY);
+                if ui.add(chip.selected(repo.id == current.id)).clicked() {
+                    *selected = Some(repo.id.clone());
+                }
+            }
+        });
+        ui.add_space(space::M);
+    }
+    let chosen = selected.as_deref().and_then(|id| repos.iter().find(|r| r.id == id)).unwrap_or(current);
+    Some(chosen)
 }

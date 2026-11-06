@@ -5,6 +5,7 @@
 //! on `gh` (adding a checkout, reading or writing branch rules) runs on a
 //! background thread through [`Jobs`], so the window never blocks.
 
+mod commands;
 mod general;
 mod jobs;
 mod parts;
@@ -30,15 +31,18 @@ pub(crate) enum Section {
     General,
     /// The tracked checkouts.
     Repositories,
+    /// The local command behind each check.
+    Commands,
 }
 
 impl Section {
-    const ALL: [Self; 2] = [Self::General, Self::Repositories];
+    const ALL: [Self; 3] = [Self::General, Self::Repositories, Self::Commands];
 
     fn label(self) -> &'static str {
         match self {
             Self::General => "General",
             Self::Repositories => "Repositories",
+            Self::Commands => "Commands",
         }
     }
 
@@ -46,6 +50,7 @@ impl Section {
         match self {
             Self::General => icons::GENERAL,
             Self::Repositories => icons::REPOSITORY,
+            Self::Commands => icons::TERMINAL,
         }
     }
 }
@@ -58,6 +63,9 @@ pub(crate) struct Settings {
     /// Whether Signoff starts at login, read when the window first opens.
     launch_at_login: Option<bool>,
     repositories: repositories::Form,
+    /// The repository the commands and branch rules sections show.
+    selected_repo: Option<String>,
+    commands: Option<commands::Draft>,
 }
 
 /// What the settings asked the app for this frame.
@@ -78,6 +86,8 @@ impl Settings {
             section: Section::default(),
             launch_at_login: None,
             repositories: repositories::Form::default(),
+            selected_repo: None,
+            commands: None,
         }
     }
 
@@ -144,6 +154,7 @@ pub(crate) fn contents(ui: &mut Ui, settings: &mut Settings, state: &ProductStat
                     match settings.section {
                         Section::General => general::show(ui, settings, state, &mut effects),
                         Section::Repositories => repositories::show(ui, settings, state, &mut effects),
+                        Section::Commands => commands::show(ui, settings, state, &mut effects),
                     }
                 });
             });
