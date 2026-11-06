@@ -52,6 +52,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
 fn blocked(ui: &mut Ui, app: &mut Signoff) -> bool {
     let state = &app.state;
     let mut clicked = false;
+    let mut open_settings = false;
     let shown = if state.fetched_at.is_none() {
         ui.add(EmptyState::new(Mood::Busy, "Looking around", "Reading your pull requests through gh…"));
         true
@@ -65,15 +66,32 @@ fn blocked(ui: &mut Ui, app: &mut Signoff) -> bool {
         }
         true
     } else if !state.onboarded {
-        ui.add(
-            EmptyState::new(Mood::AtYou, "Track a repository", "Add a local checkout to see its pull requests here.")
-                .action("Open settings", &mut clicked),
-        );
+        if let Some(path) = app.settings.adding() {
+            let detail = format!("Asking gh about {}…", path.display());
+            ui.add(EmptyState::new(Mood::Busy, "Checking the folder", &detail));
+        } else {
+            ui.add(
+                EmptyState::new(
+                    Mood::AtYou,
+                    "Track a repository",
+                    "Choose the folder of a GitHub checkout to see its pull requests here.",
+                )
+                .action("Choose a folder…", &mut clicked),
+            );
+            ui.add_space(space::S);
+            if ui.add(Button::new("Open settings").kind(ButtonKind::Secondary)).clicked() {
+                open_settings = true;
+            }
+        }
         true
     } else {
         false
     };
-    if clicked && !state.onboarded {
+    if clicked && !app.state.onboarded {
+        let ctx = ui.ctx().clone();
+        app.settings.choose_and_add(&ctx);
+    }
+    if open_settings {
         app.settings_open = true;
     }
     shown

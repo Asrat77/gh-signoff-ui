@@ -175,6 +175,13 @@ impl Signoff {
             }
         }
 
+        // Settings jobs started from the popover finish with Settings closed.
+        if let Some(ctx) = ctx
+            && self.settings.pump(ctx).refresh
+        {
+            self.refresh();
+        }
+
         // A signoff changes GitHub's statuses; show them.
         if self.runs.take_signed_off() {
             self.refresh();
@@ -336,6 +343,9 @@ impl eframe::App for Window {
         popover::show(ui, &mut self.app);
         if self.app.settings_open {
             settings::window(ui.ctx(), &mut self.app);
+        } else {
+            // The settings window shows its own toasts.
+            signoff_ui::widgets::show_toasts(ui.ctx());
         }
     }
 

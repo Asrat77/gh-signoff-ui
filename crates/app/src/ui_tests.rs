@@ -404,3 +404,25 @@ fn settings_opens_from_the_popover() {
     harness.run_ok();
     assert!(harness.state().settings_open);
 }
+
+#[test]
+fn the_first_run_screen_picks_a_folder_and_keeps_settings_second() {
+    let mut harness = popover_harness();
+    // Let the demo's first refresh land, or it would replace the state below.
+    step_until(&mut harness, "the first refresh", |h| !h.state().refreshing());
+    {
+        let app = harness.state_mut();
+        app.state = ProductState {
+            fetched_at: Some(jiff::Timestamp::now()),
+            env: signoff_core::Environment { gh_installed: true, authenticated: true, ..Default::default() },
+            onboarded: false,
+            ..ProductState::default()
+        };
+    }
+    harness.run_ok();
+    harness.get_by_label("Track a repository");
+    harness.get_by_label("Choose a folder…");
+    harness.get_by_label("Open settings").click();
+    harness.run_ok();
+    assert!(harness.state().settings_open);
+}

@@ -212,10 +212,8 @@ fn add(ui: &mut Ui, settings: &mut Settings) {
         });
         return;
     }
-    if ui.add(AddButton::new("Add a local checkout")).clicked()
-        && let Some(folder) = rfd::FileDialog::new().set_title("Choose a local checkout").pick_folder()
-    {
-        start_adding(settings, folder);
+    if ui.add(AddButton::new("Add a local checkout")).clicked() {
+        choose_and_add(ui.ctx(), settings);
         return;
     }
     ui.add_space(space::S);
@@ -231,6 +229,24 @@ fn add(ui: &mut Ui, settings: &mut Settings) {
             start_adding(settings, expand_home(&path));
         }
     });
+}
+
+/// Asks for a checkout with the system folder picker and starts tracking
+/// it in the background. Progress and errors come as toasts. Settings and
+/// the popover's first-run screen both add repositories through this.
+pub(super) fn choose_and_add(ctx: &egui::Context, settings: &mut Settings) {
+    if settings.repositories.adding.is_some() {
+        return;
+    }
+    if let Some(folder) = rfd::FileDialog::new().set_title("Choose a local checkout").pick_folder() {
+        toast(ctx, format!("Checking {} with gh…", folder.display()), Status::Neutral);
+        start_adding(settings, folder);
+    }
+}
+
+/// The checkout being added, while `gh` checks it.
+pub(super) fn adding(settings: &Settings) -> Option<&std::path::Path> {
+    settings.repositories.adding.as_deref()
 }
 
 /// `~/code/app` → the home folder's `code/app`.
