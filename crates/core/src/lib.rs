@@ -16,6 +16,8 @@
 //! - [`rules`] edits the signoff checks branch protection requires,
 //!   leaving every other rule alone.
 //! - [`discover`] finds the GitHub checkouts already on this computer.
+//! - [`suggest`] proposes local commands for a check from the checkout's
+//!   `Makefile`, `package.json` and the like.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
 pub mod checks;
@@ -28,6 +30,7 @@ pub mod product;
 pub mod rules;
 pub mod runner;
 mod store;
+pub mod suggest;
 pub mod verify;
 
 pub use checks::{Check, CheckState, Rules, Tally};
@@ -37,4 +40,5 @@ pub use history::{ActivityEvent, ActivityKind, HistoryStore};
 pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequestState, RepositoryState};
 pub use rules::{RulesError, Write as RulesWrite};
 pub use runner::{CANCELLED, Output, Runner, SystemRunner, TIMED_OUT};
+pub use suggest::CommandSuggestion;
 pub use verify::{Outcome, Phase, Verifier, VerifyError, VerifyEvent, VerifyRequest};
