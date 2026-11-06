@@ -13,13 +13,16 @@ use crate::app::Signoff;
 /// buttons right to left.
 pub(super) fn band(ui: &mut Ui, mood: Mood, demo: bool, trailing: impl FnOnce(&mut Ui)) {
     let band = if demo { Band::new(mood).subtitle("demo") } else { Band::new(mood) };
+    // Registered before the band draws its buttons, so they sit on top of
+    // it and still get their clicks.
+    let top = ui.available_rect_before_wrap().min;
+    let area = Rect::from_min_size(top, Vec2::new(ui.available_width(), size::BAND));
+    let drag = ui.interact(area, ui.id().with("band-drag"), Sense::drag());
     let mut buttons = Rect::NOTHING;
-    let response = band.show(ui, |ui| {
+    band.show(ui, |ui| {
         trailing(ui);
         buttons = ui.min_rect();
     });
-    // Drag only: clicks still reach the buttons on top of it.
-    let drag = ui.interact(response.response.rect, ui.id().with("band-drag"), Sense::drag());
     let from_button = ui.input(|i| i.pointer.press_origin()).is_some_and(|at| buttons.contains(at));
     if drag.drag_started() && !from_button {
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
