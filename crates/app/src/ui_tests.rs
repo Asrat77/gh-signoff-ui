@@ -74,11 +74,14 @@ struct SettingsUnderTest {
     state: ProductState,
     service: Arc<ProductService>,
     refreshes: usize,
+    /// Read the state again on refresh, as the app does. Off, the state
+    /// stays as it was: a refresh that has not finished yet.
+    follow: bool,
 }
 
 fn settings_harness(service: Arc<ProductService>, state: ProductState) -> Harness<'static, SettingsUnderTest> {
     let settings = Settings::new(service.clone(), || {});
-    let under_test = SettingsUnderTest { settings, state, service, refreshes: 0 };
+    let under_test = SettingsUnderTest { settings, state, service, refreshes: 0, follow: true };
     Harness::builder().with_size(egui::vec2(820.0, 900.0)).build_ui_state(
         |ui, t: &mut SettingsUnderTest| {
             if !installed(ui.ctx()) {
@@ -87,7 +90,9 @@ fn settings_harness(service: Arc<ProductService>, state: ProductState) -> Harnes
             if settings::contents(ui, &mut t.settings, &t.state).refresh {
                 t.refreshes += 1;
                 // What the app does on refresh: read the state again.
-                t.state = t.service.cached_or_config_state();
+                if t.follow {
+                    t.state = t.service.cached_or_config_state();
+                }
             }
         },
         under_test,
@@ -232,6 +237,42 @@ fn adding_a_checkout_tracks_it() {
 }
 
 #[test]
+fn a_repository_chip_changes_before_the_refresh_finishes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.state_mut().follow = false;
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+
+    harness.get_by_label("Watching").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Paused").is_some(), "the chip should flip at once");
+    assert!(!service.config().expect("config").find_repository("repo1").expect("repo").enabled);
+
+    harness.get_by_label("Stop tracking").click();
+    harness.run_ok();
+    harness.get_by_label("Remove").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("acme/widgets").is_none(), "the row should go at once");
+    assert!(service.config().expect("config").snapshot().repositories.is_empty());
+}
+
+#[test]
+fn a_new_repository_reads_until_a_refresh_covers_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let mut harness = settings_harness(service, ProductState::default());
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+    harness.get_by_label("acme/widgets");
+    harness.get_by_label("Reading…");
+}
+
+#[test]
 fn a_command_is_saved_for_a_check() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
@@ -362,4 +403,78 @@ fn settings_opens_from_the_popover() {
     harness.event(press(false));
     harness.run_ok();
     assert!(harness.state().settings_open);
+}
+
+#[test]
+fn the_first_run_screen_picks_a_folder_and_keeps_settings_second() {
+    let mut harness = popover_harness();
+    // Let the demo's first refresh land, or it would replace the state below.
+    step_until(&mut harness, "the first refresh", |h| !h.state().refreshing());
+    {
+        let app = harness.state_mut();
+        app.state = ProductState {
+            fetched_at: Some(jiff::Timestamp::now()),
+            env: signoff_core::Environment { gh_installed: true, authenticated: true, ..Default::default() },
+            onboarded: false,
+            ..ProductState::default()
+        };
+    }
+    harness.run_ok();
+    harness.get_by_label("Track a repository");
+    harness.get_by_label("Choose a folder…");
+    harness.get_by_label("Open settings").click();
+    harness.run_ok();
+    assert!(harness.state().settings_open);
+}
+
+#[test]
+fn set_up_signoff_opens_branch_rules_ready_to_save() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = Arc::new(
+        Script::default()
+            .reply("check-ref-format", "main")
+            .reply("protection --jq", r#"["ci/build"]"#)
+            .reply("--method", "{}"),
+    );
+    let service = service(dir.path(), vec![tracked(dir.path())], script.clone());
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+
+    harness.get_by_label("Set up signoff").click();
+    step_until(&mut harness, "the rules to load with signoff ready", |h| {
+        h.query_by_label_contains("`signoff` is ready below").is_some()
+    });
+    harness.get_by_label("ci/build");
+    harness.get_by_label("Save to GitHub").click();
+    step_until(&mut harness, "the rules to be written", |_| {
+        script.calls().iter().any(|(line, _)| line.contains("--method"))
+    });
+
+    let calls = script.calls();
+    let (_, input) = calls.iter().find(|(line, _)| line.contains("--method")).expect("a write");
+    let input = input.as_deref().unwrap_or_default();
+    assert!(input.contains(r#""signoff""#) && input.contains("ci/build"), "{input}");
+}
+
+#[test]
+fn a_pull_request_without_signoffs_offers_to_set_them_up() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    {
+        let app = harness.state_mut();
+        let pr = app.state.pull_requests.first_mut().expect("a pull request");
+        pr.checks.clear();
+        pr.rules.signoff_contexts.clear();
+        let (repo_id, number) = (pr.repo_id.clone(), pr.pr.number);
+        app.glance.page = popover::Page::PullRequest { repo_id, number };
+    }
+    harness.run_ok();
+    harness.get_by_label("No signoffs required");
+    harness.get_by_label("Set up signoff").click();
+    harness.run_ok();
+    assert!(harness.state().settings_open);
+    assert_eq!(harness.state().settings.section, settings::Section::BranchRules);
 }

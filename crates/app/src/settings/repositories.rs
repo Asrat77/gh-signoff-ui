@@ -4,7 +4,8 @@
 use std::path::PathBuf;
 
 use egui::{Align, Layout, RichText, Ui};
-use signoff_core::{ProductState, PullRequestScope, RepositoryState, RepositoryUpdate};
+use signoff_core::config::TrackedRepository;
+use signoff_core::{ProductState, PullRequestScope, RepositoryUpdate};
 use signoff_ui::theme::space;
 use signoff_ui::widgets::{AddButton, Button, ButtonKind, Chip, IconButton, IconButtonKind, spinner, toast};
 use signoff_ui::{Status, Type, icons, palette};
@@ -28,17 +29,76 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
         "Repositories",
         "Local checkouts of GitHub repositories. Signoff shows their open pull requests and runs checks in them.",
     );
-    if state.repositories.is_empty() {
+    let rows = rows(settings, state);
+    if rows.is_empty() {
         parts::notice(ui, Status::Neutral, "No repository yet. Add a local checkout to start.");
     }
-    for repo in &state.repositories {
+    for repo in &rows {
         row(ui, settings, repo, effects);
     }
     ui.add_space(space::S);
     add(ui, settings);
 }
 
-fn row(ui: &mut Ui, settings: &mut Settings, repo: &RepositoryState, effects: &mut Effects) {
+/// One repository as the section draws it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Row {
+    id: String,
+    path: PathBuf,
+    name_with_owner: String,
+    default_branch: String,
+    enabled: bool,
+    scope: PullRequestScope,
+    /// A refresh has read it since it was added.
+    read: bool,
+    /// Why the last refresh could not read it.
+    error: Option<String>,
+}
+
+/// The rows to draw. The saved config decides which repositories there are
+/// and how they are set, so a click or a removal shows at once; the last
+/// refresh only adds what it learned (the error). Demo data has no config,
+/// so its rows come from the state.
+fn rows(settings: &Settings, state: &ProductState) -> Vec<Row> {
+    match settings.service.config() {
+        Some(config) => merge_rows(&config.snapshot().repositories, state),
+        None => state
+            .repositories
+            .iter()
+            .map(|repo| Row {
+                id: repo.id.clone(),
+                path: repo.path.clone(),
+                name_with_owner: repo.name_with_owner.clone(),
+                default_branch: repo.default_branch.clone(),
+                enabled: repo.enabled,
+                scope: repo.pull_request_scope,
+                read: true,
+                error: repo.error.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn merge_rows(tracked: &[TrackedRepository], state: &ProductState) -> Vec<Row> {
+    tracked
+        .iter()
+        .map(|repo| {
+            let read = state.repositories.iter().find(|r| r.id == repo.id);
+            Row {
+                id: repo.id.clone(),
+                path: repo.path.clone(),
+                name_with_owner: repo.name_with_owner.clone(),
+                default_branch: repo.default_branch.clone(),
+                enabled: repo.enabled,
+                scope: repo.pull_request_scope,
+                read: read.is_some(),
+                error: read.and_then(|r| r.error.clone()),
+            }
+        })
+        .collect()
+}
+
+fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row, effects: &mut Effects) {
     let read_only = settings.read_only();
     parts::card(ui, |ui| {
         let p = palette(ui.ctx());
@@ -72,7 +132,7 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &RepositoryState, effects: &m
         let mut change = None;
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!read_only, |ui| {
-                let mine = repo.pull_request_scope == PullRequestScope::Mine;
+                let mine = repo.scope == PullRequestScope::Mine;
                 if ui.add(Chip::new("My pull requests").selected(mine)).clicked() {
                     change = Some(Change::Scope(PullRequestScope::Mine));
                 }
@@ -87,6 +147,14 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &RepositoryState, effects: &m
                 }
             });
         });
+        ui.add_space(space::XS);
+        if ui
+            .add(Button::new("Set up signoff").kind(ButtonKind::Secondary).compact().width(130.0))
+            .on_hover_text("Require the signoff check on this repository's default branch")
+            .clicked()
+        {
+            settings.set_up_signoff(&repo.id, &repo.default_branch);
+        }
         if let Some(change) = change {
             update_repository(ui, settings, &repo.id, |update| match change {
                 Change::Scope(scope) => update.pull_request_scope = scope,
@@ -97,6 +165,9 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &RepositoryState, effects: &m
         if let Some(error) = &repo.error {
             ui.add_space(space::XS);
             ui.label(RichText::new(error).font(Type::Caption.font()).color(Status::Failing.color(&p)));
+        } else if !repo.read && repo.enabled {
+            ui.add_space(space::XS);
+            ui.label(RichText::new("Reading…").font(Type::Caption.font()).color(p.secondary));
         }
     });
 }
@@ -126,7 +197,7 @@ pub(super) fn update_repository(ui: &Ui, settings: &Settings, id: &str, change: 
     }
 }
 
-fn remove(ui: &Ui, settings: &Settings, repo: &RepositoryState, effects: &mut Effects) {
+fn remove(ui: &Ui, settings: &Settings, repo: &Row, effects: &mut Effects) {
     let Some(config) = settings.service.config() else { return };
     match config.remove_repository(&repo.id) {
         Ok(()) => {
@@ -149,10 +220,8 @@ fn add(ui: &mut Ui, settings: &mut Settings) {
         });
         return;
     }
-    if ui.add(AddButton::new("Add a local checkout")).clicked()
-        && let Some(folder) = rfd::FileDialog::new().set_title("Choose a local checkout").pick_folder()
-    {
-        start_adding(settings, folder);
+    if ui.add(AddButton::new("Add a local checkout")).clicked() {
+        choose_and_add(ui.ctx(), settings);
         return;
     }
     ui.add_space(space::S);
@@ -168,6 +237,24 @@ fn add(ui: &mut Ui, settings: &mut Settings) {
             start_adding(settings, expand_home(&path));
         }
     });
+}
+
+/// Asks for a checkout with the system folder picker and starts tracking
+/// it in the background. Progress and errors come as toasts. Settings and
+/// the popover's first-run screen both add repositories through this.
+pub(super) fn choose_and_add(ctx: &egui::Context, settings: &mut Settings) {
+    if settings.repositories.adding.is_some() {
+        return;
+    }
+    if let Some(folder) = rfd::FileDialog::new().set_title("Choose a local checkout").pick_folder() {
+        toast(ctx, format!("Checking {} with gh…", folder.display()), Status::Neutral);
+        start_adding(settings, folder);
+    }
+}
+
+/// The checkout being added, while `gh` checks it.
+pub(super) fn adding(settings: &Settings) -> Option<&std::path::Path> {
+    settings.repositories.adding.as_deref()
 }
 
 /// `~/code/app` → the home folder's `code/app`.
@@ -199,6 +286,46 @@ fn start_adding(settings: &mut Settings, path: PathBuf) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use signoff_core::RepositoryState;
+
+    fn tracked(id: &str, enabled: bool) -> TrackedRepository {
+        TrackedRepository {
+            id: id.into(),
+            name_with_owner: format!("acme/{id}"),
+            enabled,
+            pull_request_scope: PullRequestScope::All,
+            ..TrackedRepository::default()
+        }
+    }
+
+    #[test]
+    fn rows_follow_the_config_and_borrow_errors_from_the_last_read() {
+        let state = ProductState {
+            repositories: vec![
+                // Stale: the config says paused and "Everyone's" now.
+                RepositoryState {
+                    id: "a".into(),
+                    enabled: true,
+                    pull_request_scope: PullRequestScope::Mine,
+                    error: Some("gh failed".into()),
+                    ..RepositoryState::default()
+                },
+                // Removed since: must not appear.
+                RepositoryState { id: "gone".into(), ..RepositoryState::default() },
+            ],
+            ..ProductState::default()
+        };
+        let rows = merge_rows(&[tracked("a", false), tracked("b", true)], &state);
+        assert_eq!(rows.len(), 2);
+        assert!(!rows[0].enabled);
+        assert_eq!(rows[0].scope, PullRequestScope::All);
+        assert!(rows[0].read);
+        assert_eq!(rows[0].error.as_deref(), Some("gh failed"));
+        // Added but not read yet.
+        assert_eq!(rows[1].id, "b");
+        assert!(!rows[1].read);
+        assert!(rows[1].error.is_none());
+    }
 
     #[test]
     fn a_tilde_path_starts_at_home() {

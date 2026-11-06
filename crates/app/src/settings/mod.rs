@@ -103,6 +103,35 @@ impl Settings {
         }
     }
 
+    /// Opens Branch rules on `branch` of the repository `repo_id` with the
+    /// `signoff` check ready to save: the way to set signoff up on a
+    /// repository. The caller opens the window.
+    pub(crate) fn set_up_signoff(&mut self, repo_id: &str, branch: &str) {
+        self.section = Section::BranchRules;
+        self.selected_repo = Some(repo_id.to_owned());
+        rules::set_up(self, repo_id, branch);
+    }
+
+    /// Asks for a checkout with the folder picker and starts tracking it.
+    pub(crate) fn choose_and_add(&mut self, ctx: &egui::Context) {
+        repositories::choose_and_add(ctx, self);
+    }
+
+    /// The checkout being added, while `gh` checks it.
+    pub(crate) fn adding(&self) -> Option<&std::path::Path> {
+        repositories::adding(self)
+    }
+
+    /// Applies the background jobs that finished. The popover runs this
+    /// too, so an add started there completes with Settings closed.
+    pub(crate) fn pump(&mut self, ctx: &egui::Context) -> Effects {
+        let mut effects = Effects::default();
+        for done in self.jobs.finished(ctx) {
+            done(self, ctx, &mut effects);
+        }
+        effects
+    }
+
     /// Waits, for a bounded time, until config and history are on disk.
     pub(crate) fn flush(&self) {
         self.service.flush();
@@ -137,10 +166,7 @@ pub(crate) fn window(ctx: &egui::Context, app: &mut Signoff) {
 
 /// The window's contents. Split out so tests can draw it without a window.
 pub(crate) fn contents(ui: &mut Ui, settings: &mut Settings, state: &ProductState) -> Effects {
-    let mut effects = Effects::default();
-    for done in settings.jobs.finished(ui.ctx()) {
-        done(settings, ui.ctx(), &mut effects);
-    }
+    let mut effects = settings.pump(ui.ctx());
     let p = palette(ui.ctx());
     Frame::new().fill(p.window).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
