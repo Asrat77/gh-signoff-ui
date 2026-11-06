@@ -5,10 +5,12 @@
 //! happen on a background thread (see [`worker`]), so the window never
 //! waits on `gh`.
 
+mod anchor;
 mod app;
+mod glance;
 mod paths;
+mod popover;
 mod runs;
-mod theme;
 mod tray;
 mod views;
 mod worker;
@@ -101,7 +103,8 @@ fn main() -> ExitCode {
 
     let app = app::Signoff::new(tray, refresher, runs, args.demo);
     let result = Shell::new(app, &waker).idle(fastframe_tray::idle).start_hidden(args.hidden).run(|lease| {
-        eframe::run_native("Signoff", app::native_options(), Box::new(move |cc| Ok(app::window(cc, lease))))
+        let options = lease.peek(|app| app::native_options(app.is_popover(), app.anchor()));
+        eframe::run_native("Signoff", options, Box::new(move |cc| Ok(app::window(cc, lease))))
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,

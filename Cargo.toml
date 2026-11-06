@@ -11,6 +11,7 @@ repository = "https://github.com/Asrat77/gh-signoff-ui"
 
 [workspace.dependencies]
 signoff-core = { path = "crates/core" }
+signoff-ui = { path = "crates/ui" }
 
 # UI: egui on fastframe (https://github.com/crmne/fastframe, MIT). fastframe
 # is not on crates.io yet, so every crate is pinned to the same release tag.
