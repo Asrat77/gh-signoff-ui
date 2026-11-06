@@ -80,7 +80,9 @@ struct SettingsUnderTest {
 }
 
 fn settings_harness(service: Arc<ProductService>, state: ProductState) -> Harness<'static, SettingsUnderTest> {
-    let settings = Settings::new(service.clone(), || {});
+    let mut settings = Settings::new(service.clone(), || {});
+    // Never scan the machine running the tests.
+    settings.find_checkouts_in(None);
     let under_test = SettingsUnderTest { settings, state, service, refreshes: 0, follow: true };
     Harness::builder().with_size(egui::vec2(820.0, 900.0)).build_ui_state(
         |ui, t: &mut SettingsUnderTest| {
@@ -533,4 +535,149 @@ fn a_pull_request_without_signoffs_offers_to_set_them_up() {
     harness.run_ok();
     assert!(harness.state().settings_open);
     assert_eq!(harness.state().settings.section, settings::Section::BranchRules);
+}
+
+/// A folder shaped like a GitHub checkout under `home/code`.
+fn github_checkout(home: &Path, name: &str) -> std::path::PathBuf {
+    let dir = home.join("code").join(name);
+    std::fs::create_dir_all(dir.join(".git")).expect("dot dir");
+    std::fs::write(dir.join(".git/config"), format!("[remote \"origin\"]\n\turl = git@github.com:acme/{name}.git\n"))
+        .expect("config");
+    std::fs::canonicalize(dir).expect("canonical")
+}
+
+fn repo_view_script() -> Arc<Script> {
+    Arc::new(
+        Script::default()
+            .reply("repo view", r#"{"nameWithOwner":"acme/widgets","defaultBranchRef":{"name":"main"}}"#)
+            .reply("rev-parse", "main"),
+    )
+}
+
+#[test]
+fn settings_offers_checkouts_found_on_this_computer_and_adds_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    github_checkout(&home, "widgets");
+    github_checkout(&home, "gadgets");
+    let service = service(dir.path(), Vec::new(), repo_view_script());
+    let mut harness = settings_harness(service.clone(), ProductState::default());
+    harness.state_mut().settings.find_checkouts_in(Some(home));
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    step_until(&mut harness, "the scan", |h| h.query_by_label("Found on this computer").is_some());
+    harness.get_by_label("acme/widgets");
+    harness.get_by_label("acme/gadgets");
+    harness.get_by_label_contains("Add all 2");
+
+    // The suggestions come first; the paste field has an Add of its own.
+    harness.get_all_by_label("Add").next().expect("an Add button").click();
+    step_until(&mut harness, "the checkout to be added", |h| {
+        h.state().service.config().map_or(0, |c| c.snapshot().repositories.len()) >= 1
+    });
+    let repos = service.config().expect("config").snapshot().repositories;
+    assert_eq!(repos.len(), 1);
+    assert!(repos[0].path.ends_with("gadgets"), "the first suggestion is the one added");
+    // The added one is no longer offered; the other still is. (The script
+    // names every repository acme/widgets, so it shows as row and suggestion.)
+    step_until(&mut harness, "the rescan", |h| h.query_by_label_contains("Add all").is_none());
+    assert_eq!(harness.get_all_by_label("acme/widgets").count(), 2);
+    assert!(harness.query_by_label("acme/gadgets").is_none());
+}
+
+#[test]
+fn add_all_tracks_every_suggestion() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    github_checkout(&home, "widgets");
+    github_checkout(&home, "gadgets");
+    let service = service(dir.path(), Vec::new(), repo_view_script());
+    let mut harness = settings_harness(service.clone(), ProductState::default());
+    harness.state_mut().settings.find_checkouts_in(Some(home));
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    step_until(&mut harness, "the scan", |h| h.query_by_label_contains("Add all 2").is_some());
+    harness.get_by_label_contains("Add all 2").click();
+    step_until(&mut harness, "both to be added", |h| {
+        h.state().service.config().map_or(0, |c| c.snapshot().repositories.len()) >= 2
+    });
+    assert_eq!(service.config().expect("config").snapshot().repositories.len(), 2);
+    step_until(&mut harness, "the suggestions to go", |h| h.query_by_label("Found on this computer").is_none());
+}
+
+#[test]
+fn already_tracked_checkouts_are_not_suggested() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let widgets = github_checkout(&home, "widgets");
+    github_checkout(&home, "gadgets");
+    let service = service(dir.path(), vec![tracked(&widgets)], repo_view_script());
+    let mut harness = settings_harness(service, ProductState::default());
+    harness.state_mut().settings.find_checkouts_in(Some(home));
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    step_until(&mut harness, "the scan", |h| h.query_by_label("Found on this computer").is_some());
+    harness.get_by_label("acme/gadgets");
+    assert!(harness.query_by_label_contains("Add all").is_none());
+}
+
+#[derive(Debug)]
+struct Dropped(std::path::PathBuf);
+
+impl egui::DroppedFile for Dropped {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        Err("not needed".into())
+    }
+}
+
+#[test]
+fn a_folder_dropped_on_settings_is_tracked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let checkout = dir.path().join("widgets");
+    std::fs::create_dir(&checkout).expect("checkout");
+    let service = service(dir.path(), Vec::new(), repo_view_script());
+    let mut harness = settings_harness(service.clone(), ProductState::default());
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+    harness.input_mut().dropped_files.push(Arc::new(Dropped(checkout)));
+    step_until(&mut harness, "the folder to be added", |h| {
+        h.state().service.config().map_or(0, |c| c.snapshot().repositories.len()) >= 1
+    });
+    assert_eq!(service.config().expect("config").snapshot().repositories.len(), 1);
+}
+
+#[test]
+fn the_first_run_screen_lists_suggestions_and_adds_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path().join("home");
+    let widgets = github_checkout(&home, "widgets");
+    let service = service(dir.path(), Vec::new(), repo_view_script());
+    let mut harness = popover_harness();
+    step_until(&mut harness, "the first refresh", |h| !h.state().refreshing());
+    {
+        let app = harness.state_mut();
+        app.settings = Settings::new(service.clone(), || {});
+        app.settings
+            .suggest(vec![signoff_core::discover::Found { path: widgets, name_with_owner: "acme/widgets".into() }]);
+        app.state = ProductState {
+            fetched_at: Some(jiff::Timestamp::now()),
+            env: signoff_core::Environment { gh_installed: true, authenticated: true, ..Default::default() },
+            onboarded: false,
+            ..ProductState::default()
+        };
+    }
+    harness.run_ok();
+    harness.get_by_label("Found on this computer");
+    harness.get_by_label("acme/widgets");
+    harness.get_by_label("Choose a folder…");
+    harness.get_by_label("Add").click();
+    step_until(&mut harness, "the checkout to be added", |_| {
+        !service.config().expect("config").snapshot().repositories.is_empty()
+    });
+    step_until(&mut harness, "the suggestion to go", |h| h.query_by_label("Found on this computer").is_none());
 }

@@ -82,6 +82,9 @@ fn blocked(ui: &mut Ui, app: &mut Signoff) -> bool {
             if ui.add(Button::new("Open settings").kind(ButtonKind::Secondary)).clicked() {
                 open_settings = true;
             }
+            app.settings.accept_drops(ui.ctx());
+            ui.add_space(space::M);
+            Frame::new().inner_margin(Margin::symmetric(14, 0)).show(ui, |ui| app.settings.show_suggestions(ui, true));
         }
         true
     } else {

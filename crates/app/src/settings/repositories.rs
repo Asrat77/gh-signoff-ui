@@ -10,15 +10,17 @@ use signoff_ui::theme::space;
 use signoff_ui::widgets::{AddButton, Button, ButtonKind, Switch, spinner, toast};
 use signoff_ui::{Status, Type, icons, palette};
 
-use super::{Effects, Settings, parts};
+use super::{Effects, Settings, discovery, parts};
 
 /// What the repositories section keeps between frames.
 #[derive(Debug, Default)]
 pub(crate) struct Form {
     /// The path typed into the add field.
     path: String,
-    /// A checkout being added.
+    /// The checkout being added (the first, when several are).
     adding: Option<PathBuf>,
+    /// How many more are queued behind it.
+    adding_more: usize,
     /// The repository whose remove button was pressed once.
     confirm_remove: Option<String>,
 }
@@ -29,6 +31,7 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
         "Repositories",
         "Local checkouts of GitHub repositories. Signoff shows their open pull requests and runs checks in them.",
     );
+    accept_drops(ui.ctx(), settings);
     let rows = rows(settings, state);
     if rows.is_empty() {
         parts::notice(ui, Status::Neutral, "No repository yet. Add a local checkout to start.");
@@ -37,7 +40,15 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
         row(ui, settings, repo);
     }
     ui.add_space(space::S);
+    discovery::show(ui, settings, false);
     add(ui, settings);
+}
+
+impl Form {
+    /// Whether a checkout is being added.
+    pub(super) const fn is_adding(&self) -> bool {
+        self.adding.is_some()
+    }
 }
 
 /// One repository as the section draws it.
@@ -233,10 +244,11 @@ pub(super) fn update_repository(ui: &Ui, settings: &Settings, id: &str, change: 
     }
 }
 
-fn remove(ui: &Ui, settings: &Settings, repo: &Row) {
+fn remove(ui: &Ui, settings: &mut Settings, repo: &Row) {
     let Some(config) = settings.service.config() else { return };
     match config.remove_repository(&repo.id) {
         Ok(()) => {
+            settings.discovery.mark_stale();
             toast(ui.ctx(), format!("Stopped tracking {}", repo.name_with_owner), Status::Neutral);
         }
         Err(err) => toast(ui.ctx(), err.to_string(), Status::Failing),
@@ -251,7 +263,11 @@ fn add(ui: &mut Ui, settings: &mut Settings) {
         ui.horizontal(|ui| {
             let (rect, _) = ui.allocate_exact_size(egui::Vec2::splat(18.0), egui::Sense::hover());
             spinner(ui, rect.center(), 7.0, palette(ui.ctx()).secondary);
-            parts::caption(ui, &format!("Checking {} with gh…", path.display()));
+            let more = match settings.repositories.adding_more {
+                0 => String::new(),
+                n => format!(" and {n} more"),
+            };
+            parts::caption(ui, &format!("Checking {}{more} with gh…", path.display()));
         });
         return;
     }
@@ -269,7 +285,7 @@ fn add(ui: &mut Ui, settings: &mut Settings) {
             .add(Button::new("Add").kind(ButtonKind::Accent).compact().width(84.0).enabled(!path.is_empty()))
             .clicked();
         if (clicked || entered) && !path.is_empty() {
-            start_adding(settings, expand_home(&path));
+            start_adding(settings, vec![expand_home(&path)]);
         }
     });
 }
@@ -283,7 +299,7 @@ pub(super) fn choose_and_add(ctx: &egui::Context, settings: &mut Settings) {
     }
     if let Some(folder) = rfd::FileDialog::new().set_title("Choose a local checkout").pick_folder() {
         toast(ctx, format!("Checking {} with gh…", folder.display()), Status::Neutral);
-        start_adding(settings, folder);
+        start_adding(settings, vec![folder]);
     }
 }
 
@@ -300,21 +316,62 @@ fn expand_home(path: &str) -> PathBuf {
     }
 }
 
-fn start_adding(settings: &mut Settings, path: PathBuf) {
-    settings.repositories.adding = Some(path.clone());
+/// Starts tracking every folder in `paths`, one after another, in the
+/// background.
+pub(super) fn start_adding(settings: &mut Settings, paths: Vec<PathBuf>) {
+    let Some(first) = paths.first().cloned() else { return };
+    if settings.repositories.adding.is_some() {
+        return;
+    }
+    settings.repositories.adding = Some(first);
+    settings.repositories.adding_more = paths.len() - 1;
     settings.jobs.start(move |service| {
-        let result = service.add_repository(&path);
+        let results: Vec<_> = paths.into_iter().map(|path| (service.add_repository(&path), path)).collect();
         Box::new(move |settings: &mut Settings, ctx: &egui::Context, _: &mut Effects| {
             settings.repositories.adding = None;
-            match result {
-                Ok(repo) => {
-                    settings.repositories.path.clear();
-                    toast(ctx, format!("Tracking {}", repo.name_with_owner), Status::Ready);
+            settings.repositories.adding_more = 0;
+            let mut tracked = Vec::new();
+            for (result, path) in results {
+                match result {
+                    Ok(repo) => {
+                        settings.discovery.added(&path);
+                        tracked.push(repo.name_with_owner);
+                    }
+                    Err(message) => toast(ctx, message, Status::Failing),
                 }
-                Err(message) => toast(ctx, message, Status::Failing),
+            }
+            if !tracked.is_empty() {
+                settings.repositories.path.clear();
+                let what =
+                    if tracked.len() == 1 { tracked.remove(0) } else { format!("{} repositories", tracked.len()) };
+                toast(ctx, format!("Tracking {what}"), Status::Ready);
             }
         })
     });
+}
+
+/// Starts tracking the folders dropped onto the window, if any. A dropped
+/// file stands for the folder it is in.
+pub(super) fn accept_drops(ctx: &egui::Context, settings: &mut Settings) {
+    if settings.read_only() {
+        return;
+    }
+    let mut dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_owned()).collect());
+    if dropped.is_empty() {
+        return;
+    }
+    if settings.repositories.adding.is_some() {
+        toast(ctx, "Still adding a checkout. Drop it again in a moment.", Status::Neutral);
+        return;
+    }
+    for path in &mut dropped {
+        if path.is_file() {
+            path.pop();
+        }
+    }
+    dropped.dedup();
+    toast(ctx, "Checking the dropped folder with gh…", Status::Neutral);
+    start_adding(settings, dropped);
 }
 
 #[cfg(test)]
