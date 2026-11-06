@@ -20,6 +20,8 @@ const FOOTER: f32 = 112.0;
 enum Action {
     /// Open this pull request's page.
     Page(Page),
+    /// Install the `gh signoff` extension.
+    Install,
 }
 
 /// Draws the list page.
@@ -36,7 +38,9 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
         ui.set_width(ui.available_width());
         ui.set_height(ui.available_height());
         if !blocked(ui, app) {
-            action = body(ui, &app.state, &mut app.glance.filter);
+            let installing = app.installer.running();
+            let failure = app.installer.failure();
+            action = body(ui, &app.state, &mut app.glance.filter, installing, failure.as_deref());
         }
     });
     match action {
@@ -44,6 +48,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
             app.glance.page = page;
             app.glance.check = None;
         }
+        Some(Action::Install) => app.installer.start(),
         None => {}
     }
 }
@@ -100,7 +105,13 @@ fn blocked(ui: &mut Ui, app: &mut Signoff) -> bool {
     shown
 }
 
-fn body(ui: &mut Ui, state: &ProductState, filter: &mut Filter) -> Option<Action> {
+fn body(
+    ui: &mut Ui,
+    state: &ProductState,
+    filter: &mut Filter,
+    installing: bool,
+    install_failure: Option<&str>,
+) -> Option<Action> {
     let mut action = None;
     Frame::new().inner_margin(Margin { left: 22, right: 22, top: 22, bottom: 14 }).show(ui, |ui| {
         let (title, detail) = glance::headline(state);
@@ -123,6 +134,9 @@ fn body(ui: &mut Ui, state: &ProductState, filter: &mut Filter) -> Option<Action
         let height = parts::height_above(ui, FOOTER);
         ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| {
             problems(ui, state);
+            if parts::needs_extension(&state.env) && parts::install_notice(ui, installing, install_failure) {
+                action = Some(Action::Install);
+            }
             let prs = glance::visible(state, *filter);
             if prs.is_empty() {
                 empty(ui, state, *filter);

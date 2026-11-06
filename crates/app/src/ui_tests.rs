@@ -74,6 +74,8 @@ struct SettingsUnderTest {
     state: ProductState,
     service: Arc<ProductService>,
     refreshes: usize,
+    /// How many times Settings asked to install `gh signoff`.
+    installs: usize,
     /// Read the state again on refresh, as the app does. Off, the state
     /// stays as it was: a refresh that has not finished yet.
     follow: bool,
@@ -83,13 +85,15 @@ fn settings_harness(service: Arc<ProductService>, state: ProductState) -> Harnes
     let mut settings = Settings::new(service.clone(), || {});
     // Never scan the machine running the tests.
     settings.find_checkouts_in(None);
-    let under_test = SettingsUnderTest { settings, state, service, refreshes: 0, follow: true };
+    let under_test = SettingsUnderTest { settings, state, service, refreshes: 0, installs: 0, follow: true };
     Harness::builder().with_size(egui::vec2(820.0, 900.0)).build_ui_state(
         |ui, t: &mut SettingsUnderTest| {
             if !installed(ui.ctx()) {
                 return;
             }
-            if settings::contents(ui, &mut t.settings, &t.state).refresh {
+            let effects = settings::contents(ui, &mut t.settings, &t.state);
+            t.installs += usize::from(effects.install);
+            if effects.refresh {
                 t.refreshes += 1;
                 // What the app does on refresh: read the state again.
                 if t.follow {
@@ -394,7 +398,8 @@ fn demo_app() -> Signoff {
     let refresher = worker::Refresher::spawn(service.clone(), || {});
     let runs = crate::runs::Runs::new(Arc::new(signoff_core::Verifier::demo(service.clone())), || {});
     let checkouts = crate::checkouts::Checkouts::new(Gh::default(), true, || {});
-    let mut app = Signoff::new(None, refresher, runs, checkouts, settings, true);
+    let installer = crate::installer::Installer::new(Gh::default(), true, || {});
+    let mut app = Signoff::new(None, refresher, runs, checkouts, installer, settings, true);
     app.state = service.refresh();
     app
 }
@@ -818,4 +823,111 @@ fn the_demo_simulates_a_checkout_and_then_offers_to_run() {
     harness.run_ok();
     harness.get_by_label("Check out #485").click();
     step_until(&mut harness, "the simulated checkout", |h| h.query_by_label_contains("Run & sign off").is_some());
+}
+
+#[test]
+fn the_notifications_switch_is_on_by_default_and_saved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.run_ok();
+    assert!(harness.state().settings.notifications_on());
+
+    harness.get_by_label("Notifications").click();
+    harness.run_ok();
+    assert!(!service.config().expect("config").snapshot().notifications);
+    assert!(!harness.state().settings.notifications_on());
+
+    harness.get_by_label("Notifications").click();
+    harness.run_ok();
+    assert!(service.config().expect("config").snapshot().notifications);
+}
+
+/// A state where `gh` is ready and only the extension is missing.
+fn without_extension(mut state: ProductState) -> ProductState {
+    state.env.gh_installed = true;
+    state.env.authenticated = true;
+    state.env.login = "me".into();
+    state.env.signoff_installed = false;
+    state
+}
+
+#[test]
+fn a_missing_extension_offers_to_install_it_from_the_popover() {
+    let script = Arc::new(Script::default().reply("extension install", ""));
+    let mut app = demo_app();
+    app.demo = false;
+    app.installer = crate::installer::Installer::new(Gh::new(script.clone()), false, || {});
+    let mut harness = Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+        |ui, app: &mut Signoff| {
+            if installed(ui.ctx()) {
+                app.tick(Some(ui.ctx()));
+                popover::show(ui, app);
+            }
+        },
+        app,
+    );
+    harness.run_ok();
+    // The first frame took in the refresher's state; now it lacks the extension.
+    let state = without_extension(harness.state().state.clone());
+    harness.state_mut().state = state;
+    harness.run_ok();
+    harness.get_by_label_contains("gh signoff is not installed");
+    harness.get_by_label("Install gh signoff").click();
+    step_until(&mut harness, "gh extension install to run", |_| {
+        script.calls().iter().any(|(line, _)| line == "gh extension install basecamp/gh-signoff")
+    });
+    step_until(&mut harness, "the install to finish", |h| !h.state().installer.running());
+}
+
+#[test]
+fn a_failed_install_says_why_and_offers_to_try_again() {
+    let script = Arc::new(Script::default());
+    let mut app = demo_app();
+    app.demo = false;
+    app.installer = crate::installer::Installer::new(Gh::new(script), false, || {});
+    let mut harness = Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+        |ui, app: &mut Signoff| {
+            if installed(ui.ctx()) {
+                app.tick(Some(ui.ctx()));
+                popover::show(ui, app);
+            }
+        },
+        app,
+    );
+    harness.run_ok();
+    let state = without_extension(harness.state().state.clone());
+    harness.state_mut().state = state;
+    harness.run_ok();
+    harness.get_by_label("Install gh signoff").click();
+    step_until(&mut harness, "the failure", |h| h.query_by_label_contains("could not install gh signoff").is_some());
+    harness.get_by_label("Install gh signoff");
+}
+
+#[test]
+fn an_installed_extension_offers_nothing() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    assert!(harness.query_by_label("Install gh signoff").is_none());
+}
+
+#[test]
+fn settings_offers_install_only_when_the_extension_is_missing() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let missing = without_extension(service.cached_or_config_state());
+    let mut harness = settings_harness(service.clone(), missing);
+    harness.run_ok();
+    harness.get_by_label("Install").click();
+    harness.run_ok();
+    assert_eq!(harness.state().installs, 1);
+
+    let mut ready = service.cached_or_config_state();
+    ready.env.gh_installed = true;
+    ready.env.authenticated = true;
+    ready.env.signoff_installed = true;
+    let mut harness = settings_harness(service, ready);
+    harness.run_ok();
+    assert!(harness.query_by_label("Install").is_none());
 }

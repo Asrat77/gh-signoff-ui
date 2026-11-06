@@ -487,7 +487,22 @@ impl Gh {
             .map(drop)
             .map_err(|err| format!("could not check out #{number}: {}", detail(&err, "gh pr checkout failed")))
     }
+
+    /// Installs the `gh signoff` extension.
+    ///
+    /// # Errors
+    ///
+    /// A message for the user: `gh` could not install it.
+    pub fn install_signoff_extension(&self) -> Result<(), String> {
+        self.exec(None, "gh", &["extension", "install", SIGNOFF_EXTENSION]).map(drop).map_err(|err| {
+            let reason = err.message().filter(|message| !message.is_empty()).unwrap_or("gh extension install failed");
+            format!("could not install gh signoff: {reason}")
+        })
+    }
 }
+
+/// The repository `gh extension install` takes for `gh signoff`.
+pub const SIGNOFF_EXTENSION: &str = "basecamp/gh-signoff";
 
 /// The first eight characters of a commit id.
 pub fn short_sha(sha: &str) -> &str {
@@ -903,5 +918,19 @@ mod tests {
         ]));
         let err = gh(&fake).check_out_pull_request(Path::new("/repo"), 1).expect_err("gh");
         assert!(err.contains("could not check out #1") && err.contains("would be overwritten"), "{err}");
+    }
+
+    #[test]
+    fn installing_the_extension_runs_gh_extension_install() {
+        let fake = Arc::new(FakeRunner::new(vec![ok("extension install", "")]));
+        assert_eq!(gh(&fake).install_signoff_extension(), Ok(()));
+        assert_eq!(fake.commands(), ["gh extension install basecamp/gh-signoff"]);
+    }
+
+    #[test]
+    fn a_failed_install_carries_ghs_message() {
+        let fake = Arc::new(FakeRunner::new(vec![fail("extension install", "could not resolve host")]));
+        let err = gh(&fake).install_signoff_extension().expect_err("install");
+        assert!(err.contains("could not install gh signoff") && err.contains("could not resolve host"), "{err}");
     }
 }

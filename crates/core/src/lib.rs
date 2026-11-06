@@ -22,6 +22,8 @@
 //! - [`discover`] finds the GitHub checkouts already on this computer.
 //! - [`suggest`] proposes local commands for a check from the checkout's
 //!   `Makefile`, `package.json` and the like.
+//! - [`notify`] decides which changes between two states earn a desktop
+//!   notification.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
 pub mod api;
@@ -32,6 +34,7 @@ pub mod discover;
 pub mod gh;
 mod git;
 pub mod history;
+pub mod notify;
 pub mod product;
 pub mod rules;
 pub mod runner;
@@ -43,6 +46,7 @@ pub use checks::{Check, CheckState, Rules, Tally};
 pub use config::{AppConfig, CommandMapping, ConfigError, ConfigStore, RepositoryUpdate, TrackedRepository};
 pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo};
 pub use history::{ActivityEvent, ActivityKind, HistoryStore};
+pub use notify::{Change, Transition, transitions};
 pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequestState, RepositoryState};
 pub use rules::{RulesError, Write as RulesWrite};
 pub use runner::{CANCELLED, Output, Runner, SystemRunner, TIMED_OUT};

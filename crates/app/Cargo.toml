@@ -32,6 +32,9 @@ directories = "6"
 # The folder picker for adding a checkout.
 rfd = "0.15"
 open = "5"
+# Desktop notifications. The default features pick zbus on Linux (no libdbus),
+# the system notification centre on macOS and toast notifications on Windows.
+notify-rust = "4.18"
 
 [dev-dependencies]
 # Drives the real widgets through their accessibility tree, without a window.

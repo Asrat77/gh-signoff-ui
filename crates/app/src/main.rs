@@ -10,6 +10,8 @@ mod app;
 mod autostart;
 mod checkouts;
 mod glance;
+mod installer;
+mod notifier;
 mod paths;
 mod popover;
 mod runs;
@@ -107,7 +109,11 @@ fn main() -> ExitCode {
     };
     let checkouts = {
         let wake = waker.clone();
-        checkouts::Checkouts::new(gh, args.demo, move || wake.wake())
+        checkouts::Checkouts::new(gh.clone(), args.demo, move || wake.wake())
+    };
+    let installer = {
+        let wake = waker.clone();
+        installer::Installer::new(gh, args.demo, move || wake.wake())
     };
     let tray = {
         let wake = waker.clone();
@@ -117,7 +123,7 @@ fn main() -> ExitCode {
         log::warn!("no tray is available; closing the window will quit");
     }
 
-    let app = app::Signoff::new(tray, refresher, runs, checkouts, settings, args.demo);
+    let app = app::Signoff::new(tray, refresher, runs, checkouts, installer, settings, args.demo);
     let result = Shell::new(app, &waker).idle(fastframe_tray::idle).start_hidden(args.hidden).run(|lease| {
         let options = lease.peek(|app| app::native_options(app.is_popover(), app.anchor()));
         eframe::run_native("Signoff", options, Box::new(move |cc| Ok(app::window(cc, lease))))

@@ -11,6 +11,8 @@ use std::thread;
 
 use signoff_core::{Outcome, Phase, Verifier, VerifyEvent, VerifyRequest};
 
+use crate::notifier::RunFinished;
+
 /// Lines kept per run; older ones scroll away.
 const MAX_LINES: usize = 4000;
 
@@ -52,12 +54,20 @@ pub(crate) struct Runs {
     /// Repositories a run signed off on since the app last looked, so it
     /// reads them again.
     signed_off: Arc<Mutex<Vec<String>>>,
+    /// Runs that ended since the app last looked, for notifications.
+    finished: Arc<Mutex<Vec<RunFinished>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Runs {
     pub(crate) fn new(verifier: Arc<Verifier>, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        Self { verifier, slots: Arc::default(), signed_off: Arc::default(), wake: Arc::new(wake) }
+        Self {
+            verifier,
+            slots: Arc::default(),
+            signed_off: Arc::default(),
+            finished: Arc::default(),
+            wake: Arc::new(wake),
+        }
     }
 
     /// Starts verifying `request` unless it is already running.
@@ -83,6 +93,7 @@ impl Runs {
         let verifier = self.verifier.clone();
         let slots = self.slots.clone();
         let signed_off = self.signed_off.clone();
+        let finished = self.finished.clone();
         let wake = self.wake.clone();
         let spawned = thread::Builder::new().name("signoff-verify".into()).spawn(move || {
             let update = |change: &mut dyn FnMut(&mut RunView)| {
@@ -101,6 +112,10 @@ impl Runs {
                 signed_off.lock().unwrap_or_else(PoisonError::into_inner).push(request.repo_id.clone());
             }
             let result = result.map_err(|err| err.to_string());
+            finished
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(RunFinished { request: request.clone(), result: result.clone() });
             update(&mut |view| view.result = Some(result.clone()));
         });
         if let Err(err) = spawned {
@@ -136,6 +151,11 @@ impl Runs {
         repos.sort();
         repos.dedup();
         repos
+    }
+
+    /// The runs that ended since the last call.
+    pub(crate) fn take_finished(&self) -> Vec<RunFinished> {
+        std::mem::take(&mut *self.finished.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// Stops every run, for quitting.

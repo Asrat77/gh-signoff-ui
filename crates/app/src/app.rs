@@ -16,6 +16,8 @@ use signoff_ui::widgets::toast;
 
 use crate::anchor::{self, Corner, POPOVER};
 use crate::checkouts::Checkouts;
+use crate::installer::Installer;
+use crate::notifier;
 use crate::popover::{self, Glance};
 use crate::runs::Runs;
 use crate::settings::{self, Settings};
@@ -30,6 +32,8 @@ pub(crate) struct Signoff {
     pub(crate) runs: Runs,
     /// "Check out this pull request" jobs.
     pub(crate) checkouts: Checkouts,
+    /// The `gh signoff` install job.
+    pub(crate) installer: Installer,
     /// The latest state copied from the refresher.
     pub(crate) state: ProductState,
     seen: u64,
@@ -81,6 +85,7 @@ impl Signoff {
         refresher: Refresher,
         runs: Runs,
         checkouts: Checkouts,
+        installer: Installer,
         settings: Settings,
         demo: bool,
     ) -> Self {
@@ -89,6 +94,7 @@ impl Signoff {
             refresher,
             runs,
             checkouts,
+            installer,
             state: ProductState::default(),
             seen: 0,
             shown_health: None,
@@ -195,10 +201,31 @@ impl Signoff {
         }
 
         // Settings jobs started from the popover finish with Settings closed.
-        if let Some(ctx) = ctx
-            && self.settings.pump(ctx).refresh
-        {
-            self.refresh();
+        self.settings.installing = self.installer.running();
+        if let Some(ctx) = ctx {
+            let effects = self.settings.pump(ctx);
+            if effects.install {
+                self.installer.start();
+            }
+            if effects.refresh {
+                self.refresh();
+            }
+        }
+        // The extension was installed (or not): say so, and probe `gh` again.
+        for result in self.installer.take_finished() {
+            match result {
+                Ok(()) => {
+                    self.recheck();
+                    if let Some(ctx) = ctx {
+                        toast(ctx, "Installed gh signoff", Status::Ready);
+                    }
+                }
+                Err(message) => {
+                    if let Some(ctx) = ctx {
+                        toast(ctx, message, Status::Failing);
+                    }
+                }
+            }
         }
 
         // A signoff is already shown; read its repository to confirm it.
@@ -221,8 +248,17 @@ impl Signoff {
                 }
             }
         }
+        let runs = self.runs.take_finished();
+        let mut transitions = Vec::new();
         if let Some(state) = self.refresher.changed_since(&mut self.seen) {
+            transitions = signoff_core::transitions(Some(&self.state), &state, &state.env.login);
             self.state = state;
+        }
+        if !self.demo && (!transitions.is_empty() || !runs.is_empty()) {
+            // A window that is open and in front already shows the change.
+            let hidden = ctx.is_none_or(|ctx| !ctx.input(|i| i.viewport().focused.unwrap_or(true)));
+            let enabled = self.settings.notifications_on();
+            notifier::deliver(notifier::notices(enabled, hidden, &transitions, &runs, &self.state));
         }
         let health = self.state.summary.status;
         if self.shown_health != Some(health)

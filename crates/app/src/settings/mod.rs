@@ -81,6 +81,8 @@ pub(crate) struct Settings {
     /// A repository and check Commands should show on its next frame.
     configure: Option<(String, String)>,
     rules: Option<rules::Form>,
+    /// The `gh signoff` install is running; the app sets this each frame.
+    pub(crate) installing: bool,
 }
 
 /// What the settings asked the app for this frame.
@@ -88,6 +90,8 @@ pub(crate) struct Settings {
 pub(crate) struct Effects {
     /// The config changed: read GitHub again.
     pub(crate) refresh: bool,
+    /// Install the `gh signoff` extension.
+    pub(crate) install: bool,
 }
 
 impl Settings {
@@ -106,6 +110,7 @@ impl Settings {
             commands: None,
             configure: None,
             rules: None,
+            installing: false,
         }
     }
 
@@ -175,6 +180,11 @@ impl Settings {
         self.service.flush();
     }
 
+    /// Whether desktop notifications are on. They are until switched off.
+    pub(crate) fn notifications_on(&self) -> bool {
+        self.service.config().is_none_or(|config| config.snapshot().notifications)
+    }
+
     /// Whether edits are refused: demo data has no config to change.
     pub(crate) fn read_only(&self) -> bool {
         self.service.is_demo()
@@ -199,6 +209,9 @@ pub(crate) fn window(ctx: &egui::Context, app: &mut Signoff) {
     });
     if effects.refresh {
         app.refresh();
+    }
+    if effects.install {
+        app.installer.start();
     }
 }
 
