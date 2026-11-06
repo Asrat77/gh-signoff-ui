@@ -15,4 +15,5 @@
 pub mod checks;
 pub mod config;
 pub mod gh;
+pub mod history;
 pub mod runner;
