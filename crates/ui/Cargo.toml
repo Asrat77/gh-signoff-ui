@@ -1,0 +1,21 @@
+[package]
+name = "signoff-ui"
+description = "Signoff's design system for egui: palette, type, icons, motion and widgets"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+egui.workspace = true
+fastframe-fonts.workspace = true
+egui-phosphor.workspace = true
+fastframe-theme.workspace = true
+
+[dev-dependencies]
+eframe.workspace = true
+
+[lints]
+workspace = true

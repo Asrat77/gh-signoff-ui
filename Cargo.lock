@@ -705,6 +705,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "egui-phosphor"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f4299551488dddaa8f757727e1eb4ffdaf277ffe6e30b413403468f5ecf4634"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "egui-wgpu"
 version = "0.36.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -919,6 +928,19 @@ version = "0.16.1"
 source = "git+https://github.com/crmne/fastframe?tag=v0.16.1#ebc7cecb7cfb229e3d6849abd17bff953506fdb8"
 dependencies = [
  "log",
+ "windows-sys 0.60.2",
+]
+
+[[package]]
+name = "fastframe-fonts"
+version = "0.16.1"
+source = "git+https://github.com/crmne/fastframe?tag=v0.16.1#ebc7cecb7cfb229e3d6849abd17bff953506fdb8"
+dependencies = [
+ "directories",
+ "egui",
+ "log",
+ "memmap2",
+ "skrifa",
  "windows-sys 0.60.2",
 ]
 
@@ -2686,6 +2708,17 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "signoff-ui"
+version = "0.3.0"
+dependencies = [
+ "eframe",
+ "egui",
+ "egui-phosphor",
+ "fastframe-fonts",
+ "fastframe-theme",
 ]
 
 [[package]]

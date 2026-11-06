@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/app"]
+members = ["crates/core", "crates/app", "crates/ui"]
 
 [workspace.package]
 version = "0.3.0"
@@ -17,10 +17,13 @@ signoff-core = { path = "crates/core" }
 egui = { version = "0.36.2", default-features = false }
 eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 fastframe-dirs = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+fastframe-fonts = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
 fastframe-file = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
 fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
 fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
 fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+# Icons, as a font, for the design system. 0.14 is built for egui 0.36.
+egui-phosphor = { version = "0.14", default-features = false, features = ["regular", "fill"] }
 
 jiff = { version = "0.2", features = ["serde"] }
 log = "0.4"
