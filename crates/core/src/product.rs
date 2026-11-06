@@ -1207,6 +1207,22 @@ mod tests {
         assert_eq!(probes(&fake), 2);
     }
 
+    /// One head whose statuses cannot be read must not hide the others.
+    #[test]
+    fn one_unreadable_head_warns_instead_of_failing_the_repository() {
+        let (f, _, transport) = api_fixture(api_gh(true));
+        transport
+            .answer("/pulls?", json(200, None, r#"[{"number":1,"head":{"sha":"aaa"},"base":{"ref":"main"}},{"number":2,"head":{"sha":"gone"},"base":{"ref":"main"}}]"#))
+            .answer("/protection", json(200, None, r#"{"required_status_checks":{"contexts":["signoff/tests"]}}"#))
+            .answer("/commits/aaa/", json(200, None, r#"{"statuses":[{"context":"signoff/tests","state":"success"}]}"#))
+            .answer("/commits/gone/", json(422, None, r#"{"message":"No commit found for SHA: gone"}"#));
+        let state = f.service.refresh();
+        assert_eq!(state.repositories[0].error, None);
+        let gone = f.service.find_pull_request("r1", 2).expect("still listed");
+        assert!(gone.warning.as_deref().is_some_and(|w| w.contains("No commit found")));
+        assert_eq!(f.service.find_pull_request("r1", 1).expect("pr").status, Health::Ready);
+    }
+
     fn rate_limited() -> crate::api::HttpResponse {
         let reset = Timestamp::now().as_second() + 600;
         crate::api::HttpResponse {
