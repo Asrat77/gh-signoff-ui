@@ -14,6 +14,8 @@ mod popover;
 mod runs;
 mod settings;
 mod tray;
+#[cfg(test)]
+mod ui_tests;
 mod worker;
 
 use std::path::PathBuf;

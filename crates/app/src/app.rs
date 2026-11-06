@@ -112,7 +112,7 @@ impl Signoff {
     }
 
     /// Handles tray clicks and new state. `ctx` is the window's, if open.
-    fn tick(&mut self, ctx: Option<&egui::Context>) {
+    pub(crate) fn tick(&mut self, ctx: Option<&egui::Context>) {
         let events = self.tray.as_ref().map(Tray::events).unwrap_or_default();
         for event in events {
             match event {

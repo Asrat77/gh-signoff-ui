@@ -32,5 +32,10 @@ directories = "6"
 # The folder picker for adding a checkout.
 rfd = "0.15"
 
+[dev-dependencies]
+# Drives the real widgets through their accessibility tree, without a window.
+egui_kittest = "0.36"
+tempfile.workspace = true
+
 [lints]
 workspace = true
