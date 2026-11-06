@@ -227,7 +227,10 @@ fn adding_a_checkout_tracks_it() {
 
     type_into(&mut harness, 0, &checkout.display().to_string());
     harness.get_by_label("Add").click();
-    step_until(&mut harness, "the checkout to be added", |h| h.state().refreshes > 0);
+    step_until(&mut harness, "the checkout to be added", |h| {
+        h.query_by_label("Add a local checkout").is_some()
+            && h.state().service.config().is_some_and(|c| !c.snapshot().repositories.is_empty())
+    });
 
     let repos = service.config().expect("config").snapshot().repositories;
     assert_eq!(repos.len(), 1);

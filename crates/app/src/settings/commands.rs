@@ -78,7 +78,7 @@ fn suggestions(state: &ProductState, repo_id: &str, rows: &[Row]) -> Vec<String>
         .collect()
 }
 
-pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, effects: &mut Effects) {
+pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _: &mut Effects) {
     parts::heading(
         ui,
         "Commands",
@@ -148,8 +148,9 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
     if let Some(commands) = to_save {
         repositories::update_repository(ui, settings, &repo.id, |update| update.commands = commands);
         settings.commands = None;
+        // Applied to the shown checks by the config subscription; GitHub
+        // has nothing new to say.
         toast(ui.ctx(), "Commands saved", Status::Ready);
-        effects.refresh = true;
     }
 }
 

@@ -23,7 +23,7 @@ pub(crate) struct Form {
     confirm_remove: Option<String>,
 }
 
-pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, effects: &mut Effects) {
+pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _: &mut Effects) {
     parts::heading(
         ui,
         "Repositories",
@@ -34,7 +34,7 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
         parts::notice(ui, Status::Neutral, "No repository yet. Add a local checkout to start.");
     }
     for repo in &rows {
-        row(ui, settings, repo, effects);
+        row(ui, settings, repo);
     }
     ui.add_space(space::S);
     add(ui, settings);
@@ -52,7 +52,7 @@ struct Row {
     pull_requests: usize,
     /// Of those, the failing ones.
     failing: usize,
-    /// A refresh has read it since it was added.
+    /// It has been read since it was added or resumed.
     read: bool,
     /// Why the last refresh could not read it.
     error: Option<String>,
@@ -135,14 +135,14 @@ fn merge_rows(tracked: &[TrackedRepository], state: &ProductState) -> Vec<Row> {
                 enabled: repo.enabled,
                 pull_requests: read.map_or(0, |r| r.pull_request_count),
                 failing: failing(state, &repo.id),
-                read: read.is_some(),
+                read: read.is_some_and(|r| !r.loading),
                 error: read.and_then(|r| r.error.clone()),
             }
         })
         .collect()
 }
 
-fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row, effects: &mut Effects) {
+fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row) {
     let read_only = settings.read_only();
     parts::card(ui, |ui| {
         let p = palette(ui.ctx());
@@ -189,7 +189,7 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row, effects: &mut Effects) 
                 if settings.repositories.confirm_remove.as_deref() == Some(repo.id.as_str()) {
                     if ui.add(Button::new("Remove").kind(ButtonKind::Accent).compact().width(84.0)).clicked() {
                         settings.repositories.confirm_remove = None;
-                        remove(ui, settings, repo, effects);
+                        remove(ui, settings, repo);
                     }
                     if ui.add(Button::new("Keep").kind(ButtonKind::Secondary).compact().width(72.0)).clicked() {
                         settings.repositories.confirm_remove = None;
@@ -204,8 +204,8 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row, effects: &mut Effects) 
             });
         });
         if watching != repo.enabled {
+            // The config subscription patches the state and reads it again.
             update_repository(ui, settings, &repo.id, |update| update.enabled = watching);
-            effects.refresh = true;
         }
     });
 }
@@ -233,12 +233,11 @@ pub(super) fn update_repository(ui: &Ui, settings: &Settings, id: &str, change: 
     }
 }
 
-fn remove(ui: &Ui, settings: &Settings, repo: &Row, effects: &mut Effects) {
+fn remove(ui: &Ui, settings: &Settings, repo: &Row) {
     let Some(config) = settings.service.config() else { return };
     match config.remove_repository(&repo.id) {
         Ok(()) => {
             toast(ui.ctx(), format!("Stopped tracking {}", repo.name_with_owner), Status::Neutral);
-            effects.refresh = true;
         }
         Err(err) => toast(ui.ctx(), err.to_string(), Status::Failing),
     }
@@ -305,13 +304,12 @@ fn start_adding(settings: &mut Settings, path: PathBuf) {
     settings.repositories.adding = Some(path.clone());
     settings.jobs.start(move |service| {
         let result = service.add_repository(&path);
-        Box::new(move |settings: &mut Settings, ctx: &egui::Context, effects: &mut Effects| {
+        Box::new(move |settings: &mut Settings, ctx: &egui::Context, _: &mut Effects| {
             settings.repositories.adding = None;
             match result {
                 Ok(repo) => {
                     settings.repositories.path.clear();
                     toast(ctx, format!("Tracking {}", repo.name_with_owner), Status::Ready);
-                    effects.refresh = true;
                 }
                 Err(message) => toast(ctx, message, Status::Failing),
             }
@@ -346,11 +344,13 @@ mod tests {
                 },
                 // Removed since: must not appear.
                 RepositoryState { id: "gone".into(), ..RepositoryState::default() },
+                // Resumed and not read again yet.
+                RepositoryState { id: "c".into(), enabled: true, loading: true, ..RepositoryState::default() },
             ],
             ..ProductState::default()
         };
-        let rows = merge_rows(&[tracked("a", false), tracked("b", true)], &state);
-        assert_eq!(rows.len(), 2);
+        let rows = merge_rows(&[tracked("a", false), tracked("b", true), tracked("c", true)], &state);
+        assert_eq!(rows.len(), 3);
         assert!(!rows[0].enabled);
         assert!(rows[0].read);
         assert_eq!(rows[0].error.as_deref(), Some("gh failed"));
@@ -358,6 +358,7 @@ mod tests {
         assert_eq!(rows[1].id, "b");
         assert!(!rows[1].read);
         assert!(rows[1].error.is_none());
+        assert!(!rows[2].read, "a loading placeholder is not a read");
     }
 
     fn row_of(enabled: bool, read: bool, prs: usize, failing: usize, error: Option<&str>) -> Row {

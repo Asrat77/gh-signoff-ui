@@ -231,7 +231,12 @@ impl Verifier {
 
                 let timeout = command_timeout(mapping.timeout_seconds);
                 let live = Live { runner: runner.as_ref(), gh, history, dir: &repo.path, repo_id: &repo.id };
-                Ok(live.run_and_sign_off(&mut ctx, mapping.command.trim(), timeout, &head, cancel))
+                let outcome = live.run_and_sign_off(&mut ctx, mapping.command.trim(), timeout, &head, cancel);
+                if outcome.signed_off() {
+                    // Shown at once; the next read of the repository confirms it.
+                    self.product.mark_signed_off(&repo.id, request.pr_number, check, &head);
+                }
+                Ok(outcome)
             }
         }
     }
@@ -467,6 +472,7 @@ mod tests {
 
     struct Fixture {
         verifier: Verifier,
+        product: Arc<ProductService>,
         fake: Arc<FakeRunner>,
         history: Arc<HistoryStore>,
         _dir: tempfile::TempDir,
@@ -516,8 +522,8 @@ mod tests {
             ..ProductState::default()
         }));
         let fake = Arc::new(FakeRunner::new(replies));
-        let verifier = Verifier::new(product, fake.clone(), config, history.clone());
-        Fixture { verifier, fake, history, _dir: dir }
+        let verifier = Verifier::new(product.clone(), fake.clone(), config, history.clone());
+        Fixture { verifier, product, fake, history, _dir: dir }
     }
 
     fn request(check: &str) -> VerifyRequest {
@@ -562,6 +568,10 @@ mod tests {
         let kinds: Vec<ActivityKind> = f.history.snapshot(0).iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&ActivityKind::Run) && kinds.contains(&ActivityKind::Signoff));
         assert!(f.history.snapshot(0).iter().all(|e| e.state == CheckState::Success && e.check == "tests"));
+
+        let pr = f.product.find_pull_request("r1", 7).expect("pr");
+        let tests = pr.checks.iter().find(|c| c.name == "tests").expect("check");
+        assert_eq!(tests.state, CheckState::Success, "shown before GitHub is read again");
     }
 
     #[test]
@@ -591,6 +601,8 @@ mod tests {
             (history[0].kind, history[0].state, history[0].exit_code),
             (ActivityKind::Run, CheckState::Failure, 2)
         );
+        let pr = f.product.find_pull_request("r1", 7).expect("pr");
+        assert!(pr.checks.iter().all(|c| c.state != CheckState::Success), "nothing shown as signed off");
         assert_eq!(history[0].command, "make test");
     }
 

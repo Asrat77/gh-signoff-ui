@@ -37,7 +37,7 @@ pub(super) fn refresh_button(ui: &mut Ui, app: &Signoff) {
         ui.painter().circle_filled(rect.center(), size::ICON_BUTTON / 2.0, egui::Color32::from_black_alpha(46));
         spinner(ui, rect.center(), 7.0, palette(ui.ctx()).on_accent);
     } else if ui.add(IconButton::new(icons::REFRESH, "Refresh")).clicked() {
-        app.refresh();
+        app.recheck();
     }
 }
 
