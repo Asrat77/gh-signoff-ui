@@ -6,7 +6,9 @@
 //! waits on `gh`.
 
 mod app;
+mod glance;
 mod paths;
+mod popover;
 mod tray;
 mod views;
 mod worker;

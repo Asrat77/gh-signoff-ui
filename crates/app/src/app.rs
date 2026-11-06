@@ -8,6 +8,7 @@ use fastframe_shell::{Closed, Headless, Held, Lease, Resident};
 use fastframe_tray::{Event, Tray};
 use signoff_core::{Health, ProductState};
 
+use crate::popover::{self, Glance};
 use crate::worker::Refresher;
 use crate::{tray, views};
 
@@ -21,6 +22,8 @@ pub(crate) struct Signoff {
     /// The health the tray icon shows.
     shown_health: Option<Health>,
     pub(crate) demo: bool,
+    /// What the popover shows.
+    pub(crate) glance: Glance,
     /// The settings window is open.
     pub(crate) settings_open: bool,
     closing: Closed,
@@ -37,6 +40,7 @@ impl Signoff {
             seen: 0,
             shown_health: None,
             demo,
+            glance: Glance::default(),
             settings_open: false,
             closing: Closed::Hide,
             show: false,
@@ -180,7 +184,7 @@ impl eframe::App for Window {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        views::popover(ui, &mut self.0);
+        popover::show(ui, &mut self.0);
         if self.0.settings_open {
             views::settings_window(ui.ctx(), &mut self.0);
         }
