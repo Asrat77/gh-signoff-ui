@@ -200,6 +200,7 @@ fn run_log(ui: &mut Ui, check: &Check, run: &RunView) {
     let (phase, status) = match &run.result {
         None => (
             match run.phase {
+                Phase::Prepare => "preparing worktree",
                 Phase::Checkout => "checking commit",
                 Phase::Run => "streaming",
                 Phase::Signoff => "signing off",

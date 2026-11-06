@@ -26,6 +26,8 @@
 //!   `Makefile`, `package.json` and the like.
 //! - [`notify`] decides which changes between two states earn a desktop
 //!   notification.
+//! - [`worktree`] keeps the worktrees Signoff verifies pull requests in
+//!   when the person's own checkout is elsewhere, and cleans them up.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
 pub mod api;
@@ -43,6 +45,7 @@ pub mod runner;
 mod store;
 pub mod suggest;
 pub mod verify;
+pub mod worktree;
 
 pub use checks::{Check, CheckState, Rules, Tally};
 pub use config::{AppConfig, CommandMapping, ConfigError, ConfigStore, RepositoryUpdate, TrackedRepository};
@@ -55,3 +58,4 @@ pub use rules::{RulesError, Write as RulesWrite};
 pub use runner::{CANCELLED, Output, Runner, SystemRunner, TIMED_OUT};
 pub use suggest::CommandSuggestion;
 pub use verify::{Outcome, Phase, Verifier, VerifyError, VerifyEvent, VerifyRequest};
+pub use worktree::Worktrees;

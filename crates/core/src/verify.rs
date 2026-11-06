@@ -4,7 +4,10 @@
 //! The order is the whole point:
 //!
 //! 1. Refuse unless the local checkout is at the pull request's head, so a
-//!    command never vouches for a commit it did not run on.
+//!    command never vouches for a commit it did not run on. With the
+//!    separate-worktree setting on, a checkout elsewhere is left alone and
+//!    the run happens in Signoff's own worktree, prepared at the head
+//!    ([`crate::worktree`]).
 //! 2. Run the user's mapped command in their login shell, streaming its
 //!    output, stopped by its timeout or by the user.
 //! 3. Only on exit code 0, check again that neither the checkout nor the
@@ -29,6 +32,7 @@ use crate::gh::{Gh, short_sha};
 use crate::history::{ActivityEvent, ActivityKind, HistoryStore};
 use crate::product::ProductService;
 use crate::runner::Runner;
+use crate::worktree::{Lease, Worktrees};
 
 /// How long `gh signoff` may take.
 pub const SIGNOFF_TIMEOUT: Duration = Duration::from_secs(120);
@@ -55,6 +59,9 @@ impl VerifyRequest {
 /// The step a run is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
+    /// Preparing Signoff's worktree at the pull request's head, when the
+    /// checkout is elsewhere and the separate-worktree setting is on.
+    Prepare,
     /// Confirming the checkout and pull request are at the expected commit.
     Checkout,
     /// Running the mapped command.
@@ -118,6 +125,9 @@ pub enum VerifyError {
     /// The checkout is not at the pull request's head.
     #[error("{0}")]
     WrongCommit(String),
+    /// Another run is using this repository's worktree.
+    #[error("another run is using this repository's worktree; run this once it finishes")]
+    WorktreeBusy,
 }
 
 /// Runs checks and writes signoffs.
@@ -128,6 +138,8 @@ pub struct Verifier {
     product: Arc<ProductService>,
     source: Source,
     running: Mutex<HashSet<String>>,
+    /// Where runs go when the checkout is elsewhere and the setting is on.
+    worktrees: Option<Worktrees>,
 }
 
 enum Source {
@@ -181,7 +193,15 @@ impl Verifier {
     }
 
     fn from_source(product: Arc<ProductService>, source: Source) -> Self {
-        Self { product, source, running: Mutex::new(HashSet::new()) }
+        Self { product, source, running: Mutex::new(HashSet::new()), worktrees: None }
+    }
+
+    /// Runs in a worktree from `worktrees` when the checkout is not at the
+    /// pull request's head and the config's separate-worktree setting is on.
+    #[must_use]
+    pub fn with_worktrees(mut self, worktrees: Worktrees) -> Self {
+        self.worktrees = Some(worktrees);
+        self
     }
 
     /// Whether `request` is running now.
@@ -227,11 +247,48 @@ impl Verifier {
                     .get(check)
                     .filter(|m| !m.command.trim().is_empty())
                     .ok_or_else(|| VerifyError::NotConfigured(check.into()))?;
-                gh.require_checked_out_commit(&repo.path, &head).map_err(VerifyError::WrongCommit)?;
+                let lease = match gh.require_checked_out_commit(&repo.path, &head) {
+                    Ok(()) => None,
+                    Err(message) => match &self.worktrees {
+                        Some(worktrees) if config.snapshot().isolated_worktrees => {
+                            Some(worktrees.claim(&repo.id).ok_or(VerifyError::WorktreeBusy)?)
+                        }
+                        _ => return Err(VerifyError::WrongCommit(message)),
+                    },
+                };
 
                 let timeout = command_timeout(mapping.timeout_seconds);
-                let live = Live { runner: runner.as_ref(), gh, history, dir: &repo.path, repo_id: &repo.id };
-                let outcome = live.run_and_sign_off(&mut ctx, mapping.command.trim(), timeout, &head, cancel);
+                let outcome = match &lease {
+                    None => {
+                        let live = Live {
+                            runner: runner.as_ref(),
+                            gh,
+                            history,
+                            dir: &repo.path,
+                            repo_id: &repo.id,
+                            isolated: false,
+                        };
+                        live.run_and_sign_off(&mut ctx, mapping.command.trim(), timeout, &head, cancel)
+                    }
+                    Some(lease) => {
+                        let prepared = prepare(lease, runner.as_ref(), &repo, &mut ctx, &head, cancel);
+                        match prepared {
+                            Ok(dir) => {
+                                let live = Live {
+                                    runner: runner.as_ref(),
+                                    gh,
+                                    history,
+                                    dir: &dir,
+                                    repo_id: &repo.id,
+                                    isolated: true,
+                                };
+                                live.run_and_sign_off(&mut ctx, mapping.command.trim(), timeout, &head, cancel)
+                            }
+                            Err(outcome) => outcome,
+                        }
+                    }
+                };
+                drop(lease);
                 if outcome.signed_off() {
                     // Shown at once; the next read of the repository confirms it.
                     self.product.mark_signed_off(&repo.id, request.pr_number, check, &head);
@@ -261,6 +318,28 @@ impl Verifier {
         ctx.line(format!("signed off {} on {}", ctx.check, short_sha(head)));
         self.product.mark_demo_passed(&ctx.request.repo_id, ctx.request.pr_number, ctx.check);
         Outcome { phase: Phase::Signoff, code: 0, message: None }
+    }
+}
+
+/// Prepares `repo`'s worktree at `head` for the run in `ctx`, reporting it
+/// as [`Phase::Prepare`]; a failure is the run's outcome.
+fn prepare(
+    lease: &Lease,
+    runner: &dyn Runner,
+    repo: &crate::config::TrackedRepository,
+    ctx: &mut Run<'_>,
+    head: &str,
+    cancel: &AtomicBool,
+) -> Result<std::path::PathBuf, Outcome> {
+    ctx.emit(VerifyEvent::Phase(Phase::Prepare));
+    ctx.line(format!("preparing Signoff's worktree at {}; your checkout is not touched", short_sha(head)));
+    let number = ctx.request.pr_number;
+    match lease.prepare(runner, repo, number, head, cancel, &mut |line| ctx.line(line)) {
+        Ok(dir) => Ok(dir),
+        Err(err) => {
+            ctx.line(&err.message);
+            Err(Outcome::stopped(Phase::Prepare, err.code, err.message))
+        }
     }
 }
 
@@ -307,6 +386,8 @@ struct Live<'a> {
     history: &'a HistoryStore,
     dir: &'a Path,
     repo_id: &'a str,
+    /// `dir` is Signoff's worktree, not the person's checkout.
+    isolated: bool,
 }
 
 impl Live<'_> {
@@ -342,6 +423,14 @@ impl Live<'_> {
         // Nothing moved while it ran.
         ctx.emit(VerifyEvent::Phase(Phase::Checkout));
         if let Err(message) = self.gh.require_checked_out_commit(self.dir, head) {
+            let message = if self.isolated {
+                format!(
+                    "Signoff's worktree moved off {} while the command ran; nothing was signed off",
+                    short_sha(head)
+                )
+            } else {
+                message
+            };
             ctx.line(&message);
             return Outcome::stopped(Phase::Checkout, 1, message);
         }
@@ -466,6 +555,7 @@ mod tests {
     use crate::runner::fake::{FakeRunner, Reply, ok};
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::sync::Mutex;
 
     const SHA: &str = "3db401c9e8a1f00b5c2d7e6f4a3b2c1d0e9f8a7b";
     const OTHER: &str = "aaaaaaaa11111111222222223333333344444444";
@@ -750,5 +840,195 @@ mod tests {
             verifier.verify(&request("tests"), &AtomicBool::new(false), &mut |e| events.push(e)).expect("started");
         assert_eq!((outcome.phase, outcome.code), (Phase::Run, 3));
         assert!(lines(&events).contains(&"building".to_owned()));
+    }
+
+    /// Real `git` on real repositories; `gh` and the mapped command are
+    /// recorded, with the folder each ran in.
+    struct GitAndFake {
+        real: crate::runner::SystemRunner,
+        fake: FakeRunner,
+        /// Where each non-git command ran.
+        dirs: Mutex<Vec<(String, Option<PathBuf>)>>,
+        /// A commit the mapped command checks out where it runs, as a
+        /// command that moves HEAD would.
+        move_to: Mutex<Option<String>>,
+    }
+
+    impl Runner for GitAndFake {
+        fn run(
+            &self,
+            dir: Option<&Path>,
+            input: Option<&str>,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<crate::runner::Output> {
+            if program == "git" {
+                return self.real.run(dir, input, program, args);
+            }
+            let line = format!("{program} {}", args.join(" "));
+            self.dirs.lock().expect("dirs").push((line, dir.map(Path::to_owned)));
+            if program != "gh"
+                && let (Some(sha), Some(dir)) = (self.move_to.lock().expect("move_to").clone(), dir)
+            {
+                crate::worktree::tests::git(dir, &["checkout", "-q", "--detach", &sha]);
+            }
+            self.fake.run(dir, input, program, args)
+        }
+
+        fn stream(
+            &self,
+            dir: Option<&Path>,
+            program: &str,
+            args: &[&str],
+            timeout: Duration,
+            cancel: &AtomicBool,
+            on_line: &mut dyn FnMut(&str),
+        ) -> std::io::Result<i32> {
+            if program == "git" {
+                return self.real.stream(dir, program, args, timeout, cancel, on_line);
+            }
+            let out = self.run(dir, None, program, args)?;
+            for line in out.stdout.lines().chain(out.stderr.lines()) {
+                on_line(line);
+            }
+            Ok(out.code)
+        }
+    }
+
+    struct Isolated {
+        verifier: Verifier,
+        runner: Arc<GitAndFake>,
+        repos: crate::worktree::tests::Repos,
+        worktrees: Worktrees,
+        history: Arc<HistoryStore>,
+    }
+
+    fn leak(text: String) -> &'static str {
+        Box::leak(text.into_boxed_str())
+    }
+
+    /// Pull request 7 of a real clone that has `main` checked out, with
+    /// the separate-worktree setting `on`.
+    fn isolated(on: bool) -> Isolated {
+        let repos = crate::worktree::tests::Repos::new();
+        let head = repos.pr7.clone();
+        let repo = TrackedRepository {
+            id: "r1".into(),
+            commands: BTreeMap::from([(
+                "tests".to_owned(),
+                CommandMapping { command: "make test".into(), timeout_seconds: 60 },
+            )]),
+            ..repos.repo()
+        };
+        let config = Arc::new(ConfigStore::with_config(
+            repos.root.with_file_name("config.json"),
+            AppConfig { isolated_worktrees: on, repositories: vec![repo.clone()], ..AppConfig::default() },
+        ));
+        let history = Arc::new(HistoryStore::open(repos.root.with_file_name("history.json")).expect("history"));
+        let product = Arc::new(ProductService::with_state(ProductState {
+            pull_requests: vec![PullRequestState {
+                repo_id: repo.id.clone(),
+                repo: "o/app".into(),
+                pr: PrInfo { number: 7, title: "Add retry".into(), head_sha: head.clone(), ..PrInfo::default() },
+                checks: vec![Check {
+                    name: "tests".into(),
+                    local_command: "make test".into(),
+                    configured: true,
+                    ..Check::default()
+                }],
+                ..PullRequestState::default()
+            }],
+            ..ProductState::default()
+        }));
+        let view = leak(format!(r#"{{"number":7,"title":"Add retry","state":"OPEN","headRefOid":"{head}"}}"#));
+        let fake = FakeRunner::new(vec![
+            ok("make test", "ok 12 tests"),
+            ok("pr view 7", view),
+            ok("signoff --commit", "✓ Signed off"),
+        ]);
+        let runner = Arc::new(GitAndFake {
+            real: crate::runner::SystemRunner::default(),
+            fake,
+            dirs: Mutex::default(),
+            move_to: Mutex::default(),
+        });
+        let worktrees = Worktrees::new(&repos.root);
+        let verifier =
+            Verifier::new(product, runner.clone(), config, history.clone()).with_worktrees(worktrees.clone());
+        Isolated { verifier, runner, repos, worktrees, history }
+    }
+
+    fn phases(events: &[VerifyEvent]) -> Vec<Phase> {
+        events.iter().filter_map(|e| if let VerifyEvent::Phase(p) = e { Some(*p) } else { None }).collect()
+    }
+
+    #[test]
+    fn with_the_setting_on_a_checkout_elsewhere_runs_in_signoffs_worktree() {
+        let t = isolated(true);
+        let before = t.repos.checkout_state();
+        let mut events = Vec::new();
+        let outcome =
+            t.verifier.verify(&request("tests"), &AtomicBool::new(false), &mut |e| events.push(e)).expect("started");
+        assert!(outcome.signed_off(), "{outcome:?} {:?}", lines(&events));
+        assert_eq!(phases(&events), [Phase::Prepare, Phase::Run, Phase::Checkout, Phase::Signoff]);
+
+        let wt = t.worktrees.path_for("r1").expect("a path");
+        let dirs = t.runner.dirs.lock().expect("dirs").clone();
+        let ran_in =
+            |needle: &str| dirs.iter().find(|(line, _)| line.contains(needle)).and_then(|(_, dir)| dir.clone());
+        assert_eq!(ran_in("make test"), Some(wt.clone()), "the command ran in the worktree");
+        assert_eq!(ran_in("signoff --commit"), Some(wt.clone()));
+        assert!(dirs.iter().any(|(line, _)| line.contains(&format!("signoff --commit {} tests", t.repos.pr7))));
+        assert_eq!(crate::worktree::tests::git(&wt, &["rev-parse", "HEAD"]), t.repos.pr7);
+        assert_eq!(t.repos.checkout_state(), before, "the person's checkout is untouched");
+        assert!(t.history.snapshot(0).iter().any(|e| e.kind == ActivityKind::Signoff));
+        // The worktree is free for the next run.
+        assert!(t.worktrees.claim("r1").is_some());
+    }
+
+    #[test]
+    fn with_the_setting_off_a_checkout_elsewhere_is_still_refused() {
+        let t = isolated(false);
+        let result = t.verifier.verify(&request("tests"), &AtomicBool::new(false), &mut |_| {});
+        assert!(matches!(result, Err(VerifyError::WrongCommit(_))), "{result:?}");
+        assert!(!t.repos.root.exists(), "no worktree was made");
+        assert!(t.runner.dirs.lock().expect("dirs").is_empty());
+    }
+
+    #[test]
+    fn a_worktree_that_moved_during_the_run_is_not_signed_off() {
+        let t = isolated(true);
+        *t.runner.move_to.lock().expect("move_to") = Some(t.repos.checkout_state().1);
+        let mut events = Vec::new();
+        let outcome =
+            t.verifier.verify(&request("tests"), &AtomicBool::new(false), &mut |e| events.push(e)).expect("started");
+        assert_eq!(outcome.phase, Phase::Checkout, "{outcome:?}");
+        assert!(outcome.message.as_deref().is_some_and(|m| m.contains("worktree moved")), "{outcome:?}");
+        assert!(!t.runner.dirs.lock().expect("dirs").iter().any(|(line, _)| line.contains("signoff --commit")));
+    }
+
+    #[test]
+    fn a_failed_preparation_runs_nothing_and_says_how_to_fix_it() {
+        let t = isolated(true);
+        crate::worktree::tests::git(&t.repos.checkout, &["remote", "set-url", "origin", "/nowhere/at/all"]);
+        let mut events = Vec::new();
+        let outcome =
+            t.verifier.verify(&request("tests"), &AtomicBool::new(false), &mut |e| events.push(e)).expect("started");
+        assert_eq!(outcome.phase, Phase::Prepare);
+        let message = outcome.message.unwrap_or_default();
+        assert!(
+            message.contains("could not fetch #7 from origin") && message.contains("git fetch origin"),
+            "{message}"
+        );
+        assert!(t.runner.dirs.lock().expect("dirs").is_empty(), "neither the command nor gh ran");
+        assert!(t.history.snapshot(0).is_empty());
+    }
+
+    #[test]
+    fn a_worktree_another_run_holds_is_refused() {
+        let t = isolated(true);
+        let _held = t.worktrees.claim("r1").expect("free");
+        let result = t.verifier.verify(&request("tests"), &AtomicBool::new(false), &mut |_| {});
+        assert_eq!(result, Err(VerifyError::WorktreeBusy));
     }
 }
