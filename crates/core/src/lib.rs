@@ -20,6 +20,7 @@
 //!   `Makefile`, `package.json` and the like.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
+pub mod api;
 pub mod checks;
 pub mod config;
 pub mod demo;

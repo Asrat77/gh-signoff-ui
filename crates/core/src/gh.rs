@@ -390,51 +390,9 @@ impl Gh {
     ///
     /// When the status API call fails.
     pub fn commit_statuses(&self, dir: &Path, repo: &str, sha: &str) -> Result<Vec<CommitStatus>, GhError> {
-        #[derive(Deserialize)]
-        struct Combined {
-            #[serde(default)]
-            statuses: Vec<RawStatus>,
-        }
-        #[derive(Deserialize)]
-        struct RawStatus {
-            #[serde(default)]
-            context: String,
-            #[serde(default)]
-            state: CheckState,
-            #[serde(default)]
-            description: Option<String>,
-            #[serde(default, deserialize_with = "timestamp_or_default")]
-            created_at: Timestamp,
-            #[serde(default)]
-            target_url: Option<String>,
-            #[serde(default)]
-            creator: Option<Creator>,
-        }
-        #[derive(Deserialize)]
-        struct Creator {
-            #[serde(default)]
-            login: String,
-            #[serde(default)]
-            avatar_url: String,
-        }
         let path = format!("repos/{repo}/commits/{sha}/status");
-        let raw: Combined = self.json(Some(dir), &["api", &path])?;
-        Ok(raw
-            .statuses
-            .into_iter()
-            .map(|s| {
-                let (creator, avatar_url) = s.creator.map(|c| (c.login, c.avatar_url)).unwrap_or_default();
-                CommitStatus {
-                    context: s.context,
-                    state: s.state,
-                    description: s.description.unwrap_or_default(),
-                    creator,
-                    avatar_url,
-                    created_at: s.created_at,
-                    target_url: s.target_url.unwrap_or_default(),
-                }
-            })
-            .collect())
+        let stdout = self.exec(Some(dir), "gh", &["api", &path])?;
+        parse_combined_status(&stdout).map_err(|source| GhError::Json { command: format!("gh api {path}"), source })
     }
 
     /// The status contexts branch protection requires on `branch`, and which
@@ -599,8 +557,58 @@ pub(crate) fn limit_pull_requests<T>(mut raw: Vec<T>) -> (Vec<T>, bool) {
     (raw, true)
 }
 
+/// The statuses in a combined-status answer (`GET
+/// /repos/{o}/{r}/commits/{sha}/status`), whether `gh api` or the REST
+/// client fetched it.
+pub(crate) fn parse_combined_status(body: &str) -> Result<Vec<CommitStatus>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Combined {
+        #[serde(default)]
+        statuses: Vec<RawStatus>,
+    }
+    #[derive(Deserialize)]
+    struct RawStatus {
+        #[serde(default)]
+        context: String,
+        #[serde(default)]
+        state: CheckState,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default, deserialize_with = "timestamp_or_default")]
+        created_at: Timestamp,
+        #[serde(default)]
+        target_url: Option<String>,
+        #[serde(default)]
+        creator: Option<Creator>,
+    }
+    #[derive(Deserialize)]
+    struct Creator {
+        #[serde(default)]
+        login: String,
+        #[serde(default)]
+        avatar_url: String,
+    }
+    let raw: Combined = serde_json::from_str(body)?;
+    Ok(raw
+        .statuses
+        .into_iter()
+        .map(|s| {
+            let (creator, avatar_url) = s.creator.map(|c| (c.login, c.avatar_url)).unwrap_or_default();
+            CommitStatus {
+                context: s.context,
+                state: s.state,
+                description: s.description.unwrap_or_default(),
+                creator,
+                avatar_url,
+                created_at: s.created_at,
+                target_url: s.target_url.unwrap_or_default(),
+            }
+        })
+        .collect())
+}
+
 /// A timestamp, or the epoch for `null` or a missing value.
-fn timestamp_or_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+pub(crate) fn timestamp_or_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
     Ok(Option::<Timestamp>::deserialize(deserializer)?.unwrap_or_default())
 }
 
