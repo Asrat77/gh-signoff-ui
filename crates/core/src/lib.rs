@@ -14,6 +14,17 @@
 
 pub mod checks;
 pub mod config;
+pub mod demo;
 pub mod gh;
 pub mod history;
+pub mod product;
 pub mod runner;
+
+pub use checks::{Check, CheckState, Rules, Tally};
+pub use config::{
+    AppConfig, CommandMapping, ConfigError, ConfigStore, PullRequestScope, RepositoryUpdate, TrackedRepository,
+};
+pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo};
+pub use history::{ActivityEvent, ActivityKind, HistoryStore};
+pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequestState, RepositoryState};
+pub use runner::{Output, Runner, SystemRunner};
