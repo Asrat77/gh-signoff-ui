@@ -523,7 +523,12 @@ impl ProductService {
         self.state.write().unwrap_or_else(PoisonError::into_inner).refreshing = true;
 
         let mut next = match &self.source {
-            Source::Demo => crate::demo::product_state(Timestamp::now()),
+            // Demo data only changes through demo runs; a refresh must not
+            // undo them.
+            Source::Demo => {
+                let current = self.cached();
+                if current.fetched_at.is_some() { current } else { crate::demo::product_state(Timestamp::now()) }
+            }
             Source::GitHub { gh, config, history, seed_dir, cache } => {
                 let config_path = config.path().to_owned();
                 build_product_state(
@@ -647,6 +652,7 @@ mod tests {
         assert!(pr.ready);
         assert_eq!(pr.status, Health::Ready);
         assert_eq!(service.cached().history[0].kind, ActivityKind::Run);
+        assert!(service.refresh().pull_request("demo-signoff", 482).expect("pr").ready, "kept across refresh");
     }
 
     /// One repository end to end against recorded `gh` output: a failing
