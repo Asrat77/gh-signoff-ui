@@ -76,6 +76,29 @@ impl GhError {
                 .any(|needle| m.contains(needle))
         })
     }
+
+    /// Whether this says `gh` is missing or signed out, rather than that one
+    /// repository could not be read. The environment is probed again after
+    /// one of these, since the cached probe no longer holds.
+    pub fn is_environment_failure(&self) -> bool {
+        match self {
+            Self::Launch { .. } => true,
+            Self::Exit { message, .. } => {
+                let message = message.to_ascii_lowercase();
+                [
+                    "gh auth login",
+                    "not logged",
+                    "authentication",
+                    "bad credentials",
+                    "http 401",
+                    "requires authentication",
+                ]
+                .iter()
+                .any(|needle| message.contains(needle))
+            }
+            Self::Json { .. } => false,
+        }
+    }
 }
 
 /// Everything that can be wrong before there is anything to show. The UI
@@ -695,6 +718,17 @@ mod tests {
 
     /// GraphQL spells states in upper case, unlike the REST API. Everything
     /// downstream compares lower case, so that must not leak out.
+    #[test]
+    fn environment_failures_are_told_apart_from_repository_ones() {
+        let exit = |message: &str| GhError::Exit { command: "gh".into(), code: 1, message: message.into() };
+        let launch = GhError::Launch { program: "gh".into(), source: std::io::ErrorKind::NotFound.into() };
+        assert!(launch.is_environment_failure());
+        assert!(exit("To get started with GitHub CLI, please run:  gh auth login").is_environment_failure());
+        assert!(exit("HTTP 401: Bad credentials (https://api.github.com/user)").is_environment_failure());
+        assert!(!exit("GraphQL: Could not resolve to a Repository").is_environment_failure());
+        assert!(!exit("HTTP 404: Not Found").is_environment_failure());
+    }
+
     #[test]
     fn rollup_contexts_normalise_state_and_drop_check_runs() {
         let entry = |type_name: &str, context: &str, state: &str| RollupEntry {
