@@ -1,0 +1,482 @@
+//! The tracked repositories and their settings, kept in `config.json`.
+//!
+//! The file format is the one the Go version wrote, so an existing config
+//! keeps working.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::sync::{PoisonError, RwLock};
+
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+
+use crate::gh::{Gh, GhError};
+
+/// The config format version this build writes.
+pub const CURRENT_VERSION: u32 = 1;
+/// The longest a mapped command may run.
+pub const MAX_TIMEOUT_SECONDS: u32 = 7200;
+/// The timeout of a mapped command that names none.
+pub const DEFAULT_TIMEOUT_SECONDS: u32 = 1800;
+
+/// Which open pull requests a repository shows.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase", from = "String")]
+pub enum PullRequestScope {
+    /// The user's own.
+    #[default]
+    Mine,
+    /// Everyone's.
+    All,
+}
+
+impl From<String> for PullRequestScope {
+    /// Anything but `all` is `mine`, as before.
+    fn from(value: String) -> Self {
+        if value == "all" { Self::All } else { Self::Mine }
+    }
+}
+
+/// The local work that must succeed before a signoff is written. The command
+/// is the user's, runs in the tracked checkout, and is never taken from
+/// anywhere but the config.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommandMapping {
+    /// The shell command.
+    pub command: String,
+    /// How long it may run.
+    pub timeout_seconds: u32,
+}
+
+/// One local checkout Signoff watches.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct TrackedRepository {
+    /// Derived from the canonical path, so it is stable across launches.
+    pub id: String,
+    /// The checkout.
+    pub path: PathBuf,
+    /// `owner/name`.
+    pub name_with_owner: String,
+    /// Its default branch.
+    pub default_branch: String,
+    /// Whether it is refreshed.
+    pub enabled: bool,
+    /// Whose pull requests it shows.
+    pub pull_request_scope: PullRequestScope,
+    /// Local commands by check name (`tests`, `lint`…).
+    pub commands: BTreeMap<String, CommandMapping>,
+}
+
+/// The editable part of a [`TrackedRepository`]. Its identity (id, path,
+/// GitHub name) cannot be changed after it was added.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RepositoryUpdate {
+    /// Whether it is refreshed.
+    pub enabled: bool,
+    /// Whose pull requests it shows.
+    pub pull_request_scope: PullRequestScope,
+    /// Local commands by check name.
+    pub commands: BTreeMap<String, CommandMapping>,
+}
+
+/// The whole config file.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AppConfig {
+    /// The format version.
+    pub version: u32,
+    /// Seconds between background refreshes.
+    pub refresh_seconds: u32,
+    /// Tracked checkouts, sorted by GitHub name.
+    pub repositories: Vec<TrackedRepository>,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self { version: CURRENT_VERSION, refresh_seconds: 30, repositories: Vec::new() }
+    }
+}
+
+impl AppConfig {
+    /// Fills defaults, bounds values and sorts, as every load and save does.
+    pub fn normalize(&mut self) {
+        if self.version == 0 {
+            self.version = CURRENT_VERSION;
+        }
+        if self.refresh_seconds < 10 {
+            self.refresh_seconds = 30;
+        }
+        for repo in &mut self.repositories {
+            repo.normalize();
+        }
+        self.repositories.sort_by_key(|r| r.name_with_owner.to_lowercase());
+    }
+}
+
+impl TrackedRepository {
+    /// Derives a missing id and bounds every command's timeout.
+    pub fn normalize(&mut self) {
+        if self.id.is_empty() && !self.path.as_os_str().is_empty() {
+            self.id = repository_id(&self.path);
+        }
+        for mapping in self.commands.values_mut() {
+            mapping.command = mapping.command.trim().to_owned();
+            if mapping.timeout_seconds == 0 {
+                mapping.timeout_seconds = DEFAULT_TIMEOUT_SECONDS;
+            }
+            mapping.timeout_seconds = mapping.timeout_seconds.min(MAX_TIMEOUT_SECONDS);
+        }
+    }
+}
+
+/// A stable id for a checkout: the first eight bytes of the SHA-256 of its
+/// cleaned path, in hex.
+pub fn repository_id(path: &Path) -> String {
+    let cleaned = clean(path);
+    let digest = Sha256::digest(cleaned.to_string_lossy().as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Lexically removes `.`, `..` and repeated or trailing separators.
+fn clean(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Why a config operation failed.
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    /// Reading or writing the file.
+    #[error("{action} {path}: {source}")]
+    Io {
+        /// What was being done.
+        action: &'static str,
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        source: io::Error,
+    },
+    /// The file is not a config.
+    #[error("parsing {path}: {source}")]
+    Parse {
+        /// The file.
+        path: PathBuf,
+        /// Why.
+        source: serde_json::Error,
+    },
+    /// The path given to add is unusable.
+    #[error("{0}")]
+    InvalidPath(String),
+    /// The checkout is not a GitHub repository `gh` can read.
+    #[error("reading GitHub repository: {0}")]
+    Gh(#[from] GhError),
+    /// Already tracked.
+    #[error("repository is already tracked")]
+    AlreadyTracked,
+    /// No repository has that id.
+    #[error("no tracked repository has that id")]
+    NotFound,
+    /// The refresh interval is out of range.
+    #[error("refresh interval must be between 10 and 3600 seconds")]
+    InvalidRefresh,
+}
+
+/// The config file and its loaded contents.
+///
+/// Every change is saved at once, atomically and readable only by the user.
+/// Saving waits for the disk, so call the changing methods off the UI thread.
+#[derive(Debug)]
+pub struct ConfigStore {
+    path: PathBuf,
+    config: RwLock<AppConfig>,
+}
+
+impl ConfigStore {
+    /// Loads `path`, or starts from defaults if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// When the file exists but cannot be read or parsed.
+    pub fn open(path: impl Into<PathBuf>) -> Result<Self, ConfigError> {
+        let path = path.into();
+        let config = match std::fs::read(&path) {
+            Ok(bytes) => {
+                let mut config: AppConfig = serde_json::from_slice(&bytes)
+                    .map_err(|source| ConfigError::Parse { path: path.clone(), source })?;
+                config.normalize();
+                config
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => AppConfig::default(),
+            Err(source) => return Err(ConfigError::Io { action: "reading", path, source }),
+        };
+        Ok(Self { path, config: RwLock::new(config) })
+    }
+
+    /// A store that holds `config` and saves to `path`.
+    pub fn with_config(path: impl Into<PathBuf>, mut config: AppConfig) -> Self {
+        config.normalize();
+        Self { path: path.into(), config: RwLock::new(config) }
+    }
+
+    /// The config file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// A copy of the config.
+    pub fn snapshot(&self) -> AppConfig {
+        self.config.read().unwrap_or_else(PoisonError::into_inner).clone()
+    }
+
+    /// The tracked repository with `id`.
+    pub fn find_repository(&self, id: &str) -> Option<TrackedRepository> {
+        self.config.read().unwrap_or_else(PoisonError::into_inner).repositories.iter().find(|r| r.id == id).cloned()
+    }
+
+    /// Starts tracking the checkout at `path`, after checking it is a git
+    /// repository on GitHub.
+    ///
+    /// # Errors
+    ///
+    /// When it is not, is already tracked, or the config cannot be saved.
+    pub fn add_repository(&self, gh: &Gh, path: &Path) -> Result<TrackedRepository, ConfigError> {
+        let canonical = std::fs::canonicalize(path)
+            .map_err(|err| ConfigError::InvalidPath(format!("opening repository path: {err}")))?;
+        // `canonicalize` gives `\\?\C:\…` on Windows; keep the familiar form.
+        let canonical = strip_verbatim(canonical);
+        if !canonical.is_dir() {
+            return Err(ConfigError::InvalidPath("repository path is not a directory".into()));
+        }
+        let info = gh.repo(&canonical)?;
+        let mut repo = TrackedRepository {
+            id: repository_id(&canonical),
+            path: canonical,
+            name_with_owner: info.name_with_owner,
+            default_branch: info.default_branch,
+            enabled: true,
+            pull_request_scope: PullRequestScope::Mine,
+            commands: BTreeMap::new(),
+        };
+        repo.normalize();
+        self.change(|config| {
+            if config.repositories.iter().any(|r| r.id == repo.id) {
+                return Err(ConfigError::AlreadyTracked);
+            }
+            config.repositories.push(repo.clone());
+            Ok(repo)
+        })
+    }
+
+    /// Changes the editable settings of the repository with `id`.
+    ///
+    /// # Errors
+    ///
+    /// When there is none, or the config cannot be saved.
+    pub fn update_repository(&self, id: &str, update: RepositoryUpdate) -> Result<TrackedRepository, ConfigError> {
+        self.change(|config| {
+            let repo = config.repositories.iter_mut().find(|r| r.id == id).ok_or(ConfigError::NotFound)?;
+            repo.enabled = update.enabled;
+            repo.pull_request_scope = update.pull_request_scope;
+            repo.commands = update.commands;
+            repo.normalize();
+            Ok(repo.clone())
+        })
+    }
+
+    /// Stops tracking the repository with `id`.
+    ///
+    /// # Errors
+    ///
+    /// When there is none, or the config cannot be saved.
+    pub fn remove_repository(&self, id: &str) -> Result<(), ConfigError> {
+        self.change(|config| {
+            let index = config.repositories.iter().position(|r| r.id == id).ok_or(ConfigError::NotFound)?;
+            config.repositories.remove(index);
+            Ok(())
+        })
+    }
+
+    /// Sets the background refresh interval.
+    ///
+    /// # Errors
+    ///
+    /// When it is outside 10–3600 seconds, or the config cannot be saved.
+    pub fn set_refresh_seconds(&self, seconds: u32) -> Result<(), ConfigError> {
+        if !(10..=3600).contains(&seconds) {
+            return Err(ConfigError::InvalidRefresh);
+        }
+        self.change(|config| {
+            config.refresh_seconds = seconds;
+            Ok(())
+        })
+    }
+
+    /// Applies `edit` and saves. The change is kept only if both succeed.
+    fn change<T>(&self, edit: impl FnOnce(&mut AppConfig) -> Result<T, ConfigError>) -> Result<T, ConfigError> {
+        let mut guard = self.config.write().unwrap_or_else(PoisonError::into_inner);
+        let mut next = guard.clone();
+        let value = edit(&mut next)?;
+        next.normalize();
+        self.save(&next)?;
+        *guard = next;
+        Ok(value)
+    }
+
+    fn save(&self, config: &AppConfig) -> Result<(), ConfigError> {
+        let mut bytes = serde_json::to_vec_pretty(config)
+            .map_err(|source| ConfigError::Parse { path: self.path.clone(), source })?;
+        bytes.push(b'\n');
+        fastframe_file::write_private(&self.path, bytes).map_err(|source| ConfigError::Io {
+            action: "writing",
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+fn strip_verbatim(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\")
+            && !rest.starts_with("UNC\\")
+        {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tracked() -> TrackedRepository {
+        TrackedRepository {
+            id: "repo-1".into(),
+            path: "/tmp/example".into(),
+            name_with_owner: "acme/example".into(),
+            default_branch: "main".into(),
+            enabled: true,
+            pull_request_scope: PullRequestScope::All,
+            commands: BTreeMap::from([(
+                "tests".into(),
+                CommandMapping { command: "bin/test".into(), timeout_seconds: 90 },
+            )]),
+        }
+    }
+
+    #[test]
+    fn persists_repository_settings_privately() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let store =
+            ConfigStore::with_config(&path, AppConfig { repositories: vec![tracked()], ..AppConfig::default() });
+        store.set_refresh_seconds(45).expect("save");
+
+        let reloaded = ConfigStore::open(&path).expect("reload").snapshot();
+        assert_eq!(reloaded.refresh_seconds, 45);
+        assert_eq!(reloaded.repositories, vec![tracked()]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
+            assert_eq!(mode & 0o077, 0, "config permissions {mode:o} should be private");
+        }
+    }
+
+    /// The Go version's file must keep loading.
+    #[test]
+    fn reads_the_go_config_format() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"refreshSeconds":5,"repositories":[{"id":"abc","path":"/w/r","nameWithOwner":"o/r",
+            "defaultBranch":"main","enabled":true,"pullRequestScope":"weird","commands":{"tests":{"command":" bin/test ","timeoutSeconds":0}}}]}"#,
+        )
+        .expect("write");
+        let config = ConfigStore::open(&path).expect("open").snapshot();
+        assert_eq!(config.refresh_seconds, 30, "below 10 falls back to the default");
+        let repo = &config.repositories[0];
+        assert_eq!(repo.pull_request_scope, PullRequestScope::Mine);
+        assert_eq!(
+            repo.commands["tests"],
+            CommandMapping { command: "bin/test".into(), timeout_seconds: DEFAULT_TIMEOUT_SECONDS }
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_the_default_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert_eq!(ConfigStore::open(dir.path().join("none.json")).expect("open").snapshot(), AppConfig::default());
+    }
+
+    #[test]
+    fn command_timeout_is_bounded() {
+        let mut repo = TrackedRepository {
+            commands: BTreeMap::from([(
+                "tests".into(),
+                CommandMapping { command: " bin/test ".into(), timeout_seconds: 100_000 },
+            )]),
+            ..TrackedRepository::default()
+        };
+        repo.normalize();
+        assert_eq!(
+            repo.commands["tests"],
+            CommandMapping { command: "bin/test".into(), timeout_seconds: MAX_TIMEOUT_SECONDS }
+        );
+    }
+
+    /// An update carries no path or name, so a repository's identity cannot
+    /// be swapped for another checkout.
+    #[test]
+    fn update_keeps_repository_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::with_config(
+            dir.path().join("config.json"),
+            AppConfig { repositories: vec![tracked()], ..AppConfig::default() },
+        );
+        let updated = store
+            .update_repository("repo-1", RepositoryUpdate { enabled: false, ..RepositoryUpdate::default() })
+            .expect("update");
+        assert_eq!(updated.path, PathBuf::from("/tmp/example"));
+        assert_eq!(updated.name_with_owner, "acme/example");
+        assert!(!updated.enabled);
+        assert!(matches!(store.update_repository("nope", RepositoryUpdate::default()), Err(ConfigError::NotFound)));
+    }
+
+    #[test]
+    fn remove_and_refresh_bounds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::with_config(
+            dir.path().join("config.json"),
+            AppConfig { repositories: vec![tracked()], ..AppConfig::default() },
+        );
+        assert!(matches!(store.set_refresh_seconds(5), Err(ConfigError::InvalidRefresh)));
+        store.remove_repository("repo-1").expect("remove");
+        assert!(store.snapshot().repositories.is_empty());
+        assert!(matches!(store.remove_repository("repo-1"), Err(ConfigError::NotFound)));
+    }
+
+    #[test]
+    fn repository_ids_are_stable_across_spellings() {
+        assert_eq!(repository_id(Path::new("/work/repo")), repository_id(Path::new("/work/./x/../repo/")));
+        assert_eq!(repository_id(Path::new("/work/repo")).len(), 16);
+    }
+}

@@ -13,5 +13,6 @@
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
 pub mod checks;
+pub mod config;
 pub mod gh;
 pub mod runner;
