@@ -74,11 +74,14 @@ struct SettingsUnderTest {
     state: ProductState,
     service: Arc<ProductService>,
     refreshes: usize,
+    /// Read the state again on refresh, as the app does. Off, the state
+    /// stays as it was: a refresh that has not finished yet.
+    follow: bool,
 }
 
 fn settings_harness(service: Arc<ProductService>, state: ProductState) -> Harness<'static, SettingsUnderTest> {
     let settings = Settings::new(service.clone(), || {});
-    let under_test = SettingsUnderTest { settings, state, service, refreshes: 0 };
+    let under_test = SettingsUnderTest { settings, state, service, refreshes: 0, follow: true };
     Harness::builder().with_size(egui::vec2(820.0, 900.0)).build_ui_state(
         |ui, t: &mut SettingsUnderTest| {
             if !installed(ui.ctx()) {
@@ -87,7 +90,9 @@ fn settings_harness(service: Arc<ProductService>, state: ProductState) -> Harnes
             if settings::contents(ui, &mut t.settings, &t.state).refresh {
                 t.refreshes += 1;
                 // What the app does on refresh: read the state again.
-                t.state = t.service.cached_or_config_state();
+                if t.follow {
+                    t.state = t.service.cached_or_config_state();
+                }
             }
         },
         under_test,
@@ -229,6 +234,42 @@ fn adding_a_checkout_tracks_it() {
     assert_eq!(repos.len(), 1);
     assert_eq!(repos[0].name_with_owner, "acme/widgets");
     assert!(harness.query_by_label("acme/widgets").is_some());
+}
+
+#[test]
+fn a_repository_chip_changes_before_the_refresh_finishes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.state_mut().follow = false;
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+
+    harness.get_by_label("Watching").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Paused").is_some(), "the chip should flip at once");
+    assert!(!service.config().expect("config").find_repository("repo1").expect("repo").enabled);
+
+    harness.get_by_label("Stop tracking").click();
+    harness.run_ok();
+    harness.get_by_label("Remove").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("acme/widgets").is_none(), "the row should go at once");
+    assert!(service.config().expect("config").snapshot().repositories.is_empty());
+}
+
+#[test]
+fn a_new_repository_reads_until_a_refresh_covers_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let mut harness = settings_harness(service, ProductState::default());
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+    harness.get_by_label("acme/widgets");
+    harness.get_by_label("Reading…");
 }
 
 #[test]
