@@ -24,6 +24,8 @@ pub(crate) struct Glance {
     pub(crate) filter: Filter,
     /// The page on the sheet.
     pub(crate) page: Page,
+    /// The check picked on a pull request's page, to run.
+    pub(crate) check: Option<String>,
 }
 
 /// The page the sheet shows.

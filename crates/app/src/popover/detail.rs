@@ -1,11 +1,13 @@
 //! One pull request's page: its required signoffs and where each stands
-//! on the exact head commit.
+//! on the exact head commit, and running one locally to sign it off.
 
+use egui::Response;
 use egui::{Align, Frame, Layout, Margin, RichText, ScrollArea, Ui};
-use signoff_core::{Check, PullRequestState};
+use signoff_core::{Check, CheckState, Phase, PullRequestState, VerifyRequest};
 use signoff_ui::theme::space;
 use signoff_ui::widgets::{
-    Button, ButtonKind, CheckRow, EmptyState, Headline, IconButton, IconButtonKind, Mood, Segments, sheet,
+    Button, ButtonKind, CheckRow, Chip, EmptyState, Headline, IconButton, IconButtonKind, LogLine, LogView, Mood,
+    Segments, sheet,
 };
 use signoff_ui::{Status, Type, icons, palette};
 
@@ -13,6 +15,7 @@ use super::Page;
 use super::parts::{band, caption, height_above, notice, refresh_button};
 use crate::app::Signoff;
 use crate::glance;
+use crate::runs::RunView;
 
 /// Room kept under the checks for the actions.
 const FOOTER: f32 = 92.0;
@@ -24,8 +27,11 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
         app.glance.page = Page::List;
         return super::list::show(ui, app);
     };
-    let status = glance::status(pr.status);
-    band(ui, Mood::for_status(status), app.demo, |ui| {
+    let target = target(app, &pr).cloned();
+    let run = target.as_ref().and_then(|check| app.runs.view(&request(&pr, check)));
+    let running = run.as_ref().is_some_and(RunView::running);
+    let mood = if running { Mood::Busy } else { Mood::for_status(glance::status(pr.status)) };
+    band(ui, mood, app.demo, |ui| {
         if ui.add(IconButton::new(icons::EXTERNAL, "Open on GitHub")).clicked() {
             ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.pr.url));
         }
@@ -66,11 +72,20 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
                     ));
                 }
                 for check in required {
-                    check_row(ui, &pr, check);
+                    if check_row(ui, app, &pr, check, target.as_ref()).clicked() && check.configured {
+                        app.glance.check = Some(check.name.clone());
+                    }
+                }
+                if let (Some(check), Some(run)) = (&target, &run) {
+                    ui.add_space(space::XS);
+                    run_log(ui, check, run);
+                    if !run.running() && ui.add(Chip::new("Clear output").icon(icons::REMOVE)).clicked() {
+                        app.runs.dismiss(&request(&pr, check));
+                    }
                 }
             });
             ui.add_space(space::M);
-            actions(ui, &pr);
+            actions(ui, app, &pr, target.as_ref(), run.as_ref());
         });
     });
 }
@@ -80,7 +95,8 @@ fn head(ui: &mut Ui, pr: &PullRequestState) {
     let p = palette(ui.ctx());
     ui.with_layout(Layout::top_down(Align::Center), |ui| {
         ui.horizontal(|ui| {
-            let repo = RichText::new(format!("{} #{}", pr.repo, pr.pr.number)).font(Type::Caption.font());
+            let repo = RichText::new(format!("{} #{}", pr.repo.rsplit('/').next().unwrap_or(&pr.repo), pr.pr.number))
+                .font(Type::Caption.font());
             let commit =
                 RichText::new(format!("{} {} @ {}", icons::COMMIT, pr.pr.head_ref, glance::short_sha(&pr.pr.head_sha)))
                     .font(Type::Mono.font());
@@ -97,20 +113,84 @@ fn head(ui: &mut Ui, pr: &PullRequestState) {
     });
 }
 
-/// One required signoff on the head commit.
-fn check_row(ui: &mut Ui, pr: &PullRequestState, check: &Check) {
+/// The check the page's button acts on: the one running, else the one
+/// picked, else the one the merge waits on, if it has a local command.
+fn target<'a>(app: &Signoff, pr: &'a PullRequestState) -> Option<&'a Check> {
+    let mut required = glance::required(pr);
+    let running = |check: &&Check| app.runs.view(&request(pr, check)).is_some_and(|run| run.running());
+    if let Some(check) = glance::required(pr).find(running) {
+        return Some(check);
+    }
+    if let Some(name) = &app.glance.check
+        && let Some(check) = glance::required(pr).find(|check| &check.name == name)
+    {
+        return Some(check);
+    }
+    required.find(|check| pr.blocking.as_deref() == Some(&check.name) && check.configured)
+}
+
+/// The run request for `check` on `pr`.
+fn request(pr: &PullRequestState, check: &Check) -> VerifyRequest {
+    VerifyRequest { repo_id: pr.repo_id.clone(), pr_number: pr.pr.number, check: check.name.clone() }
+}
+
+/// One required signoff on the head commit; a running one spins.
+fn check_row(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, check: &Check, target: Option<&Check>) -> Response {
     let command = if check.configured { check.local_command.as_str() } else { check.command.as_str() };
-    let row = CheckRow::new(&check.name, command, glance::check_status(pr, check)).category(&check.category);
+    let running = app.runs.view(&request(pr, check)).is_some_and(|run| run.running());
+    let status = if running { Status::Running } else { glance::check_status(pr, check) };
+    // The picked check is the loud one, so the button below reads right.
+    let status = match (status, target) {
+        (Status::Neutral, Some(target)) if target.name == check.name => Status::Attention,
+        (Status::Attention, Some(target)) if target.name != check.name => Status::Neutral,
+        (status, _) => status,
+    };
+    let row = CheckRow::new(&check.name, command, status).category(&check.category);
     let response = row.show(ui).response;
     if check.actor.is_empty() {
-        response.on_hover_text(format!("{} has no signoff on this commit yet", check.context));
+        response.on_hover_text(format!("{} has no signoff on this commit yet", check.context))
     } else {
         let by = match check.at {
             Some(at) => format!("{} by {} at {}", check.context, check.actor, at.strftime("%Y-%m-%d %H:%M")),
             None => format!("{} by {}", check.context, check.actor),
         };
-        response.on_hover_text(by);
+        response.on_hover_text(by)
     }
+}
+
+/// A run's output under the checks, newest at the bottom.
+fn run_log(ui: &mut Ui, check: &Check, run: &RunView) {
+    let mut lines = Vec::with_capacity(run.lines.len() + 3);
+    if run.dropped > 0 {
+        lines.push(LogLine::Step(format!("… {} earlier lines", run.dropped)));
+    }
+    lines.extend(run.lines.iter().cloned().map(LogLine::Output));
+    let (phase, status) = match &run.result {
+        None => (
+            match run.phase {
+                Phase::Checkout => "checking commit",
+                Phase::Run => "streaming",
+                Phase::Signoff => "signing off",
+            }
+            .to_owned(),
+            Status::Running,
+        ),
+        Some(Ok(outcome)) if outcome.signed_off() => {
+            lines.push(LogLine::Success(format!("{} signed off {}", icons::CHECK, check.name)));
+            ("signed off".to_owned(), Status::Ready)
+        }
+        Some(Ok(outcome)) => {
+            let message = outcome.message.clone().unwrap_or_else(|| format!("exit {}", outcome.code));
+            lines.push(LogLine::Failure(message));
+            (format!("exit {}", outcome.code), Status::Failing)
+        }
+        Some(Err(refused)) => {
+            lines.push(LogLine::Failure(refused.clone()));
+            ("refused".to_owned(), Status::Failing)
+        }
+    };
+    let title = format!("{} output", check.name);
+    ui.add(LogView::new(&title, &lines).phase(&phase, status).max_height(150.0));
 }
 
 /// What stops this pull request's checks from being trusted as shown.
@@ -128,20 +208,43 @@ fn problems(ui: &mut Ui, pr: &PullRequestState) {
     }
 }
 
-/// The page's main button. Verify and sign off adds its run controls here.
-fn actions(ui: &mut Ui, pr: &PullRequestState) {
-    let (label, kind) = if pr.ready {
-        ("Open pull request to merge", ButtonKind::Accent)
-    } else {
-        ("Open on GitHub", ButtonKind::Primary)
-    };
-    if ui.add(Button::new(label).kind(kind).trailing_icon(icons::FORWARD)).clicked() {
-        ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.pr.url));
+/// The page's main button: run and sign off the target check, stop it
+/// while it runs, or open a ready pull request to merge.
+fn actions(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) {
+    let can_run = app.demo || pr.checked_out;
+    match (target, run) {
+        (Some(check), Some(run)) if run.running() => {
+            let label = format!("Stop {}", check.name);
+            if ui.add(Button::new(&label).kind(ButtonKind::Secondary).icon(icons::STOP)).clicked() {
+                app.runs.stop(&request(pr, check));
+            }
+        }
+        (Some(check), _) if check.configured && check.state != CheckState::Success => {
+            let label = format!("Run & sign off {}", check.name);
+            let button = ui
+                .add(Button::new(&label).icon(icons::RUN).enabled(can_run))
+                .on_hover_text(format!("Run `{}`, then sign off {} on this commit", check.local_command, check.name));
+            if button.clicked() {
+                app.runs.start(request(pr, check));
+            }
+        }
+        _ => {
+            let (label, kind) = if pr.ready {
+                ("Open pull request to merge", ButtonKind::Accent)
+            } else {
+                ("Open on GitHub", ButtonKind::Secondary)
+            };
+            if ui.add(Button::new(label).kind(kind).trailing_icon(icons::FORWARD)).clicked() {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.pr.url));
+            }
+        }
     }
     ui.add_space(space::S);
-    if pr.checked_out {
-        caption(ui, "Your checkout is on this commit.");
-    } else {
-        caption(ui, &format!("Check out {} to verify it locally.", pr.pr.head_ref));
-    }
+    let hint = match target {
+        _ if app.demo => "Demo: runs are simulated and nothing is signed off on GitHub.".to_owned(),
+        Some(check) if !check.configured => format!("Map a local command to {} in Settings to run it.", check.name),
+        _ if pr.checked_out => "Your checkout is on this commit.".to_owned(),
+        _ => format!("Check out {} at {} to verify it locally.", pr.pr.head_ref, glance::short_sha(&pr.pr.head_sha)),
+    };
+    caption(ui, &hint);
 }

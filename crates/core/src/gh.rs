@@ -310,6 +310,17 @@ impl Gh {
         }
     }
 
+    /// Pull request `number` in the repository at `dir`, read fresh, so a
+    /// signoff can confirm its head did not move while a command ran.
+    ///
+    /// # Errors
+    ///
+    /// When `gh pr view` fails.
+    pub fn pull_request(&self, dir: &Path, number: u64) -> Result<PrInfo, GhError> {
+        let number = number.to_string();
+        self.json::<RawPr>(Some(dir), &["pr", "view", &number, "--json", PULL_REQUEST_FIELDS]).map(RawPr::into_info)
+    }
+
     /// The open pull requests in the repository at `dir`: the user's own, or
     /// everyone's when `all`. The second value says the list was cut at
     /// [`PULL_REQUEST_LIMIT`].
@@ -544,6 +555,17 @@ mod tests {
         assert_eq!(info.default_branch, "master");
         assert_eq!(info.current_branch, "dependabot/github_actions/actions/checkout-7");
         assert_eq!(info.head_sha, "b3c837bd2fae5f34633831c84cd45a856d99a76e");
+    }
+
+    #[test]
+    fn reads_one_pull_request_by_number() {
+        let fake = Arc::new(FakeRunner::new(vec![ok(
+            "pr view 482",
+            r#"{"number":482,"title":"t","state":"OPEN","headRefOid":"3db401c9","headRefName":"f","baseRefName":"main"}"#,
+        )]));
+        let pr = gh(&fake).pull_request(Path::new("/repo"), 482).expect("pr");
+        assert_eq!((pr.number, pr.head_sha.as_str(), pr.state.as_str()), (482, "3db401c9", "OPEN"));
+        assert!(fake.called("--json number,title"));
     }
 
     /// The list must carry status state with it; a per-pull-request status

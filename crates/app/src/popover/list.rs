@@ -40,7 +40,10 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
         }
     });
     match action {
-        Some(Action::Page(page)) => app.glance.page = page,
+        Some(Action::Page(page)) => {
+            app.glance.page = page;
+            app.glance.check = None;
+        }
         None => {}
     }
 }
