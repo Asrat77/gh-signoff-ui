@@ -14,5 +14,8 @@ fastframe-fonts.workspace = true
 egui-phosphor.workspace = true
 fastframe-theme.workspace = true
 
+[dev-dependencies]
+eframe.workspace = true
+
 [lints]
 workspace = true

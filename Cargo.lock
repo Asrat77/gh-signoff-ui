@@ -2714,6 +2714,7 @@ dependencies = [
 name = "signoff-ui"
 version = "0.3.0"
 dependencies = [
+ "eframe",
  "egui",
  "egui-phosphor",
  "fastframe-fonts",
