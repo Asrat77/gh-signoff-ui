@@ -8,7 +8,7 @@ use signoff_ui::widgets::{Button, ButtonKind, ToggleRow, toast};
 use signoff_ui::{Status, Type, palette};
 
 use super::{Effects, Settings, parts};
-use crate::autostart;
+use crate::{autostart, hotkey};
 
 /// The refresh interval's bounds, in seconds, as the config accepts them.
 const REFRESH_RANGE: std::ops::RangeInclusive<u32> = 10..=3600;
@@ -27,6 +27,9 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
     ui.add_space(space::S);
 
     notifications(ui, settings);
+    ui.add_space(space::S);
+
+    shortcut(ui, settings, effects);
     ui.add_space(space::S);
 
     refresh_interval(ui, settings, effects);
@@ -71,6 +74,55 @@ fn refresh_interval(ui: &mut Ui, settings: &Settings, effects: &mut Effects) {
             "Signoff also reads again when you open the popover, if the last read is over 10 seconds old, or when you press refresh.",
         );
     });
+}
+
+fn shortcut(ui: &mut Ui, settings: &Settings, effects: &mut Effects) {
+    let (mut on, chosen) = settings.shortcut_config();
+    let current = hotkey::effective(&chosen).to_owned();
+    let hint = format!("Open or hide the popover from any app with {}.", hotkey::label(&current));
+    let editable = !settings.read_only();
+    let toggle = ui.add_enabled(editable, ToggleRow::new(&mut on, "Global shortcut", &hint));
+    let mut picked = current.clone();
+    if on {
+        parts::card(ui, |ui| {
+            let p = palette(ui.ctx());
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Shortcut").font(Type::Row.font()).color(p.text));
+                ui.add_enabled_ui(editable, |ui| {
+                    egui::ComboBox::from_id_salt("shortcut").selected_text(hotkey::label(&picked)).show_ui(ui, |ui| {
+                        for preset in hotkey::PRESETS {
+                            ui.selectable_value(&mut picked, preset.spec.to_owned(), hotkey::label(preset.spec));
+                        }
+                    });
+                });
+            });
+            match &settings.shortcut_status {
+                hotkey::Status::Unavailable(why) => parts::caption(ui, &format!("Not working: {why}.")),
+                _ => {
+                    if let Some(note) = hotkey::caveat() {
+                        parts::caption(ui, note);
+                    }
+                }
+            }
+        });
+    }
+    let config = settings.service.config();
+    let mut failed = None;
+    if toggle.changed()
+        && let Some(config) = config
+    {
+        failed = config.set_shortcut_enabled(on).err();
+        effects.shortcut = true;
+    }
+    if picked != current
+        && let Some(config) = config
+    {
+        failed = config.set_shortcut(&picked).err().or(failed);
+        effects.shortcut = true;
+    }
+    if let Some(err) = failed {
+        toast(ui.ctx(), err.to_string(), Status::Failing);
+    }
 }
 
 fn environment(ui: &mut Ui, state: &ProductState, installing: bool, can_install: bool, effects: &mut Effects) {

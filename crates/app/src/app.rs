@@ -16,6 +16,7 @@ use signoff_ui::widgets::toast;
 
 use crate::anchor::{self, Corner, POPOVER};
 use crate::checkouts::Checkouts;
+use crate::hotkey::Hotkeys;
 use crate::installer::Installer;
 use crate::notifier;
 use crate::popover::{self, Glance};
@@ -52,6 +53,8 @@ pub(crate) struct Signoff {
     auto_hidden_at: Option<Instant>,
     /// When the popover last asked for a refresh on opening.
     asked_at: Option<Instant>,
+    /// The global shortcut, where one was set up (never in tests).
+    hotkeys: Option<Hotkeys>,
     closing: Closed,
     show: bool,
     quit: bool,
@@ -105,10 +108,26 @@ impl Signoff {
             anchor: None,
             auto_hidden_at: None,
             asked_at: None,
+            hotkeys: None,
             closing: Closed::Hide,
             show: false,
             quit: false,
         }
+    }
+
+    /// Starts the global shortcut, as the config sets it.
+    pub(crate) fn with_hotkeys(mut self, hotkeys: Hotkeys) -> Self {
+        self.hotkeys = Some(hotkeys);
+        self.apply_shortcut();
+        self
+    }
+
+    /// Registers the shortcut the config now names, or drops it.
+    fn apply_shortcut(&mut self) {
+        let Some(hotkeys) = &mut self.hotkeys else { return };
+        let (enabled, shortcut) = self.settings.shortcut_config();
+        hotkeys.apply(enabled, &shortcut);
+        self.settings.shortcut_status = hotkeys.status().clone();
     }
 
     /// Whether a refresh is running.
@@ -200,6 +219,14 @@ impl Signoff {
             }
         }
 
+        // The global shortcut: show the popover, or hide it if it is in front.
+        if self.hotkeys.as_ref().is_some_and(Hotkeys::take_pressed) {
+            match ctx {
+                Some(ctx) if ctx.input(|i| i.viewport().focused.unwrap_or(false)) => self.hide(ctx),
+                _ => self.open(),
+            }
+        }
+
         // Settings jobs started from the popover finish with Settings closed.
         self.settings.installing = self.installer.running();
         if let Some(ctx) = ctx {
@@ -209,6 +236,9 @@ impl Signoff {
             }
             if effects.refresh {
                 self.refresh();
+            }
+            if effects.shortcut {
+                self.apply_shortcut();
             }
         }
         // The extension was installed (or not): say so, and probe `gh` again.

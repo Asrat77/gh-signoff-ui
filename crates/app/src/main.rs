@@ -11,6 +11,7 @@ mod autostart;
 mod checkouts;
 mod commands;
 mod glance;
+mod hotkey;
 mod installer;
 mod notifier;
 mod paths;
@@ -124,7 +125,13 @@ fn main() -> ExitCode {
         log::warn!("no tray is available; closing the window will quit");
     }
 
-    let app = app::Signoff::new(tray, refresher, runs, checkouts, installer, settings, args.demo);
+    // On this, the main thread: the OS delivers shortcut presses to the
+    // thread that registered them, and this is the one that runs the loop.
+    let hotkeys = {
+        let wake = waker.clone();
+        hotkey::Hotkeys::new(move || wake.wake())
+    };
+    let app = app::Signoff::new(tray, refresher, runs, checkouts, installer, settings, args.demo).with_hotkeys(hotkeys);
     let result = Shell::new(app, &waker).idle(fastframe_tray::idle).start_hidden(args.hidden).run(|lease| {
         let options = lease.peek(|app| app::native_options(app.is_popover(), app.anchor()));
         eframe::run_native("Signoff", options, Box::new(move |cc| Ok(app::window(cc, lease))))
