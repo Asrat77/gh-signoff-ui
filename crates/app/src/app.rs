@@ -11,8 +11,11 @@ use fastframe_shell::{Closed, Headless, Held, Lease, Resident};
 use fastframe_tray::{Event, Tray};
 use jiff::Timestamp;
 use signoff_core::{Health, ProductState};
+use signoff_ui::Status;
+use signoff_ui::widgets::toast;
 
 use crate::anchor::{self, Corner, POPOVER};
+use crate::checkouts::Checkouts;
 use crate::popover::{self, Glance};
 use crate::runs::Runs;
 use crate::settings::{self, Settings};
@@ -25,6 +28,8 @@ pub(crate) struct Signoff {
     refresher: Refresher,
     /// Verify-and-sign-off runs.
     pub(crate) runs: Runs,
+    /// "Check out this pull request" jobs.
+    pub(crate) checkouts: Checkouts,
     /// The latest state copied from the refresher.
     pub(crate) state: ProductState,
     seen: u64,
@@ -71,11 +76,19 @@ fn stale(fetched_at: Option<Timestamp>, now: Timestamp, refreshing: bool) -> boo
 }
 
 impl Signoff {
-    pub(crate) fn new(tray: Option<Tray>, refresher: Refresher, runs: Runs, settings: Settings, demo: bool) -> Self {
+    pub(crate) fn new(
+        tray: Option<Tray>,
+        refresher: Refresher,
+        runs: Runs,
+        checkouts: Checkouts,
+        settings: Settings,
+        demo: bool,
+    ) -> Self {
         Self {
             tray,
             refresher,
             runs,
+            checkouts,
             state: ProductState::default(),
             seen: 0,
             shown_health: None,
@@ -191,6 +204,22 @@ impl Signoff {
         // A signoff is already shown; read its repository to confirm it.
         for repo in self.runs.take_signed_off() {
             self.refresher.refresh_repository(&repo);
+        }
+        // A checkout moved a repository's head; read it to see the page flip.
+        for done in self.checkouts.take_finished() {
+            match done.result {
+                Ok(()) => {
+                    self.refresher.refresh_repository(&done.repo_id);
+                    if let Some(ctx) = ctx {
+                        toast(ctx, format!("Checked out #{}", done.number), Status::Ready);
+                    }
+                }
+                Err(message) => {
+                    if let Some(ctx) = ctx {
+                        toast(ctx, message, Status::Failing);
+                    }
+                }
+            }
         }
         if let Some(state) = self.refresher.changed_since(&mut self.seen) {
             self.state = state;

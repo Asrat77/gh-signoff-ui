@@ -393,7 +393,8 @@ fn demo_app() -> Signoff {
     let settings = Settings::new(service.clone(), || {});
     let refresher = worker::Refresher::spawn(service.clone(), || {});
     let runs = crate::runs::Runs::new(Arc::new(signoff_core::Verifier::demo(service.clone())), || {});
-    let mut app = Signoff::new(None, refresher, runs, settings, true);
+    let checkouts = crate::checkouts::Checkouts::new(Gh::default(), true, || {});
+    let mut app = Signoff::new(None, refresher, runs, checkouts, settings, true);
     app.state = service.refresh();
     app
 }
@@ -680,4 +681,141 @@ fn the_first_run_screen_lists_suggestions_and_adds_one() {
         !service.config().expect("config").snapshot().repositories.is_empty()
     });
     step_until(&mut harness, "the suggestion to go", |h| h.query_by_label("Found on this computer").is_none());
+}
+
+/// Opens the first demo pull request with `security` lacking a command.
+fn unmapped_security_page() -> Harness<'static, Signoff> {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.get_by_label_contains("Add label-based partial signoff").click();
+    harness.run_ok();
+    {
+        let app = harness.state_mut();
+        let pr = app.state.pull_requests.iter_mut().find(|pr| pr.pr.number == 482).expect("pull request");
+        let check = pr.checks.iter_mut().find(|check| check.name == "security").expect("check");
+        check.configured = false;
+        check.local_command.clear();
+    }
+    harness.run_ok();
+    harness
+}
+
+#[test]
+fn a_check_without_a_command_offers_to_configure_it() {
+    let mut harness = unmapped_security_page();
+    assert!(harness.query_by_label("Run & sign off security").is_none());
+    harness.get_by_label("Configure").click();
+    harness.run_ok();
+    assert!(harness.state().settings_open);
+    assert_eq!(harness.state().settings.section, settings::Section::Commands);
+}
+
+#[test]
+fn the_pages_button_configures_the_blocking_check() {
+    let mut harness = unmapped_security_page();
+    harness.get_by_label("Configure security").click();
+    harness.run_ok();
+    assert!(harness.state().settings_open);
+    assert_eq!(harness.state().settings.section, settings::Section::Commands);
+}
+
+#[test]
+fn configuring_a_check_selects_its_repository_and_offers_commands_from_the_checkout() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("package.json"), r#"{"scripts":{"build":"b","lint":"eslint .","test":"jest"}}"#)
+        .expect("package.json");
+    std::fs::write(dir.path().join("pnpm-lock.yaml"), "").expect("lockfile");
+    let other = tempfile::tempdir().expect("tempdir");
+    let mut second = tracked(other.path());
+    second.id = "repo2".into();
+    second.name_with_owner = "acme/gadgets".into();
+    let service = service(dir.path(), vec![second, tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.run_ok();
+    harness.state_mut().settings.configure_check("repo1", "lint");
+    harness.run_ok();
+
+    // The check has its row, with the command field focused.
+    harness.get_by_label("lint");
+    let field = harness.get_all_by_role(egui::accesskit::Role::TextInput).next().expect("a command field");
+    assert!(field.is_focused(), "the command field takes focus");
+    // The matching command comes first.
+    let chips: Vec<String> = harness
+        .get_all_by_role(egui::accesskit::Role::Button)
+        .filter_map(|node| node.accesskit_node().label())
+        .filter(|label| label.starts_with("pnpm run"))
+        .collect();
+    assert_eq!(chips, ["pnpm run lint", "pnpm run build", "pnpm run test"]);
+
+    harness.get_by_label("pnpm run lint").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("pnpm run build").is_none(), "suggestions go once the field is filled");
+    harness.get_by_label("Save commands").click();
+    harness.run_ok();
+    let repo = service.config().expect("config").find_repository("repo1").expect("repo");
+    assert_eq!(repo.commands["lint"].command, "pnpm run lint");
+}
+
+/// A popover harness on the demo data where `gh` and `git` answer through
+/// `script`, as outside demo mode, opened on the pull request that is not
+/// checked out.
+fn unchecked_page(script: Arc<Script>) -> Harness<'static, Signoff> {
+    let mut app = demo_app();
+    app.demo = false;
+    app.checkouts = crate::checkouts::Checkouts::new(Gh::new(script), false, || {});
+    let (repo_id, number) = {
+        let pr = app.state.pull_requests.iter().find(|pr| !pr.checked_out).expect("an unchecked pull request");
+        (pr.repo_id.clone(), pr.pr.number)
+    };
+    app.glance.page = popover::Page::PullRequest { repo_id, number };
+    Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+        |ui, app: &mut Signoff| {
+            if installed(ui.ctx()) {
+                app.tick(Some(ui.ctx()));
+                popover::show(ui, app);
+            }
+        },
+        app,
+    )
+}
+
+#[test]
+fn a_pull_request_that_is_not_checked_out_offers_to_check_it_out() {
+    let script = Arc::new(Script::default().reply("status --porcelain", "").reply("pr checkout", ""));
+    let mut harness = unchecked_page(script.clone());
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("Run & sign off").is_none());
+    harness.get_by_label("Check out #485").click();
+    step_until(&mut harness, "gh pr checkout to run", |_| {
+        script.calls().iter().any(|(line, _)| line.contains("gh pr checkout 485"))
+    });
+    let lines: Vec<String> = script.calls().into_iter().map(|(line, _)| line).collect();
+    assert_eq!(lines, ["git status --porcelain --untracked-files=no", "gh pr checkout 485"]);
+}
+
+#[test]
+fn a_dirty_checkout_is_refused_with_a_reason_and_gh_never_runs() {
+    let script = Arc::new(Script::default().reply("status --porcelain", " M src/lib.rs").reply("pr checkout", ""));
+    let mut harness = unchecked_page(script.clone());
+    harness.run_ok();
+    harness.get_by_label("Check out #485").click();
+    step_until(&mut harness, "the refusal", |h| h.query_by_label_contains("uncommitted change").is_some());
+    harness.get_by_label("Check out #485");
+    assert!(!script.calls().iter().any(|(line, _)| line.contains("pr checkout")));
+}
+
+#[test]
+fn the_demo_simulates_a_checkout_and_then_offers_to_run() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    {
+        let app = harness.state_mut();
+        let pr = app.state.pull_requests.iter().find(|pr| !pr.checked_out).expect("an unchecked pull request");
+        let (repo_id, number) = (pr.repo_id.clone(), pr.pr.number);
+        app.glance.page = popover::Page::PullRequest { repo_id, number };
+    }
+    harness.run_ok();
+    harness.get_by_label("Check out #485").click();
+    step_until(&mut harness, "the simulated checkout", |h| h.query_by_label_contains("Run & sign off").is_some());
 }

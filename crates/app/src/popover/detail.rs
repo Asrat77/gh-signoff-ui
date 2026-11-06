@@ -14,6 +14,7 @@ use signoff_ui::{Status, Type, icons, palette};
 use super::Page;
 use super::parts::{band, caption, height_above, notice, refresh_button};
 use crate::app::Signoff;
+use crate::checkouts::Checkout;
 use crate::glance;
 use crate::runs::RunView;
 
@@ -84,6 +85,12 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
                     if check_row(ui, app, &pr, check, target.as_ref()).clicked() && check.configured {
                         app.glance.check = Some(check.name.clone());
                     }
+                    if !check.configured && check.state != CheckState::Success {
+                        let chip = Chip::new("Configure").icon(icons::TERMINAL);
+                        if ui.add(chip).on_hover_text(format!("Map a local command to {}", check.name)).clicked() {
+                            configure(app, &pr, &check.name);
+                        }
+                    }
                 }
                 if let (Some(check), Some(run)) = (&target, &run) {
                     ui.add_space(space::XS);
@@ -136,6 +143,21 @@ fn target<'a>(app: &Signoff, pr: &'a PullRequestState) -> Option<&'a Check> {
         return Some(check);
     }
     required.find(|check| pr.blocking.as_deref() == Some(&check.name) && check.configured)
+}
+
+/// The check the merge waits on when it has no local command and no other
+/// check is picked: the page's button then offers to set one up.
+fn to_configure<'a>(pr: &'a PullRequestState, target: Option<&Check>) -> Option<&'a Check> {
+    if target.is_some() {
+        return None;
+    }
+    glance::required(pr).find(|check| pr.blocking.as_deref() == Some(&check.name) && !check.configured)
+}
+
+/// Opens Settings → Commands on `check` of this pull request's repository.
+fn configure(app: &mut Signoff, pr: &PullRequestState, check: &str) {
+    app.settings.configure_check(&pr.repo_id, check);
+    app.settings_open = true;
 }
 
 /// The run request for `check` on `pr`.
@@ -219,8 +241,11 @@ fn problems(ui: &mut Ui, pr: &PullRequestState) {
 
 /// The page's main button: run and sign off the target check, stop it
 /// while it runs, or open a ready pull request to merge.
-fn actions(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) {
-    let can_run = app.demo || pr.checked_out;
+fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) {
+    let number = pr.pr.number;
+    let checkout = app.checkouts.view(&pr.repo_id, number);
+    let at_head = pr.checked_out || app.checkouts.simulated(&pr.repo_id, number);
+    let unmapped = to_configure(pr, target);
     match (target, run) {
         (Some(check), Some(run)) if run.running() => {
             let label = format!("Stop {}", check.name);
@@ -228,13 +253,22 @@ fn actions(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, target: Option<&Ch
                 app.runs.stop(&request(pr, check));
             }
         }
+        (Some(check), _) if check.configured && check.state != CheckState::Success && !at_head => {
+            check_out_button(ui, app, pr, checkout.as_ref());
+        }
         (Some(check), _) if check.configured && check.state != CheckState::Success => {
             let label = format!("Run & sign off {}", check.name);
             let button = ui
-                .add(Button::new(&label).icon(icons::RUN).enabled(can_run))
+                .add(Button::new(&label).icon(icons::RUN))
                 .on_hover_text(format!("Run `{}`, then sign off {} on this commit", check.local_command, check.name));
             if button.clicked() {
                 app.runs.start(request(pr, check));
+            }
+        }
+        _ if unmapped.is_some() => {
+            let name = unmapped.map(|check| check.name.as_str()).unwrap_or_default();
+            if ui.add(Button::new(&format!("Configure {name}")).icon(icons::TERMINAL)).clicked() {
+                configure(app, pr, name);
             }
         }
         _ => {
@@ -249,11 +283,43 @@ fn actions(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, target: Option<&Ch
         }
     }
     ui.add_space(space::S);
-    let hint = match target {
-        _ if app.demo => "Demo: runs are simulated and nothing is signed off on GitHub.".to_owned(),
-        Some(check) if !check.configured => format!("Map a local command to {} in Settings to run it.", check.name),
-        _ if pr.checked_out => "Your checkout is on this commit.".to_owned(),
-        _ => format!("Check out {} at {} to verify it locally.", pr.pr.head_ref, glance::short_sha(&pr.pr.head_sha)),
+    let hint = match checkout {
+        Some(Checkout::Failed(message)) => message,
+        Some(Checkout::Running) => format!("Running gh pr checkout {number}…"),
+        _ => hint(app, pr, target, unmapped),
     };
     caption(ui, &hint);
+}
+
+/// The button that checks out the pull request, disabled while that runs.
+fn check_out_button(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, checkout: Option<&Checkout>) {
+    let number = pr.pr.number;
+    let (label, busy) = match checkout {
+        Some(Checkout::Running) => (format!("Checking out #{number}…"), true),
+        Some(Checkout::Done) => (format!("Reading #{number}…"), true),
+        _ => (format!("Check out #{number}"), false),
+    };
+    let button = Button::new(&label).icon(if busy { icons::RUNNING } else { icons::BRANCH }).enabled(!busy);
+    let button = ui.add(button).on_hover_text(format!(
+        "Run `gh pr checkout {number}` in {}; refused if tracked files have uncommitted changes",
+        pr.repo_path.display()
+    ));
+    if button.clicked() {
+        app.checkouts.start(&pr.repo_id, number, pr.repo_path.clone());
+    }
+}
+
+/// The line under the main button when nothing is running or failed.
+fn hint(app: &Signoff, pr: &PullRequestState, target: Option<&Check>, unmapped: Option<&Check>) -> String {
+    match target {
+        _ if app.demo => "Demo: runs are simulated and nothing is signed off on GitHub.".to_owned(),
+        _ if unmapped.is_some() => {
+            format!(
+                "Map a local command to {} to run it from here.",
+                unmapped.map(|c| c.name.as_str()).unwrap_or_default()
+            )
+        }
+        _ if pr.checked_out => "Your checkout is on this commit.".to_owned(),
+        _ => format!("Check out {} at {} to verify it locally.", pr.pr.head_ref, glance::short_sha(&pr.pr.head_sha)),
+    }
 }
