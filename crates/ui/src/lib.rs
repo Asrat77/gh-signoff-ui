@@ -15,3 +15,4 @@ pub use status::Status;
 pub mod theme;
 
 pub use theme::{ThemeMode, install, palette};
+pub mod widgets;
