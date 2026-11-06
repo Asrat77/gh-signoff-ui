@@ -21,24 +21,6 @@ pub const MAX_TIMEOUT_SECONDS: u32 = 7200;
 /// The timeout of a mapped command that names none.
 pub const DEFAULT_TIMEOUT_SECONDS: u32 = 1800;
 
-/// Which open pull requests a repository shows.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase", from = "String")]
-pub enum PullRequestScope {
-    /// The user's own.
-    #[default]
-    Mine,
-    /// Everyone's.
-    All,
-}
-
-impl From<String> for PullRequestScope {
-    /// Anything but `all` is `mine`, as before.
-    fn from(value: String) -> Self {
-        if value == "all" { Self::All } else { Self::Mine }
-    }
-}
-
 /// The local work that must succeed before a signoff is written. The command
 /// is the user's, runs in the tracked checkout, and is never taken from
 /// anywhere but the config.
@@ -65,8 +47,6 @@ pub struct TrackedRepository {
     pub default_branch: String,
     /// Whether it is refreshed.
     pub enabled: bool,
-    /// Whose pull requests it shows.
-    pub pull_request_scope: PullRequestScope,
     /// Local commands by check name (`tests`, `lint`…).
     pub commands: BTreeMap<String, CommandMapping>,
 }
@@ -77,8 +57,6 @@ pub struct TrackedRepository {
 pub struct RepositoryUpdate {
     /// Whether it is refreshed.
     pub enabled: bool,
-    /// Whose pull requests it shows.
-    pub pull_request_scope: PullRequestScope,
     /// Local commands by check name.
     pub commands: BTreeMap<String, CommandMapping>,
 }
@@ -278,7 +256,6 @@ impl ConfigStore {
             name_with_owner: info.name_with_owner,
             default_branch: info.default_branch,
             enabled: true,
-            pull_request_scope: PullRequestScope::Mine,
             commands: BTreeMap::new(),
         };
         repo.normalize();
@@ -300,7 +277,6 @@ impl ConfigStore {
         self.change(|config| {
             let repo = config.repositories.iter_mut().find(|r| r.id == id).ok_or(ConfigError::NotFound)?;
             repo.enabled = update.enabled;
-            repo.pull_request_scope = update.pull_request_scope;
             repo.commands = update.commands;
             repo.normalize();
             Ok(repo.clone())
@@ -384,7 +360,6 @@ mod tests {
             name_with_owner: "acme/example".into(),
             default_branch: "main".into(),
             enabled: true,
-            pull_request_scope: PullRequestScope::All,
             commands: BTreeMap::from([(
                 "tests".into(),
                 CommandMapping { command: "bin/test".into(), timeout_seconds: 90 },
@@ -439,11 +414,34 @@ mod tests {
         let config = ConfigStore::open(&path).expect("open").snapshot();
         assert_eq!(config.refresh_seconds, 30, "below 10 falls back to the default");
         let repo = &config.repositories[0];
-        assert_eq!(repo.pull_request_scope, PullRequestScope::Mine);
+        assert_eq!(repo.name_with_owner, "o/r", "the retired scope field is ignored");
         assert_eq!(
             repo.commands["tests"],
             CommandMapping { command: "bin/test".into(), timeout_seconds: DEFAULT_TIMEOUT_SECONDS }
         );
+    }
+
+    /// A file written before the scope was dropped keeps loading, and saving
+    /// it does not bring the field back.
+    #[test]
+    fn an_old_scope_field_is_ignored_and_not_written_back() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"refreshSeconds":30,"repositories":[{"id":"a","path":"/w/a","nameWithOwner":"o/a",
+            "defaultBranch":"main","enabled":true,"pullRequestScope":"all"},
+            {"id":"b","path":"/w/b","nameWithOwner":"o/b","defaultBranch":"main","enabled":false,"pullRequestScope":"mine"}]}"#,
+        )
+        .expect("write");
+        let store = ConfigStore::open(&path).expect("open");
+        let repos = store.snapshot().repositories;
+        assert_eq!(repos.len(), 2);
+        assert!(repos[0].enabled && !repos[1].enabled);
+        store.set_refresh_seconds(60).expect("save");
+        assert!(store.flush(), "written");
+        assert!(!std::fs::read_to_string(&path).expect("read").contains("pullRequestScope"));
+        assert_eq!(ConfigStore::open(&path).expect("reload").snapshot().repositories, repos);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use jiff::{SignedDuration, Timestamp};
 
 use crate::checks::{Check, CheckState, Rules, build_install_command, category_for, signoff_command};
-use crate::config::{CommandMapping, PullRequestScope};
+use crate::config::CommandMapping;
 use crate::gh::{Environment, PrInfo};
 use crate::history::{ActivityEvent, ActivityKind};
 use crate::product::{ProductState, PullRequestState, RepositoryState, summarize};
@@ -84,7 +84,6 @@ pub fn product_state(now: Timestamp) -> ProductState {
             current_branch: "feature/partial-checks".into(),
             current_sha: "3db401c".into(),
             enabled: true,
-            pull_request_scope: PullRequestScope::Mine,
             commands: commands(&["tests", "lint", "security"]),
             pull_request_count: 2,
             ..RepositoryState::default()
@@ -95,7 +94,6 @@ pub fn product_state(now: Timestamp) -> ProductState {
             name_with_owner: "rails/rails".into(),
             default_branch: "main".into(),
             enabled: true,
-            pull_request_scope: PullRequestScope::Mine,
             commands: commands(&["tests"]),
             pull_request_count: 1,
             ..RepositoryState::default()
