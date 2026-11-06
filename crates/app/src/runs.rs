@@ -5,7 +5,7 @@
 //! and the UI is woken as lines arrive.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
@@ -49,15 +49,15 @@ struct Slot {
 pub(crate) struct Runs {
     verifier: Arc<Verifier>,
     slots: Arc<Mutex<Vec<Slot>>>,
-    /// Bumped when a run signs off, so the app knows to refresh.
-    signed_off: Arc<AtomicU64>,
-    seen_signed_off: u64,
+    /// Repositories a run signed off on since the app last looked, so it
+    /// reads them again.
+    signed_off: Arc<Mutex<Vec<String>>>,
     wake: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl Runs {
     pub(crate) fn new(verifier: Arc<Verifier>, wake: impl Fn() + Send + Sync + 'static) -> Self {
-        Self { verifier, slots: Arc::default(), signed_off: Arc::default(), seen_signed_off: 0, wake: Arc::new(wake) }
+        Self { verifier, slots: Arc::default(), signed_off: Arc::default(), wake: Arc::new(wake) }
     }
 
     /// Starts verifying `request` unless it is already running.
@@ -98,7 +98,7 @@ impl Runs {
                 VerifyEvent::Line(line) => update(&mut |view| view.push(line.clone())),
             });
             if result.as_ref().is_ok_and(Outcome::signed_off) {
-                signed_off.fetch_add(1, Ordering::AcqRel);
+                signed_off.lock().unwrap_or_else(PoisonError::into_inner).push(request.repo_id.clone());
             }
             let result = result.map_err(|err| err.to_string());
             update(&mut |view| view.result = Some(result.clone()));
@@ -130,12 +130,12 @@ impl Runs {
         slots.iter().rev().find(|s| &s.view.request == request).map(|s| s.view.clone())
     }
 
-    /// Whether a run signed off since the last call.
-    pub(crate) fn take_signed_off(&mut self) -> bool {
-        let now = self.signed_off.load(Ordering::Acquire);
-        let changed = now != self.seen_signed_off;
-        self.seen_signed_off = now;
-        changed
+    /// The repositories a run signed off on since the last call.
+    pub(crate) fn take_signed_off(&self) -> Vec<String> {
+        let mut repos = std::mem::take(&mut *self.signed_off.lock().unwrap_or_else(PoisonError::into_inner));
+        repos.sort();
+        repos.dedup();
+        repos
     }
 
     /// Stops every run, for quitting.

@@ -188,9 +188,9 @@ impl Signoff {
             self.refresh();
         }
 
-        // A signoff changes GitHub's statuses; show them.
-        if self.runs.take_signed_off() {
-            self.refresh();
+        // A signoff is already shown; read its repository to confirm it.
+        for repo in self.runs.take_signed_off() {
+            self.refresher.refresh_repository(&repo);
         }
         if let Some(state) = self.refresher.changed_since(&mut self.seen) {
             self.state = state;

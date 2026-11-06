@@ -5,7 +5,7 @@
 //!
 //! - **The scheduler** decides when to read: everything on start, every
 //!   `refreshSeconds` and when asked; one repository when the config
-//!   changes it. Config changes are also applied
+//!   changes it or a signoff lands on it. Config changes are also applied
 //!   to the state at once, before anything is read.
 //! - **Readers**, a few of them, take jobs from a queue that drops
 //!   duplicates and puts single-repository reads first. A full refresh is a
@@ -35,6 +35,8 @@ enum Command {
     Refresh {
         recheck: bool,
     },
+    /// Read one repository soon.
+    Repository(String),
     /// The config changed: patch the state, then read what needs it.
     ConfigChanged,
     Quit,
@@ -197,6 +199,11 @@ impl Refresher {
         let _ = self.commands.send(Command::Refresh { recheck: true });
     }
 
+    /// Asks for one repository to be read again, ahead of other reads.
+    pub(crate) fn refresh_repository(&self, id: &str) {
+        let _ = self.commands.send(Command::Repository(id.to_owned()));
+    }
+
     /// Whether anything is being read or waits to be.
     pub(crate) fn is_refreshing(&self) -> bool {
         self.queue.lock().busy() || self.service.is_refreshing()
@@ -251,6 +258,7 @@ fn schedule(service: &ProductService, queue: &Queue, inbox: &mpsc::Receiver<Comm
                 queue.update(|jobs| jobs.plan(false));
                 next = Instant::now() + interval(service);
             }
+            Ok(Command::Repository(id)) => queue.update(|jobs| jobs.read(id, true)),
             Ok(Command::ConfigChanged) => {
                 let ids = service.sync_config();
                 queue.update(|jobs| ids.into_iter().for_each(|id| jobs.read(id, true)));
