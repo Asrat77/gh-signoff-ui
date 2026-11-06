@@ -457,6 +457,34 @@ impl Gh {
         }
         Ok(())
     }
+
+    /// Checks out pull request `number` in the checkout at `dir` with
+    /// `gh pr checkout`, unless tracked files have uncommitted changes
+    /// (untracked files are fine: a checkout never overwrites them without
+    /// failing).
+    ///
+    /// # Errors
+    ///
+    /// A message for the user: the tree is dirty, or `git` or `gh` failed.
+    pub fn check_out_pull_request(&self, dir: &Path, number: u64) -> Result<(), String> {
+        let detail = |err: &GhError, fallback: &str| {
+            err.message().filter(|message| !message.is_empty()).unwrap_or(fallback).to_owned()
+        };
+        let status = self
+            .exec(Some(dir), "git", &["status", "--porcelain", "--untracked-files=no"])
+            .map_err(|err| format!("could not read the working tree: {}", detail(&err, "git status failed")))?;
+        if !status.trim().is_empty() {
+            let changed = status.lines().filter(|line| !line.trim().is_empty()).count();
+            let (plural, them) = if changed == 1 { ("", "it") } else { ("s", "them") };
+            return Err(format!(
+                "this checkout has {changed} uncommitted change{plural}; commit or stash {them} first, then check out #{number}"
+            ));
+        }
+        let arg = number.to_string();
+        self.exec(Some(dir), "gh", &["pr", "checkout", &arg])
+            .map(drop)
+            .map_err(|err| format!("could not check out #{number}: {}", detail(&err, "gh pr checkout failed")))
+    }
 }
 
 /// The first eight characters of a commit id.
@@ -790,5 +818,38 @@ mod tests {
         let gh = Gh::default();
         assert_eq!(gh.require_checked_out_commit(dir.path(), &sha), Ok(()));
         assert!(gh.require_checked_out_commit(dir.path(), &"0".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn checking_out_a_pull_request_runs_gh_in_a_clean_tree() {
+        let fake = Arc::new(FakeRunner::new(vec![ok("status --porcelain", ""), ok("pr checkout 482", "")]));
+        assert_eq!(gh(&fake).check_out_pull_request(Path::new("/repo"), 482), Ok(()));
+        assert_eq!(
+            fake.commands(),
+            ["git status --porcelain --untracked-files=no", "gh pr checkout 482"],
+            "tracked changes only: untracked files do not block a checkout"
+        );
+    }
+
+    #[test]
+    fn a_dirty_tree_is_refused_before_gh_runs() {
+        let fake = Arc::new(FakeRunner::new(vec![ok("status --porcelain", " M src/main.rs\nA  new.rs")]));
+        let err = gh(&fake).check_out_pull_request(Path::new("/repo"), 7).expect_err("dirty");
+        assert!(err.contains("2 uncommitted changes") && err.contains("#7"), "{err}");
+        assert!(!fake.called("pr checkout"), "gh must not run: {:?}", fake.commands());
+    }
+
+    #[test]
+    fn checkout_failures_carry_gits_or_ghs_message() {
+        let fake = Arc::new(FakeRunner::new(vec![fail("status --porcelain", "fatal: not a git repository")]));
+        let err = gh(&fake).check_out_pull_request(Path::new("/repo"), 1).expect_err("git");
+        assert!(err.contains("not a git repository"), "{err}");
+
+        let fake = Arc::new(FakeRunner::new(vec![
+            ok("status --porcelain", ""),
+            fail("pr checkout", "error: Your local changes would be overwritten"),
+        ]));
+        let err = gh(&fake).check_out_pull_request(Path::new("/repo"), 1).expect_err("gh");
+        assert!(err.contains("could not check out #1") && err.contains("would be overwritten"), "{err}");
     }
 }
