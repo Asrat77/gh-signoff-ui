@@ -29,6 +29,8 @@ jiff.workspace = true
 log.workspace = true
 env_logger.workspace = true
 directories = "6"
+# The folder picker for adding a checkout.
+rfd = "0.15"
 
 [lints]
 workspace = true
