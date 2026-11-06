@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::checks::{
     self, Check, CheckState, Rules, display_name, is_signoff_context, latest_signoffs, resolve_checks, rules_for, tally,
 };
-use crate::config::{AppConfig, CommandMapping, ConfigStore, PullRequestScope, TrackedRepository};
+use crate::config::{AppConfig, CommandMapping, ConfigStore, TrackedRepository};
 use crate::gh::{CommitStatus, Environment, Gh, PrInfo, ProtectionStatus, RepoInfo, same_contexts};
 use crate::history::{ActivityEvent, ActivityKind, HistoryStore};
 
@@ -84,8 +84,6 @@ pub struct RepositoryState {
     pub current_sha: String,
     /// Whether it is refreshed.
     pub enabled: bool,
-    /// Whose pull requests it shows.
-    pub pull_request_scope: PullRequestScope,
     /// Local commands by check name.
     pub commands: BTreeMap<String, CommandMapping>,
     /// Open pull requests shown.
@@ -341,7 +339,6 @@ fn build_repository_state(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCa
         name_with_owner: tracked.name_with_owner.clone(),
         default_branch: tracked.default_branch.clone(),
         enabled: tracked.enabled,
-        pull_request_scope: tracked.pull_request_scope,
         commands: tracked.commands.clone(),
         ..RepositoryState::default()
     };
@@ -361,7 +358,7 @@ fn build_repository_state(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCa
     view.current_branch.clone_from(&info.current_branch);
     view.current_sha.clone_from(&info.head_sha);
 
-    let (prs, truncated) = match gh.pull_requests(&tracked.path, tracked.pull_request_scope == PullRequestScope::All) {
+    let (prs, truncated) = match gh.pull_requests(&tracked.path) {
         Ok(found) => found,
         Err(err) => {
             view.error = Some(err.to_string());

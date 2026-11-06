@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use egui::{Align, Layout, RichText, Ui};
 use signoff_core::config::TrackedRepository;
-use signoff_core::{ProductState, PullRequestScope, RepositoryUpdate};
+use signoff_core::{Health, ProductState, RepositoryUpdate};
 use signoff_ui::theme::space;
-use signoff_ui::widgets::{AddButton, Button, ButtonKind, Chip, IconButton, IconButtonKind, spinner, toast};
+use signoff_ui::widgets::{AddButton, Button, ButtonKind, Switch, spinner, toast};
 use signoff_ui::{Status, Type, icons, palette};
 
 use super::{Effects, Settings, parts};
@@ -48,7 +48,10 @@ struct Row {
     name_with_owner: String,
     default_branch: String,
     enabled: bool,
-    scope: PullRequestScope,
+    /// Open pull requests the last refresh found.
+    pull_requests: usize,
+    /// Of those, the failing ones.
+    failing: usize,
     /// A refresh has read it since it was added.
     read: bool,
     /// Why the last refresh could not read it.
@@ -71,11 +74,51 @@ fn rows(settings: &Settings, state: &ProductState) -> Vec<Row> {
                 name_with_owner: repo.name_with_owner.clone(),
                 default_branch: repo.default_branch.clone(),
                 enabled: repo.enabled,
-                scope: repo.pull_request_scope,
+                pull_requests: repo.pull_request_count,
+                failing: failing(state, &repo.id),
                 read: true,
                 error: repo.error.clone(),
             })
             .collect(),
+    }
+}
+
+/// How many of the repository's pull requests are failing.
+fn failing(state: &ProductState, id: &str) -> usize {
+    state.pull_requests.iter().filter(|pr| pr.repo_id == id && pr.status == Health::Failing).count()
+}
+
+/// The line under a row's path: what the last refresh found, or why not.
+fn status_line(repo: &Row) -> (String, Status) {
+    if !repo.enabled {
+        return ("Paused".into(), Status::Neutral);
+    }
+    if let Some(error) = &repo.error {
+        return (error.clone(), Status::Failing);
+    }
+    if !repo.read {
+        return ("Reading…".into(), Status::Neutral);
+    }
+    let noun = if repo.pull_requests == 1 { "open PR" } else { "open PRs" };
+    let mut line = match repo.pull_requests {
+        0 => "No open PRs".to_owned(),
+        n => format!("{n} {noun}"),
+    };
+    if repo.failing > 0 {
+        line.push_str(&format!(" · {} failing", repo.failing));
+        return (line, Status::Failing);
+    }
+    (line, Status::Neutral)
+}
+
+/// The name of the OS file manager, for the button that opens a folder in it.
+const fn file_manager() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Finder"
+    } else if cfg!(target_os = "windows") {
+        "Explorer"
+    } else {
+        "Files"
     }
 }
 
@@ -90,7 +133,8 @@ fn merge_rows(tracked: &[TrackedRepository], state: &ProductState) -> Vec<Row> {
                 name_with_owner: repo.name_with_owner.clone(),
                 default_branch: repo.default_branch.clone(),
                 enabled: repo.enabled,
-                scope: repo.pull_request_scope,
+                pull_requests: read.map_or(0, |r| r.pull_request_count),
+                failing: failing(state, &repo.id),
                 read: read.is_some(),
                 error: read.and_then(|r| r.error.clone()),
             }
@@ -102,13 +146,46 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row, effects: &mut Effects) 
     let read_only = settings.read_only();
     parts::card(ui, |ui| {
         let p = palette(ui.ctx());
+        let mut watching = repo.enabled;
         ui.horizontal(|ui| {
             ui.label(RichText::new(icons::REPOSITORY).font(signoff_ui::fonts::icon(18.0)).color(p.secondary));
             ui.vertical(|ui| {
                 ui.label(RichText::new(&repo.name_with_owner).font(Type::Row.font()).color(p.text));
                 ui.label(RichText::new(repo.path.display().to_string()).font(Type::Mono.font()).color(p.secondary));
+                let (line, status) = status_line(repo);
+                let color = if status == Status::Neutral { p.secondary } else { status.color(&p) };
+                ui.add(egui::Label::new(RichText::new(line).font(Type::Caption.font()).color(color)).wrap());
             });
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let switch = ui.add_enabled(!read_only, Switch::new(&mut watching, "Watching"));
+                switch.on_hover_text("Refresh this repository's pull requests, or pause it");
+            });
+        });
+        ui.add_space(space::S);
+        ui.horizontal_wrapped(|ui| {
+            if ui
+                .add(Button::new("Open on GitHub").kind(ButtonKind::Secondary).compact().width(130.0))
+                .on_hover_text("Open this repository in your browser")
+                .clicked()
+            {
+                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://github.com/{}", repo.name_with_owner)));
+            }
+            let manager = format!("Show in {}", file_manager());
+            if ui
+                .add(Button::new(&manager).kind(ButtonKind::Secondary).compact().width(130.0))
+                .on_hover_text("Open the checkout's folder")
+                .clicked()
+            {
+                show_folder(ui, &repo.path);
+            }
+            ui.add_enabled_ui(!read_only, |ui| {
+                if ui
+                    .add(Button::new("Set up signoff").kind(ButtonKind::Secondary).compact().width(130.0))
+                    .on_hover_text("Require the signoff check on this repository's default branch")
+                    .clicked()
+                {
+                    settings.set_up_signoff(&repo.id, &repo.default_branch);
+                }
                 if settings.repositories.confirm_remove.as_deref() == Some(repo.id.as_str()) {
                     if ui.add(Button::new("Remove").kind(ButtonKind::Accent).compact().width(84.0)).clicked() {
                         settings.repositories.confirm_remove = None;
@@ -118,65 +195,28 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row, effects: &mut Effects) 
                         settings.repositories.confirm_remove = None;
                     }
                 } else if ui
-                    .add_enabled(
-                        !read_only,
-                        IconButton::new(icons::REMOVE, "Stop tracking").kind(IconButtonKind::OnSheet),
-                    )
+                    .add(Button::new("Stop tracking").kind(ButtonKind::Secondary).compact().width(130.0))
+                    .on_hover_text("Stop showing this repository's pull requests")
                     .clicked()
                 {
                     settings.repositories.confirm_remove = Some(repo.id.clone());
                 }
             });
         });
-        ui.add_space(space::S);
-        let mut change = None;
-        ui.horizontal(|ui| {
-            ui.add_enabled_ui(!read_only, |ui| {
-                let mine = repo.scope == PullRequestScope::Mine;
-                if ui.add(Chip::new("My pull requests").selected(mine)).clicked() {
-                    change = Some(Change::Scope(PullRequestScope::Mine));
-                }
-                if ui.add(Chip::new("Everyone's").selected(!mine)).clicked() {
-                    change = Some(Change::Scope(PullRequestScope::All));
-                }
-                ui.add_space(space::M);
-                let (label, icon) = if repo.enabled { ("Watching", icons::CHECK) } else { ("Paused", icons::STOP) };
-                let chip = ui.add(Chip::new(label).icon(icon).selected(repo.enabled));
-                if chip.on_hover_text("Pause or resume refreshing this repository").clicked() {
-                    change = Some(Change::Enabled(!repo.enabled));
-                }
-            });
-        });
-        ui.add_space(space::XS);
-        if ui
-            .add(Button::new("Set up signoff").kind(ButtonKind::Secondary).compact().width(130.0))
-            .on_hover_text("Require the signoff check on this repository's default branch")
-            .clicked()
-        {
-            settings.set_up_signoff(&repo.id, &repo.default_branch);
-        }
-        if let Some(change) = change {
-            update_repository(ui, settings, &repo.id, |update| match change {
-                Change::Scope(scope) => update.pull_request_scope = scope,
-                Change::Enabled(enabled) => update.enabled = enabled,
-            });
+        if watching != repo.enabled {
+            update_repository(ui, settings, &repo.id, |update| update.enabled = watching);
             effects.refresh = true;
-        }
-        if let Some(error) = &repo.error {
-            ui.add_space(space::XS);
-            ui.label(RichText::new(error).font(Type::Caption.font()).color(Status::Failing.color(&p)));
-        } else if !repo.read && repo.enabled {
-            ui.add_space(space::XS);
-            ui.label(RichText::new("Reading…").font(Type::Caption.font()).color(p.secondary));
         }
     });
 }
 
-/// A change to one of a repository's settings.
-#[derive(Clone, Copy)]
-enum Change {
-    Scope(PullRequestScope),
-    Enabled(bool),
+/// Opens `path` in the system file manager.
+fn show_folder(ui: &Ui, path: &std::path::Path) {
+    if !path.is_dir() {
+        toast(ui.ctx(), format!("{} is not there any more", path.display()), Status::Failing);
+    } else if let Err(err) = open::that_detached(path) {
+        toast(ui.ctx(), format!("Could not open {}: {err}", path.display()), Status::Failing);
+    }
 }
 
 /// Saves a change to the editable settings of the repository `id`.
@@ -186,11 +226,7 @@ pub(super) fn update_repository(ui: &Ui, settings: &Settings, id: &str, change: 
         toast(ui.ctx(), "That repository is no longer tracked", Status::Failing);
         return;
     };
-    let mut update = RepositoryUpdate {
-        enabled: current.enabled,
-        pull_request_scope: current.pull_request_scope,
-        commands: current.commands,
-    };
+    let mut update = RepositoryUpdate { enabled: current.enabled, commands: current.commands };
     change(&mut update);
     if let Err(err) = config.update_repository(id, update) {
         toast(ui.ctx(), err.to_string(), Status::Failing);
@@ -293,7 +329,6 @@ mod tests {
             id: id.into(),
             name_with_owner: format!("acme/{id}"),
             enabled,
-            pull_request_scope: PullRequestScope::All,
             ..TrackedRepository::default()
         }
     }
@@ -302,11 +337,10 @@ mod tests {
     fn rows_follow_the_config_and_borrow_errors_from_the_last_read() {
         let state = ProductState {
             repositories: vec![
-                // Stale: the config says paused and "Everyone's" now.
+                // Stale: the config says paused now.
                 RepositoryState {
                     id: "a".into(),
                     enabled: true,
-                    pull_request_scope: PullRequestScope::Mine,
                     error: Some("gh failed".into()),
                     ..RepositoryState::default()
                 },
@@ -318,13 +352,37 @@ mod tests {
         let rows = merge_rows(&[tracked("a", false), tracked("b", true)], &state);
         assert_eq!(rows.len(), 2);
         assert!(!rows[0].enabled);
-        assert_eq!(rows[0].scope, PullRequestScope::All);
         assert!(rows[0].read);
         assert_eq!(rows[0].error.as_deref(), Some("gh failed"));
         // Added but not read yet.
         assert_eq!(rows[1].id, "b");
         assert!(!rows[1].read);
         assert!(rows[1].error.is_none());
+    }
+
+    fn row_of(enabled: bool, read: bool, prs: usize, failing: usize, error: Option<&str>) -> Row {
+        Row {
+            id: "a".into(),
+            path: "/w/a".into(),
+            name_with_owner: "acme/a".into(),
+            default_branch: "main".into(),
+            enabled,
+            pull_requests: prs,
+            failing,
+            read,
+            error: error.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn the_status_line_says_what_the_last_read_found() {
+        let line = |row: &Row| status_line(row);
+        assert_eq!(line(&row_of(false, true, 3, 1, None)), ("Paused".into(), Status::Neutral));
+        assert_eq!(line(&row_of(true, false, 0, 0, None)), ("Reading…".into(), Status::Neutral));
+        assert_eq!(line(&row_of(true, true, 0, 0, None)), ("No open PRs".into(), Status::Neutral));
+        assert_eq!(line(&row_of(true, true, 1, 0, None)), ("1 open PR".into(), Status::Neutral));
+        assert_eq!(line(&row_of(true, true, 3, 1, None)), ("3 open PRs · 1 failing".into(), Status::Failing));
+        assert_eq!(line(&row_of(true, true, 3, 1, Some("gh failed"))), ("gh failed".into(), Status::Failing));
     }
 
     #[test]

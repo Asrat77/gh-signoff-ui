@@ -340,13 +340,9 @@ impl Gh {
     /// # Errors
     ///
     /// When `gh pr list` fails.
-    pub fn pull_requests(&self, dir: &Path, all: bool) -> Result<(Vec<PrInfo>, bool), GhError> {
+    pub fn pull_requests(&self, dir: &Path) -> Result<(Vec<PrInfo>, bool), GhError> {
         let limit = (PULL_REQUEST_LIMIT + 1).to_string();
-        let mut args = vec!["pr", "list", "--state", "open", "--limit", &limit];
-        if !all {
-            args.extend(["--author", "@me"]);
-        }
-        args.extend(["--json", PULL_REQUEST_LIST_FIELDS]);
+        let args = ["pr", "list", "--state", "open", "--limit", &limit, "--json", PULL_REQUEST_LIST_FIELDS];
         let raw: Vec<RawPr> = self.json(Some(dir), &args)?;
         let (raw, truncated) = limit_pull_requests(raw);
         Ok((raw.into_iter().map(RawPr::into_info).collect(), truncated))
@@ -598,7 +594,7 @@ mod tests {
                 {"__typename":"StatusContext","context":"signoff/tests","state":"SUCCESS","startedAt":"2026-08-10T08:18:36Z","targetUrl":""}
             ]}]"#,
         )]));
-        let (prs, truncated) = gh(&fake).pull_requests(Path::new("/repo"), true).expect("list");
+        let (prs, truncated) = gh(&fake).pull_requests(Path::new("/repo")).expect("list");
         assert!(!truncated);
         assert_eq!(prs.len(), 1);
         assert_eq!(prs[0].author, "app/dependabot");
@@ -608,12 +604,11 @@ mod tests {
     }
 
     #[test]
-    fn pull_requests_are_scoped_to_the_author_unless_all() {
-        for (all, want_mine) in [(false, true), (true, false)] {
-            let fake = Arc::new(FakeRunner::new(vec![ok("pr list", "[]")]));
-            gh(&fake).pull_requests(Path::new("/repo"), all).expect("list");
-            assert_eq!(fake.called("--author @me"), want_mine, "all = {all}");
-        }
+    fn pull_requests_are_everyones_not_just_the_authors() {
+        let fake = Arc::new(FakeRunner::new(vec![ok("pr list", "[]")]));
+        gh(&fake).pull_requests(Path::new("/repo")).expect("list");
+        assert!(!fake.called("--author"));
+        assert!(fake.called("--state open"));
     }
 
     #[test]

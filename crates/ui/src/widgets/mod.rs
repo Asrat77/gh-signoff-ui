@@ -14,6 +14,7 @@ mod log_view;
 mod paint;
 mod pr_row;
 mod progress;
+mod switch;
 mod toast;
 mod toggle_row;
 
@@ -27,5 +28,6 @@ pub use log_view::{LogLine, LogView};
 pub use paint::{icon_tile, spinner};
 pub use pr_row::PrRow;
 pub use progress::{Segment, Segments};
+pub use switch::Switch;
 pub use toast::{Toast, show_toasts, toast};
 pub use toggle_row::ToggleRow;

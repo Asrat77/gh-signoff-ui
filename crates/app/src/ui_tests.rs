@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use signoff_core::config::{AppConfig, ConfigStore, TrackedRepository};
-use signoff_core::{Gh, HistoryStore, Output, ProductService, ProductState, Runner};
+use signoff_core::{Gh, Health, HistoryStore, Output, ProductService, ProductState, Runner};
 
 use crate::app::Signoff;
 use crate::settings::{self, Settings};
@@ -160,7 +160,6 @@ impl StateFromConfig for ProductService {
                     name_with_owner: repo.name_with_owner,
                     default_branch: repo.default_branch,
                     enabled: repo.enabled,
-                    pull_request_scope: repo.pull_request_scope,
                     commands: repo.commands,
                     ..signoff_core::RepositoryState::default()
                 })
@@ -237,7 +236,7 @@ fn adding_a_checkout_tracks_it() {
 }
 
 #[test]
-fn a_repository_chip_changes_before_the_refresh_finishes() {
+fn the_watching_switch_flips_before_the_refresh_finishes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
     let state = service.cached_or_config_state();
@@ -249,7 +248,7 @@ fn a_repository_chip_changes_before_the_refresh_finishes() {
 
     harness.get_by_label("Watching").click();
     harness.run_ok();
-    assert!(harness.query_by_label("Paused").is_some(), "the chip should flip at once");
+    assert!(harness.query_by_label("Paused").is_some(), "the switch should flip at once");
     assert!(!service.config().expect("config").find_repository("repo1").expect("repo").enabled);
 
     harness.get_by_label("Stop tracking").click();
@@ -258,6 +257,60 @@ fn a_repository_chip_changes_before_the_refresh_finishes() {
     harness.run_ok();
     assert!(harness.query_by_label("acme/widgets").is_none(), "the row should go at once");
     assert!(service.config().expect("config").snapshot().repositories.is_empty());
+}
+
+#[test]
+fn the_row_reports_pull_requests_and_failures() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let mut state = service.cached_or_config_state();
+    state.repositories[0].pull_request_count = 3;
+    let pr = |status| signoff_core::PullRequestState {
+        repo_id: "repo1".into(),
+        status,
+        ..signoff_core::PullRequestState::default()
+    };
+    state.pull_requests = vec![pr(Health::Failing), pr(Health::Ready), pr(Health::Attention)];
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+    harness.get_by_label("3 open PRs · 1 failing");
+    for action in ["Open on GitHub", "Set up signoff", "Stop tracking"] {
+        harness.get_by_label(action);
+    }
+    assert!(harness.query_by_label_contains("Show in ").is_some());
+}
+
+#[test]
+fn the_row_shows_why_it_could_not_be_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let mut state = service.cached_or_config_state();
+    state.repositories[0].error = Some("gh: not logged in".into());
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+    harness.get_by_label("gh: not logged in");
+}
+
+#[test]
+fn keeping_a_repository_cancels_the_removal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+    harness.get_by_label("Stop tracking").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Stop tracking").is_none(), "asks first");
+    harness.get_by_label("Keep").click();
+    harness.run_ok();
+    harness.get_by_label("Stop tracking");
+    assert_eq!(service.config().expect("config").snapshot().repositories.len(), 1);
 }
 
 #[test]
