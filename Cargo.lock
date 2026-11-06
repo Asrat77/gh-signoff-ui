@@ -2689,11 +2689,11 @@ dependencies = [
  "env_logger",
  "fastframe-dirs",
  "fastframe-shell",
- "fastframe-theme",
  "fastframe-tray",
  "jiff",
  "log",
  "signoff-core",
+ "signoff-ui",
 ]
 
 [[package]]

@@ -7,7 +7,6 @@
 
 mod app;
 mod paths;
-mod theme;
 mod tray;
 mod views;
 mod worker;

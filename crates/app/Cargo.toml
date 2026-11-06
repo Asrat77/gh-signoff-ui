@@ -19,11 +19,11 @@ demo = []
 
 [dependencies]
 signoff-core.workspace = true
+signoff-ui.workspace = true
 egui.workspace = true
 eframe.workspace = true
 fastframe-dirs.workspace = true
 fastframe-shell.workspace = true
-fastframe-theme.workspace = true
 fastframe-tray.workspace = true
 jiff.workspace = true
 log.workspace = true

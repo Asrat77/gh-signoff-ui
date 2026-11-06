@@ -9,7 +9,7 @@ use fastframe_tray::{Event, Tray};
 use signoff_core::{Health, ProductState};
 
 use crate::worker::Refresher;
-use crate::{theme, tray, views};
+use crate::{tray, views};
 
 /// The app's state between windows.
 pub(crate) struct Signoff {
@@ -151,7 +151,7 @@ pub(crate) struct Window(Held<Signoff>);
 
 /// Makes the window for `lease` once eframe has a context.
 pub(crate) fn window(cc: &eframe::CreationContext<'_>, lease: Lease<Signoff>) -> Box<dyn eframe::App> {
-    theme::install(&cc.egui_ctx);
+    signoff_ui::install(&cc.egui_ctx, signoff_ui::ThemeMode::System);
     let mut app = lease.take(&cc.egui_ctx);
     app.closing = Closed::Hide;
     if let Some(tray) = &mut app.tray {
