@@ -97,7 +97,7 @@ impl Signoff {
         self.refresher.is_refreshing()
     }
 
-    /// Asks the background thread for a refresh.
+    /// Asks the background threads to read everything again.
     pub(crate) fn refresh(&self) {
         self.refresher.refresh();
     }
@@ -112,6 +112,12 @@ impl Signoff {
             self.asked_at = Some(Instant::now());
             self.refresh();
         }
+    }
+
+    /// Like [`Signoff::refresh`], and checks `gh` and its sign-in again:
+    /// what an explicit Refresh does.
+    pub(crate) fn recheck(&self) {
+        self.refresher.recheck();
     }
 
     /// Whether closing the window keeps the app running.
@@ -160,7 +166,7 @@ impl Signoff {
                     Some(ctx) => self.hide(ctx),
                     None => self.open(),
                 },
-                Event::Menu(tray::REFRESH) => self.refresh(),
+                Event::Menu(tray::REFRESH) => self.recheck(),
                 Event::Menu(tray::SETTINGS) => {
                     self.settings_open = true;
                     self.show = true;
