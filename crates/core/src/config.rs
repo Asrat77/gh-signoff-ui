@@ -72,13 +72,25 @@ pub struct AppConfig {
     /// Tell the person with a desktop notification when one of their pull
     /// requests starts failing or becomes ready, or a local run finishes.
     pub notifications: bool,
+    /// Whether the global shortcut that opens the popover is on.
+    pub shortcut_enabled: bool,
+    /// The global shortcut, such as `Alt+Shift+KeyS`; empty means the
+    /// app's default. An invalid string also falls back to the default.
+    pub shortcut: String,
     /// Tracked checkouts, sorted by GitHub name.
     pub repositories: Vec<TrackedRepository>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { version: CURRENT_VERSION, refresh_seconds: 30, notifications: true, repositories: Vec::new() }
+        Self {
+            version: CURRENT_VERSION,
+            refresh_seconds: 30,
+            notifications: true,
+            shortcut_enabled: true,
+            shortcut: String::new(),
+            repositories: Vec::new(),
+        }
     }
 }
 
@@ -91,6 +103,7 @@ impl AppConfig {
         if self.refresh_seconds < 10 {
             self.refresh_seconds = 30;
         }
+        self.shortcut = self.shortcut.trim().to_owned();
         for repo in &mut self.repositories {
             repo.normalize();
         }
@@ -349,6 +362,31 @@ impl ConfigStore {
         })
     }
 
+    /// Turns the global shortcut on or off.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be saved.
+    pub fn set_shortcut_enabled(&self, on: bool) -> Result<(), ConfigError> {
+        self.change(|config| {
+            config.shortcut_enabled = on;
+            Ok(())
+        })
+    }
+
+    /// Sets the global shortcut; empty means the app's default. The app
+    /// checks that it parses: the config only keeps the text.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be saved.
+    pub fn set_shortcut(&self, shortcut: &str) -> Result<(), ConfigError> {
+        self.change(|config| {
+            shortcut.clone_into(&mut config.shortcut);
+            Ok(())
+        })
+    }
+
     /// Applies `edit` and saves. The change is kept only if both succeed.
     fn change<T>(&self, edit: impl FnOnce(&mut AppConfig) -> Result<T, ConfigError>) -> Result<T, ConfigError> {
         let mut guard = self.config.write().unwrap_or_else(PoisonError::into_inner);
@@ -472,6 +510,24 @@ mod tests {
         store.set_notifications(false).expect("save");
         assert!(store.flush());
         assert!(!ConfigStore::open(&path).expect("reload").snapshot().notifications);
+    }
+
+    /// The shortcut is on, with the app's default, unless a config says
+    /// otherwise, and its edits are kept.
+    #[test]
+    fn shortcut_defaults_for_old_configs_and_edits_are_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"version":1,"refreshSeconds":30,"repositories":[]}"#).expect("write");
+        let store = ConfigStore::open(&path).expect("open");
+        assert!(store.snapshot().shortcut_enabled);
+        assert_eq!(store.snapshot().shortcut, "");
+        store.set_shortcut_enabled(false).expect("save");
+        store.set_shortcut(" Alt+Shift+KeyS ").expect("save");
+        assert!(store.flush());
+        let loaded = ConfigStore::open(&path).expect("reload").snapshot();
+        assert!(!loaded.shortcut_enabled);
+        assert_eq!(loaded.shortcut, "Alt+Shift+KeyS");
     }
 
     /// The Go version's file must keep loading.
