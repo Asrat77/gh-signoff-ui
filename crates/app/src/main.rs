@@ -9,6 +9,7 @@ mod anchor;
 mod app;
 mod autostart;
 mod checkouts;
+mod commands;
 mod glance;
 mod installer;
 mod notifier;
