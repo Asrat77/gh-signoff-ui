@@ -538,6 +538,10 @@ pub(crate) mod tests {
             // real clone has.
             git(dir.path(), &["clone", "-q", "--no-local", "origin", "checkout"]);
             let checkout = dir.path().join("checkout");
+            // The worktree shares this config. Keep line endings as committed
+            // so file contents compare the same on Windows, where the global
+            // config usually converts them.
+            git(&checkout, &["config", "core.autocrlf", "false"]);
             let root = dir.path().join("cache").join("worktrees");
             Self { checkout, root, main, pr7, pr8, _dir: dir }
         }
