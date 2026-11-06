@@ -44,7 +44,9 @@ pub(crate) enum Page {
 /// Draws the popover into the window.
 pub(crate) fn show(ui: &mut Ui, app: &mut Signoff) {
     let p = palette(ui.ctx());
-    Frame::new().fill(p.accent).corner_radius(radius::SHEET).show(ui, |ui| {
+    // A popover is a rounded card; an ordinary window keeps square corners.
+    let corners = if app.is_popover() { radius::SHEET } else { 0 };
+    Frame::new().fill(p.accent).corner_radius(corners).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.spacing_mut().item_spacing.y = 0.0;
         match app.glance.page.clone() {
