@@ -27,4 +27,4 @@ pub use config::{
 pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo};
 pub use history::{ActivityEvent, ActivityKind, HistoryStore};
 pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequestState, RepositoryState};
-pub use runner::{Output, Runner, SystemRunner};
+pub use runner::{CANCELLED, Output, Runner, SystemRunner, TIMED_OUT};
