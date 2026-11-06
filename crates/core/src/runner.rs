@@ -120,6 +120,66 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String>
 }
 
 #[cfg(test)]
+pub(crate) mod fake {
+    //! Recorded `gh` output for tests.
+
+    use super::{Output, Runner};
+    use std::io;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// One canned answer: used for the first command line containing `matches`.
+    pub(crate) struct Reply {
+        pub(crate) matches: &'static str,
+        pub(crate) stdout: &'static str,
+        pub(crate) stderr: &'static str,
+        pub(crate) code: i32,
+    }
+
+    pub(crate) fn ok(matches: &'static str, stdout: &'static str) -> Reply {
+        Reply { matches, stdout, stderr: "", code: 0 }
+    }
+
+    pub(crate) fn fail(matches: &'static str, stderr: &'static str) -> Reply {
+        Reply { matches, stdout: "", stderr, code: 1 }
+    }
+
+    /// Replays [`Reply`]s and records every command line it was asked for.
+    pub(crate) struct FakeRunner {
+        replies: Vec<Reply>,
+        pub(crate) commands: Mutex<Vec<String>>,
+    }
+
+    impl FakeRunner {
+        pub(crate) fn new(replies: Vec<Reply>) -> Self {
+            Self { replies, commands: Mutex::new(Vec::new()) }
+        }
+
+        pub(crate) fn commands(&self) -> Vec<String> {
+            self.commands.lock().map(|c| c.clone()).unwrap_or_default()
+        }
+
+        pub(crate) fn called(&self, needle: &str) -> bool {
+            self.commands().iter().any(|c| c.contains(needle))
+        }
+    }
+
+    impl Runner for FakeRunner {
+        fn run(&self, _dir: Option<&Path>, _input: Option<&str>, program: &str, args: &[&str]) -> io::Result<Output> {
+            let line = format!("{program} {}", args.join(" "));
+            if let Ok(mut commands) = self.commands.lock() {
+                commands.push(line.clone());
+            }
+            let reply = self.replies.iter().find(|r| line.contains(r.matches));
+            match reply {
+                Some(r) => Ok(Output { stdout: r.stdout.to_owned(), stderr: r.stderr.to_owned(), code: r.code }),
+                None => panic!("unexpected command: {line}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

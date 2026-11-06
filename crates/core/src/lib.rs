@@ -12,4 +12,6 @@
 //!   [`ProductService`] keeps the latest copy of it.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
+pub mod checks;
+pub mod gh;
 pub mod runner;
