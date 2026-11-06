@@ -8,8 +8,9 @@
 //! - [`checks`] turns branch protection plus commit statuses into the rows
 //!   the popover shows, and decides readiness.
 //! - [`config`] and [`history`] are the two files Signoff keeps on disk.
-//! - [`product`] assembles the whole multi-repository state, and
-//!   [`ProductService`] keeps the latest copy of it.
+//! - [`product`] reads each tracked repository, and [`ProductService`]
+//!   patches what it reads into the shared state; `store` keeps those
+//!   patches consistent with the app's own changes.
 //! - [`verify`] runs a check's local command on the pull request's head
 //!   commit and writes the signoff only when it passed.
 //! - [`rules`] edits the signoff checks branch protection requires,
@@ -24,6 +25,7 @@ pub mod history;
 pub mod product;
 pub mod rules;
 pub mod runner;
+mod store;
 pub mod verify;
 
 pub use checks::{Check, CheckState, Rules, Tally};

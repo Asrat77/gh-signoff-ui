@@ -1,10 +1,14 @@
 //! The whole state Signoff shows: every tracked repository's open pull
 //! requests, their signoff checks, and recent activity.
+//!
+//! [`ProductService`] reads GitHub one repository at a time and patches each
+//! result into the shared state as it lands; the `store` module explains how
+//! those patches stay consistent with the app's own changes.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
 use std::thread;
 
 use jiff::Timestamp;
@@ -13,14 +17,15 @@ use serde::{Deserialize, Serialize};
 use crate::checks::{
     self, Check, CheckState, Rules, display_name, is_signoff_context, latest_signoffs, resolve_checks, rules_for, tally,
 };
-use crate::config::{AppConfig, CommandMapping, ConfigStore, TrackedRepository};
-use crate::gh::{CommitStatus, Environment, Gh, PrInfo, ProtectionStatus, RepoInfo, same_contexts};
+use crate::config::{CommandMapping, ConfigStore, TrackedRepository};
+use crate::gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo, same_contexts};
 use crate::history::{ActivityEvent, ActivityKind, HistoryStore};
+use crate::store::{RepositoryRead, Store};
 
-/// Repositories refreshed at once.
-const PARALLEL_REPOSITORIES: usize = 4;
-/// Activity entries kept in a [`ProductState`].
-const MAX_HISTORY: usize = 300;
+/// Repositories read at once.
+pub const PARALLEL_REPOSITORIES: usize = 4;
+/// Local activity entries merged into a [`ProductState`].
+const LOCAL_HISTORY: usize = 200;
 
 /// How a pull request, or everything, is doing. The tray icon is coloured by
 /// the worst one.
@@ -92,6 +97,10 @@ pub struct RepositoryState {
     pub pull_requests_truncated: bool,
     /// Why it could not be read.
     pub error: Option<String>,
+    /// It is read but has not been yet, so its pull requests are not shown.
+    pub loading: bool,
+    /// When it was last read; `None` before that, and while paused.
+    pub fetched_at: Option<Timestamp>,
 }
 
 /// One open pull request and its signoff checks.
@@ -164,13 +173,13 @@ pub struct ProductState {
     pub onboarded: bool,
     /// This is demo data.
     pub demo: bool,
-    /// A refresh is running.
+    /// A read is running.
     pub refreshing: bool,
     /// A caveat to show.
     pub warning: Option<String>,
     /// What went wrong.
     pub error: Option<String>,
-    /// When it was read; `None` before the first refresh.
+    /// When a repository was last read; `None` until the first one lands.
     pub fetched_at: Option<Timestamp>,
 }
 
@@ -271,68 +280,10 @@ impl StatusCache {
     }
 }
 
-/// Reads everything for `config` from GitHub. Repositories are read a few at
-/// a time; this blocks for as long as that takes.
-pub fn build_product_state(
-    gh: &Gh,
-    config: &AppConfig,
-    local_history: Vec<ActivityEvent>,
-    config_path: &Path,
-    seed_dir: Option<&Path>,
-    cache: &StatusCache,
-) -> ProductState {
-    let mut state = ProductState {
-        config_path: config_path.to_owned(),
-        onboarded: !config.repositories.is_empty(),
-        fetched_at: Some(Timestamp::now()),
-        ..ProductState::default()
-    };
-    let probe_dir = config.repositories.iter().find(|r| r.enabled).map(|r| r.path.as_path()).or(seed_dir);
-    state.env = gh.probe_environment(probe_dir);
-    if !state.env.gh_installed || !state.env.authenticated {
-        state.history = local_history;
-        return state;
-    }
-
-    let repositories = &config.repositories;
-    let results: Mutex<Vec<Option<RepositoryResult>>> = Mutex::new(vec![None; repositories.len()]);
-    let next = AtomicUsize::new(0);
-    thread::scope(|scope| {
-        for _ in 0..PARALLEL_REPOSITORIES.min(repositories.len()) {
-            scope.spawn(|| {
-                loop {
-                    let index = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(tracked) = repositories.get(index) else { break };
-                    let result = build_repository_state(gh, tracked, cache);
-                    results.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(result);
-                }
-            });
-        }
-    });
-
-    for result in results.into_inner().unwrap_or_else(PoisonError::into_inner).into_iter().flatten() {
-        state.repositories.push(result.repository);
-        state.pull_requests.extend(result.pull_requests);
-        state.history.extend(result.history);
-    }
-    state.history.extend(local_history);
-    state.history.sort_by_key(|e| std::cmp::Reverse(e.at));
-    state.history.truncate(MAX_HISTORY);
-    state
-        .pull_requests
-        .sort_by(|a, b| a.status.rank().cmp(&b.status.rank()).then_with(|| b.pr.updated_at.cmp(&a.pr.updated_at)));
-    state.summary = summarize(&state.pull_requests);
-    state
-}
-
-#[derive(Clone, Debug)]
-struct RepositoryResult {
-    repository: RepositoryState,
-    pull_requests: Vec<PullRequestState>,
-    history: Vec<ActivityEvent>,
-}
-
-fn build_repository_state(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCache) -> RepositoryResult {
+/// Reads the repository `tracked`: its checkout, open pull requests and
+/// their checks. Also says whether a failure means `gh` is missing or signed
+/// out, so the environment is probed again.
+pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCache) -> (RepositoryRead, bool) {
     let mut view = RepositoryState {
         id: tracked.id.clone(),
         path: tracked.path.clone(),
@@ -342,16 +293,14 @@ fn build_repository_state(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCa
         commands: tracked.commands.clone(),
         ..RepositoryState::default()
     };
-    let empty = |repository| RepositoryResult { repository, pull_requests: Vec::new(), history: Vec::new() };
-    if !tracked.enabled {
-        return empty(view);
-    }
+    let failed = |mut repository: RepositoryState, err: GhError| {
+        repository.error = Some(err.to_string());
+        let read = RepositoryRead { repository, ..RepositoryRead::default() };
+        (read, err.is_environment_failure())
+    };
     let info = match gh.repo(&tracked.path) {
         Ok(info) => info,
-        Err(err) => {
-            view.error = Some(err.to_string());
-            return empty(view);
-        }
+        Err(err) => return failed(view, err),
     };
     view.name_with_owner.clone_from(&info.name_with_owner);
     view.default_branch.clone_from(&info.default_branch);
@@ -360,10 +309,7 @@ fn build_repository_state(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCa
 
     let (prs, truncated) = match gh.pull_requests(&tracked.path) {
         Ok(found) => found,
-        Err(err) => {
-            view.error = Some(err.to_string());
-            return empty(view);
-        }
+        Err(err) => return failed(view, err),
     };
     view.pull_request_count = prs.len();
     view.pull_requests_truncated = truncated;
@@ -380,7 +326,7 @@ fn build_repository_state(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCa
         pull_requests.push(state);
         history.extend(events);
     }
-    RepositoryResult { repository: view, pull_requests, history }
+    (RepositoryRead { repository: view, pull_requests, history }, false)
 }
 
 fn build_pull_request_state(
@@ -455,19 +401,39 @@ enum Source {
     Demo,
 }
 
-/// Keeps the latest [`ProductState`] and refreshes it.
+/// Keeps the latest [`ProductState`] and patches it as reads land.
 ///
-/// [`ProductService::refresh`] blocks on `gh`; call it from a background
-/// thread and read [`ProductService::cached`] from the UI.
+/// Reading blocks on `gh`: call [`ProductService::plan_refresh`] and
+/// [`ProductService::refresh_repository`] (or [`ProductService::refresh`],
+/// which does both) from background threads, and read
+/// [`ProductService::cached`] from the UI when [`ProductService::revision`]
+/// moves. Local patches ([`ProductService::sync_config`],
+/// [`ProductService::mark_signed_off`]) never block on `gh`.
 pub struct ProductService {
     source: Source,
-    state: RwLock<ProductState>,
-    refreshing: Mutex<()>,
+    store: RwLock<Store>,
+    /// Bumped after every change to the state.
+    revision: AtomicU64,
+    /// Reads and probes running.
+    active: AtomicUsize,
+    /// One probe at a time.
+    probing: Mutex<()>,
 }
 
 impl std::fmt::Debug for ProductService {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ProductService").field("demo", &self.is_demo()).finish_non_exhaustive()
+    }
+}
+
+/// Counts a read or probe as running while it lives.
+struct Busy<'a>(&'a ProductService);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        self.0.active.fetch_sub(1, Ordering::AcqRel);
+        // Clears `refreshing` once the last one ends.
+        self.0.mutate(|_| ());
     }
 }
 
@@ -484,14 +450,20 @@ impl ProductService {
     }
 
     fn from_source(source: Source) -> Self {
-        Self { source, state: RwLock::new(ProductState::default()), refreshing: Mutex::new(()) }
+        Self {
+            source,
+            store: RwLock::new(Store::default()),
+            revision: AtomicU64::new(0),
+            active: AtomicUsize::new(0),
+            probing: Mutex::new(()),
+        }
     }
 
     /// Serves `state` as if just refreshed, for tests elsewhere in the crate.
     #[cfg(test)]
     pub(crate) fn with_state(state: ProductState) -> Self {
         let service = Self::demo();
-        *service.state.write().unwrap_or_else(PoisonError::into_inner) = state;
+        *service.store.write().unwrap_or_else(PoisonError::into_inner) = Store::serving(state);
         service
     }
 
@@ -537,42 +509,118 @@ impl ProductService {
 
     /// The latest state, without reading anything.
     pub fn cached(&self) -> ProductState {
-        self.state.read().unwrap_or_else(PoisonError::into_inner).clone()
+        self.store().state.clone()
     }
 
-    /// Reads everything again and returns the new state. Concurrent calls
-    /// queue rather than overlap.
-    pub fn refresh(&self) -> ProductState {
-        let _one_at_a_time = self.refreshing.lock().unwrap_or_else(PoisonError::into_inner);
-        self.state.write().unwrap_or_else(PoisonError::into_inner).refreshing = true;
+    /// Moves every time the state changes, so a reader copies
+    /// [`ProductService::cached`] only when there is something new.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
 
-        let mut next = match &self.source {
+    /// Whether a read or probe is running.
+    pub fn is_refreshing(&self) -> bool {
+        self.active.load(Ordering::Acquire) > 0
+    }
+
+    /// Reads everything again and returns the new state, a few repositories
+    /// at a time, patching each in as it lands. Blocks on `gh`.
+    pub fn refresh(&self) -> ProductState {
+        let ids = self.plan_refresh(false);
+        let next = AtomicUsize::new(0);
+        thread::scope(|scope| {
+            for _ in 0..PARALLEL_REPOSITORIES.min(ids.len()) {
+                scope.spawn(|| {
+                    while let Some(id) = ids.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        self.refresh_repository(id);
+                    }
+                });
+            }
+        });
+        self.cached()
+    }
+
+    /// Prepares a full refresh and returns the repositories it reads, for
+    /// the caller to pass to [`ProductService::refresh_repository`]. Applies
+    /// the config, and probes the environment (blocking on `gh`) when
+    /// `recheck` asks for it or the cached probe no longer holds.
+    pub fn plan_refresh(&self, recheck: bool) -> Vec<String> {
+        let Source::GitHub { gh, config, seed_dir, .. } = &self.source else {
             // Demo data only changes through demo runs; a refresh must not
             // undo them.
-            Source::Demo => {
-                let current = self.cached();
-                if current.fetched_at.is_some() { current } else { crate::demo::product_state(Timestamp::now()) }
-            }
-            Source::GitHub { gh, config, history, seed_dir, cache } => {
-                let config_path = config.path().to_owned();
-                build_product_state(
-                    gh,
-                    &config.snapshot(),
-                    history.snapshot(200),
-                    &config_path,
-                    seed_dir.as_deref(),
-                    cache,
-                )
-            }
+            self.mutate(|store| {
+                if store.state.fetched_at.is_none() {
+                    *store = Store::serving(crate::demo::product_state(Timestamp::now()));
+                }
+            });
+            return Vec::new();
         };
-        next.refreshing = false;
-        *self.state.write().unwrap_or_else(PoisonError::into_inner) = next.clone();
-        next
+        let snapshot = config.snapshot();
+        let dir = self.mutate(|store| {
+            store.sync(&snapshot, config.path().to_owned());
+            store.probe_dir(seed_dir.as_deref())
+        });
+        if recheck || self.store().needs_probe(&dir) {
+            let _one_at_a_time = self.probing.lock().unwrap_or_else(PoisonError::into_inner);
+            // Another caller may have probed while this one waited.
+            if recheck || self.store().needs_probe(&dir) {
+                let _busy = self.busy();
+                let env = gh.probe_environment(dir.as_deref());
+                self.mutate(|store| store.set_environment(env, dir));
+            }
+        }
+        self.mutate(|store| {
+            let ids = store.readable_ids();
+            if ids.is_empty() {
+                // Nothing to wait for: say so rather than "loading".
+                store.state.fetched_at = Some(Timestamp::now());
+            }
+            ids
+        })
+    }
+
+    /// Reads the repository `id` and patches it in. Blocks on `gh`. Returns
+    /// whether the read landed: not when the repository is not read (paused,
+    /// removed, gh signed out) or a newer read or local change overtook it.
+    pub fn refresh_repository(&self, id: &str) -> bool {
+        let Source::GitHub { gh, cache, .. } = &self.source else { return false };
+        let _busy = self.busy();
+        let Some((ticket, tracked)) = self.mutate(|store| store.begin_read(id)) else { return false };
+        let (read, environment_failed) = read_repository(gh, &tracked, cache);
+        self.mutate(|store| {
+            if environment_failed {
+                store.invalidate_environment();
+            }
+            store.land(&ticket, read, Timestamp::now())
+        })
+    }
+
+    /// Applies the config to the state at once: a removed or paused
+    /// repository's pull requests go, an added one shows as loading, and
+    /// command mappings change in place. Returns the repositories to read
+    /// for the rest. Never blocks on `gh`.
+    pub fn sync_config(&self) -> Vec<String> {
+        let Some(config) = self.config() else { return Vec::new() };
+        let snapshot = config.snapshot();
+        self.mutate(|store| store.sync(&snapshot, config.path().to_owned()))
+    }
+
+    /// Shows `check` signed off on `repo_id#number` at `head_sha` at once,
+    /// after `gh signoff` succeeded; reads keep showing it until GitHub
+    /// reports it too. Never blocks on `gh`.
+    pub fn mark_signed_off(&self, repo_id: &str, number: u64, check: &str, head_sha: &str) {
+        self.mutate(|store| {
+            let actor = match store.state.env.login.as_str() {
+                "" => "you".to_owned(),
+                login => login.to_owned(),
+            };
+            store.mark_signed_off(repo_id, number, check, head_sha, &actor, Timestamp::now())
+        });
     }
 
     /// The pull request with `number` in the repository with `repo_id`.
     pub fn find_pull_request(&self, repo_id: &str, number: u64) -> Option<PullRequestState> {
-        self.state.read().unwrap_or_else(PoisonError::into_inner).pull_request(repo_id, number).cloned()
+        self.store().state.pull_request(repo_id, number).cloned()
     }
 
     /// In demo mode, marks a check passed, as a successful run would. Does
@@ -581,40 +629,65 @@ impl ProductService {
         if !self.is_demo() {
             return;
         }
-        let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         let now = Timestamp::now();
-        let Some(pr) = state.pull_requests.iter_mut().find(|pr| pr.repo_id == repo_id && pr.pr.number == number) else {
-            return;
+        self.mutate(|store| {
+            if !store.mark_signed_off(repo_id, number, check_name, "", "you", now) {
+                return;
+            }
+            let Some(pr) = store.state.pull_request(repo_id, number) else { return };
+            let event = ActivityEvent {
+                id: format!("demo-run:{}", now.as_nanosecond()),
+                kind: ActivityKind::Run,
+                repo_id: repo_id.to_owned(),
+                repo: pr.repo.clone(),
+                pr_number: number,
+                pr_title: pr.pr.title.clone(),
+                check: check_name.to_owned(),
+                state: CheckState::Success,
+                actor: "you".into(),
+                at: now,
+                ..ActivityEvent::default()
+            };
+            store.state.history.insert(0, event);
+            store.state.fetched_at = Some(now);
+        });
+    }
+
+    fn store(&self) -> RwLockReadGuard<'_, Store> {
+        self.store.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn busy(&self) -> Busy<'_> {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Busy(self)
+    }
+
+    /// Changes the store, re-sorts and re-summarises, and moves the revision
+    /// if the state changed.
+    fn mutate<T>(&self, change: impl FnOnce(&mut Store) -> T) -> T {
+        // Read before locking the store, so the two locks never nest.
+        let local = match &self.source {
+            Source::GitHub { history, .. } => Some(history.snapshot(LOCAL_HISTORY)),
+            Source::Demo => None,
         };
-        for check in pr.checks.iter_mut().filter(|c| c.name == check_name) {
-            check.state = CheckState::Success;
-            check.actor = "you".into();
-            check.at = Some(now);
+        let mut store = self.store.write().unwrap_or_else(PoisonError::into_inner);
+        let before = store.state.clone();
+        let value = change(&mut store);
+        store.finish(local);
+        store.state.refreshing = self.is_refreshing();
+        if store.state != before {
+            self.revision.fetch_add(1, Ordering::AcqRel);
         }
-        pr.retally();
-        let event = ActivityEvent {
-            id: format!("demo-run:{}", now.as_nanosecond()),
-            kind: ActivityKind::Run,
-            repo_id: repo_id.to_owned(),
-            repo: pr.repo.clone(),
-            pr_number: number,
-            pr_title: pr.pr.title.clone(),
-            check: check_name.to_owned(),
-            state: CheckState::Success,
-            actor: "you".into(),
-            at: now,
-            ..ActivityEvent::default()
-        };
-        state.history.insert(0, event);
-        state.summary = summarize(&state.pull_requests);
-        state.fetched_at = Some(now);
+        value
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runner::fake::{FakeRunner, fail, ok};
+    use crate::config::{AppConfig, RepositoryUpdate};
+    use crate::runner::Runner;
+    use crate::runner::fake::{FakeRunner, Reply, fail, ok};
 
     #[test]
     fn summary_uses_the_worst_pull_request() {
@@ -679,11 +752,10 @@ mod tests {
         assert!(service.refresh().pull_request("demo-signoff", 482).expect("pr").ready, "kept across refresh");
     }
 
-    /// One repository end to end against recorded `gh` output: a failing
-    /// pull request sorts first and attribution comes from the status API.
-    #[test]
-    fn builds_state_from_gh() {
-        let fake = Arc::new(FakeRunner::new(vec![
+    /// `gh` output for one signed-in repository with two pull requests:
+    /// #1 ready and checked out, #2 failing.
+    fn one_repository() -> Vec<Reply> {
+        vec![
             ok("gh --version", "gh version 2.95.0"),
             ok("api user", r#"{"login":"you"}"#),
             ok("rev-parse --git-dir", ".git"),
@@ -706,31 +778,103 @@ mod tests {
                 r#"{"statuses":[{"context":"signoff/tests","state":"success","description":"you signed off","created_at":"2026-08-10T08:00:00Z","creator":null}]}"#,
             ),
             fail("commits/bbb", "boom"),
-        ]));
-        let config = AppConfig {
-            repositories: vec![TrackedRepository {
-                id: "r1".into(),
-                path: "/repo".into(),
-                name_with_owner: "o/r".into(),
-                enabled: true,
-                commands: BTreeMap::from([(
-                    "tests".into(),
-                    CommandMapping { command: "cargo test".into(), timeout_seconds: 60 },
-                )]),
-                ..TrackedRepository::default()
-            }],
-            ..AppConfig::default()
-        };
-        let state = build_product_state(
-            &Gh::new(fake.clone()),
-            &config,
-            Vec::new(),
-            Path::new("/c/config.json"),
-            None,
-            &StatusCache::default(),
-        );
+        ]
+    }
+
+    fn tracked() -> TrackedRepository {
+        TrackedRepository {
+            id: "r1".into(),
+            path: "/repo".into(),
+            name_with_owner: "o/r".into(),
+            enabled: true,
+            commands: BTreeMap::from([(
+                "tests".into(),
+                CommandMapping { command: "cargo test".into(), timeout_seconds: 60 },
+            )]),
+            ..TrackedRepository::default()
+        }
+    }
+
+    struct Fixture {
+        service: Arc<ProductService>,
+        config: Arc<ConfigStore>,
+        dir: tempfile::TempDir,
+    }
+
+    fn fixture(runner: Arc<dyn Runner>, repos: Vec<TrackedRepository>) -> Fixture {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = Arc::new(ConfigStore::with_config(
+            dir.path().join("config.json"),
+            AppConfig { repositories: repos, ..AppConfig::default() },
+        ));
+        let history = Arc::new(HistoryStore::open(dir.path().join("history.json")).expect("history"));
+        let service = Arc::new(ProductService::new(Gh::new(runner), config.clone(), history, None));
+        Fixture { service, config, dir }
+    }
+
+    fn probes(fake: &FakeRunner) -> usize {
+        fake.commands().iter().filter(|c| c.contains("gh --version")).count()
+    }
+
+    /// Answers like a [`FakeRunner`], but holds any command containing
+    /// `gate` until [`Gated::open`], so a test can act while a read is in
+    /// flight.
+    struct Gated {
+        inner: FakeRunner,
+        gate: &'static str,
+        open: Mutex<bool>,
+        opened: std::sync::Condvar,
+        entered: Mutex<std::sync::mpsc::Sender<()>>,
+    }
+
+    impl Gated {
+        fn new(replies: Vec<Reply>, gate: &'static str) -> (Arc<Self>, std::sync::mpsc::Receiver<()>) {
+            let (entered, waiting) = std::sync::mpsc::channel();
+            let gated = Self {
+                inner: FakeRunner::new(replies),
+                gate,
+                open: Mutex::new(false),
+                opened: std::sync::Condvar::new(),
+                entered: Mutex::new(entered),
+            };
+            (Arc::new(gated), waiting)
+        }
+
+        fn open(&self) {
+            *self.open.lock().expect("gate") = true;
+            self.opened.notify_all();
+        }
+    }
+
+    impl Runner for Gated {
+        fn run(
+            &self,
+            dir: Option<&Path>,
+            input: Option<&str>,
+            program: &str,
+            args: &[&str],
+        ) -> std::io::Result<crate::runner::Output> {
+            if format!("{program} {}", args.join(" ")).contains(self.gate) {
+                let _ = self.entered.lock().expect("entered").send(());
+                let mut open = self.open.lock().expect("gate");
+                while !*open {
+                    open = self.opened.wait(open).expect("gate");
+                }
+            }
+            self.inner.run(dir, input, program, args)
+        }
+    }
+
+    /// One repository end to end against recorded `gh` output: a failing
+    /// pull request sorts first and attribution comes from the status API.
+    #[test]
+    fn builds_state_from_gh() {
+        let fake = Arc::new(FakeRunner::new(one_repository()));
+        let f = fixture(fake.clone(), vec![tracked()]);
+        let state = f.service.refresh();
 
         assert!(state.onboarded);
+        assert!(state.fetched_at.is_some() && !state.refreshing);
         assert_eq!(state.pull_requests.len(), 2);
         assert_eq!(state.pull_requests[0].pr.number, 2, "failing sorts first");
         assert_eq!(state.pull_requests[0].status, Health::Failing);
@@ -741,6 +885,9 @@ mod tests {
         assert_eq!(ready.checks[0].actor, "you");
         assert_eq!(ready.rules.signoff_contexts, ["signoff/tests"]);
         assert_eq!(state.summary.status, Health::Failing);
+        let repo = &state.repositories[0];
+        assert!(!repo.loading && repo.fetched_at.is_some() && repo.pull_request_count == 2);
+        assert!(state.history.iter().any(|e| e.kind == ActivityKind::Status && e.pr_number == 1));
         assert_eq!(
             fake.commands().iter().filter(|c| c.contains("protection")).count(),
             1,
@@ -756,24 +903,145 @@ mod tests {
             fail("rev-parse", "not a repo"),
             fail("signoff version", "unknown"),
         ]));
-        let config = AppConfig {
-            repositories: vec![TrackedRepository {
-                id: "r1".into(),
-                path: "/repo".into(),
-                enabled: true,
-                ..TrackedRepository::default()
-            }],
-            ..AppConfig::default()
-        };
-        let state = build_product_state(
-            &Gh::new(fake),
-            &config,
-            Vec::new(),
-            Path::new("/c/config.json"),
-            None,
-            &StatusCache::default(),
-        );
+        let f = fixture(fake.clone(), vec![tracked()]);
+        let state = f.service.refresh();
         assert!(!state.env.authenticated);
         assert!(state.repositories.is_empty());
+        assert!(state.fetched_at.is_some(), "the setup problem shows instead of a spinner");
+        assert!(!f.service.refresh_repository("r1"), "nothing is read while signed out");
+
+        f.service.refresh();
+        assert_eq!(probes(&fake), 2, "probed again until it is fixed");
+    }
+
+    #[test]
+    fn the_probe_runs_once_until_asked_again() {
+        let fake = Arc::new(FakeRunner::new(one_repository()));
+        let f = fixture(fake.clone(), vec![tracked()]);
+        f.service.refresh();
+        f.service.refresh();
+        assert_eq!(probes(&fake), 1, "not on every refresh");
+        assert_eq!(fake.commands().iter().filter(|c| c.contains("pr list")).count(), 2);
+
+        assert_eq!(f.service.plan_refresh(true), ["r1"]);
+        assert_eq!(probes(&fake), 2, "on request");
+    }
+
+    #[test]
+    fn the_probe_runs_again_after_gh_reports_a_sign_in_problem() {
+        let fake = Arc::new(FakeRunner::new(vec![
+            ok("gh --version", "gh version 2.95.0"),
+            ok("api user", r#"{"login":"you"}"#),
+            ok("rev-parse --git-dir", ".git"),
+            ok("signoff version", "gh-signoff 0.3.0"),
+            fail("repo view", "To get started with GitHub CLI, please run:  gh auth login"),
+        ]));
+        let f = fixture(fake.clone(), vec![tracked()]);
+        let state = f.service.refresh();
+        assert!(state.repositories[0].error.as_deref().is_some_and(|e| e.contains("gh auth login")));
+        assert!(!state.repositories[0].loading, "an error is an answer");
+        f.service.refresh();
+        assert_eq!(probes(&fake), 2);
+    }
+
+    #[test]
+    fn the_ui_sees_each_patch() {
+        let fake = Arc::new(FakeRunner::new(one_repository()));
+        let f = fixture(fake, vec![tracked()]);
+        let start = f.service.revision();
+        assert_eq!(f.service.plan_refresh(false), ["r1"]);
+        let planned = f.service.revision();
+        assert!(planned > start);
+        let state = f.service.cached();
+        assert!(state.repositories[0].loading && state.fetched_at.is_none(), "still looking");
+
+        assert!(f.service.refresh_repository("r1"));
+        assert!(f.service.revision() > planned);
+        assert_eq!(f.service.cached().pull_requests.len(), 2);
+        assert!(!f.service.is_refreshing());
+    }
+
+    #[test]
+    fn adding_a_repository_shows_it_as_loading_until_read() {
+        let fake = Arc::new(FakeRunner::new(one_repository()));
+        let f = fixture(fake, Vec::new());
+        let state = f.service.refresh();
+        assert!(!state.onboarded && state.fetched_at.is_some());
+
+        let added = f.service.add_repository(f.dir.path()).expect("add");
+        assert_eq!(f.service.sync_config(), std::slice::from_ref(&added.id));
+        let state = f.service.cached();
+        assert!(state.onboarded && state.repositories[0].loading);
+        assert_eq!(state.repositories[0].name_with_owner, "o/r");
+        assert!(f.service.sync_config().is_empty(), "applied once");
+
+        assert!(f.service.refresh_repository(&added.id));
+        let state = f.service.cached();
+        assert!(!state.repositories[0].loading);
+        assert_eq!(state.pull_requests.len(), 2);
+    }
+
+    #[test]
+    fn removing_a_repository_drops_its_pull_requests_at_once() {
+        let fake = Arc::new(FakeRunner::new(one_repository()));
+        let f = fixture(fake, vec![tracked()]);
+        f.service.refresh();
+        let before = f.service.revision();
+
+        f.config.remove_repository("r1").expect("remove");
+        assert!(f.service.sync_config().is_empty());
+        let state = f.service.cached();
+        assert!(state.repositories.is_empty() && state.pull_requests.is_empty() && !state.onboarded);
+        assert_eq!(state.summary, ProductSummary::default());
+        assert!(f.service.revision() > before);
+        assert!(!f.service.refresh_repository("r1"));
+    }
+
+    #[test]
+    fn pausing_while_a_read_is_in_flight_keeps_it_paused() {
+        let (gated, entered) = Gated::new(one_repository(), "pr list");
+        let f = fixture(gated.clone(), vec![tracked()]);
+        assert_eq!(f.service.plan_refresh(false), ["r1"]);
+
+        let service = f.service.clone();
+        let read = std::thread::spawn(move || service.refresh_repository("r1"));
+        entered.recv().expect("the read reached gh");
+        assert!(f.service.is_refreshing());
+
+        let paused = RepositoryUpdate { enabled: false, ..RepositoryUpdate::default() };
+        f.config.update_repository("r1", paused).expect("pause");
+        assert!(f.service.sync_config().is_empty());
+        assert!(f.service.cached().repositories[0].fetched_at.is_none());
+
+        gated.open();
+        assert!(!read.join().expect("read"), "the read was overtaken");
+        let state = f.service.cached();
+        assert!(state.pull_requests.is_empty() && !state.repositories[0].enabled);
+        assert!(!state.refreshing);
+    }
+
+    #[test]
+    fn a_signoff_shows_at_once_and_a_lagging_read_keeps_it() {
+        let (gated, entered) = Gated::new(one_repository(), "pr list");
+        let f = fixture(gated.clone(), vec![tracked()]);
+        gated.open();
+        f.service.refresh();
+        assert_eq!(f.service.find_pull_request("r1", 2).expect("pr").status, Health::Failing);
+
+        // Read again, and sign off while that read is in flight.
+        *gated.open.lock().expect("gate") = false;
+        while entered.try_recv().is_ok() {}
+        let service = f.service.clone();
+        let read = std::thread::spawn(move || service.refresh_repository("r1"));
+        entered.recv().expect("the read reached gh");
+        f.service.mark_signed_off("r1", 2, "tests", "bbb");
+        let pr = f.service.find_pull_request("r1", 2).expect("pr");
+        assert_eq!((pr.status, pr.checks[0].actor.as_str()), (Health::Ready, "you"));
+        assert_eq!(f.service.cached().summary.ready, 2);
+
+        gated.open();
+        assert!(read.join().expect("read"));
+        assert_eq!(f.service.find_pull_request("r1", 2).expect("pr").status, Health::Ready, "GitHub lags");
+        assert_eq!(f.service.cached().pull_requests[0].pr.number, 1, "re-sorted");
     }
 }
