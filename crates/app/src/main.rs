@@ -24,6 +24,7 @@ mod tray;
 mod ui_tests;
 mod watcher;
 mod worker;
+mod worktrees;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,7 +32,7 @@ use std::sync::Arc;
 
 use fastframe_shell::{Shell, Waker};
 use signoff_core::api::UreqTransport;
-use signoff_core::{ConfigStore, Gh, HistoryStore, ProductService, Runner, SystemRunner, Verifier};
+use signoff_core::{ConfigStore, Gh, HistoryStore, ProductService, Runner, SystemRunner, Verifier, Worktrees};
 
 /// What the command line asked for.
 #[derive(Debug, Default)]
@@ -176,6 +177,15 @@ fn build_service(args: &Args) -> Result<(Arc<ProductService>, Arc<Verifier>, Gh)
         Gh::with_api(runner.clone(), Arc::new(UreqTransport::default()))
     };
     let service = Arc::new(ProductService::new(gh.clone(), config.clone(), history.clone(), seed_dir));
-    let verifier = Arc::new(Verifier::new(service.clone(), runner, config, history));
-    Ok((service, verifier, gh))
+    let mut verifier = Verifier::new(service.clone(), runner.clone(), config.clone(), history);
+    match paths::worktrees_dir(args.config.as_deref()) {
+        Some(root) => {
+            log::info!("worktrees: {}", root.display());
+            let worktrees = Worktrees::new(root);
+            worktrees::keep_tidy(worktrees.clone(), runner, &config);
+            verifier = verifier.with_worktrees(worktrees);
+        }
+        None => log::warn!("no folder to keep worktrees in; runs need the checkout at the pull request's head"),
+    }
+    Ok((service, Arc::new(verifier), gh))
 }

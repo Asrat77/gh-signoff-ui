@@ -41,3 +41,13 @@ fn adopt_legacy(from: &Path, to: &Path) {
         }
     }
 }
+
+/// Where the worktrees Signoff verifies pull requests in are kept: the
+/// cache folder, or a `worktrees` folder beside a `--config` file, so a
+/// second config never cleans up the first one's worktrees.
+pub(crate) fn worktrees_dir(config: Option<&Path>) -> Option<PathBuf> {
+    match config {
+        Some(path) => Some(std::path::absolute(path).ok()?.parent()?.join("worktrees")),
+        None => DIRS.installed().map(|dirs| dirs.cache.join("worktrees")),
+    }
+}

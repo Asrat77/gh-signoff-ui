@@ -29,6 +29,9 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
     notifications(ui, settings);
     ui.add_space(space::S);
 
+    worktrees(ui, settings);
+    ui.add_space(space::S);
+
     shortcut(ui, settings, effects);
     ui.add_space(space::S);
 
@@ -44,6 +47,18 @@ fn notifications(ui: &mut Ui, settings: &Settings) {
     if toggle.changed()
         && let Some(config) = settings.service.config()
         && let Err(err) = config.set_notifications(on)
+    {
+        toast(ui.ctx(), err.to_string(), Status::Failing);
+    }
+}
+
+fn worktrees(ui: &mut Ui, settings: &Settings) {
+    let mut on = settings.isolated_worktrees_on();
+    let hint = "When your checkout is on another commit, run checks in a worktree Signoff keeps at the pull request's head, so your own checkout is never switched. Turning this off deletes those worktrees.";
+    let toggle = ui.add_enabled(!settings.read_only(), ToggleRow::new(&mut on, "Verify in a separate worktree", hint));
+    if toggle.changed()
+        && let Some(config) = settings.service.config()
+        && let Err(err) = config.set_isolated_worktrees(on)
     {
         toast(ui.ctx(), err.to_string(), Status::Failing);
     }
