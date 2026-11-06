@@ -79,6 +79,10 @@ pub struct AppConfig {
     /// The global shortcut, such as `Alt+Shift+KeyS`; empty means the
     /// app's default. An invalid string also falls back to the default.
     pub shortcut: String,
+    /// Run a pull request's checks in a separate worktree that Signoff
+    /// manages, at the pull request's head, instead of requiring the
+    /// tracked checkout to be there. Off unless the person turns it on.
+    pub isolated_worktrees: bool,
     /// Tracked checkouts, sorted by GitHub name.
     pub repositories: Vec<TrackedRepository>,
 }
@@ -91,6 +95,7 @@ impl Default for AppConfig {
             notifications: true,
             shortcut_enabled: true,
             shortcut: String::new(),
+            isolated_worktrees: false,
             repositories: Vec::new(),
         }
     }
@@ -376,6 +381,18 @@ impl ConfigStore {
         })
     }
 
+    /// Turns verifying in a separate, Signoff-managed worktree on or off.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be saved.
+    pub fn set_isolated_worktrees(&self, on: bool) -> Result<(), ConfigError> {
+        self.change(|config| {
+            config.isolated_worktrees = on;
+            Ok(())
+        })
+    }
+
     /// Sets the global shortcut; empty means the app's default. The app
     /// checks that it parses: the config only keeps the text.
     ///
@@ -530,6 +547,21 @@ mod tests {
         let loaded = ConfigStore::open(&path).expect("reload").snapshot();
         assert!(!loaded.shortcut_enabled);
         assert_eq!(loaded.shortcut, "Alt+Shift+KeyS");
+    }
+
+    /// Verifying in a separate worktree is off unless a config says
+    /// otherwise, and the switch is kept.
+    #[test]
+    fn isolated_worktrees_default_off_for_old_configs_and_the_switch_is_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"version":1,"refreshSeconds":30,"repositories":[]}"#).expect("write");
+        let store = ConfigStore::open(&path).expect("open");
+        assert!(!store.snapshot().isolated_worktrees, "an old file has no setting: off");
+        store.set_isolated_worktrees(true).expect("save");
+        assert!(store.flush());
+        assert!(std::fs::read_to_string(&path).expect("read").contains(r#""isolatedWorktrees": true"#));
+        assert!(ConfigStore::open(&path).expect("reload").snapshot().isolated_worktrees);
     }
 
     /// The Go version's file must keep loading.
