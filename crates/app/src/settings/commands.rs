@@ -6,7 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use egui::{Align, DragValue, Layout, RichText, Ui};
 use signoff_core::checks::valid_context_name;
 use signoff_core::config::{DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS};
-use signoff_core::{CommandMapping, ProductService, ProductState, RepositoryState};
+use signoff_core::suggest;
+use signoff_core::{CommandMapping, CommandSuggestion, ProductService, ProductState, RepositoryState};
 use signoff_ui::theme::space;
 use signoff_ui::widgets::{Button, ButtonKind, Chip, IconButton, IconButtonKind, toast};
 use signoff_ui::{Status, Type, icons, palette};
@@ -30,7 +31,14 @@ pub(crate) struct Draft {
     saved: Vec<Row>,
     /// The name typed into the add field.
     new_check: String,
+    /// The check whose command field takes focus on the next frame.
+    focus: Option<String>,
+    /// Commands the checkout suggests, read when the draft is made.
+    suggested: Vec<CommandSuggestion>,
 }
+
+/// How many suggested commands show under a command field.
+const CHIPS: usize = 5;
 
 fn rows(commands: &BTreeMap<String, CommandMapping>) -> Vec<Row> {
     commands
@@ -93,15 +101,34 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
         Some(draft) if draft.repo_id == repo.id => draft,
         slot => {
             let rows = rows(&saved(&settings.service, repo));
-            slot.insert(Draft { repo_id: repo.id.clone(), saved: rows.clone(), rows, new_check: String::new() })
+            let suggested = suggest::detect(&repo.path);
+            slot.insert(Draft {
+                repo_id: repo.id.clone(),
+                saved: rows.clone(),
+                rows,
+                new_check: String::new(),
+                focus: None,
+                suggested,
+            })
         }
     };
+    if let Some((_, check)) = settings.configure.take_if(|(id, _)| *id == repo.id) {
+        if !draft.rows.iter().any(|row| row.check == check) {
+            draft.rows.push(Row {
+                check: check.clone(),
+                command: String::new(),
+                minutes: DEFAULT_TIMEOUT_SECONDS / 60,
+            });
+        }
+        draft.focus = Some(check);
+    }
     let read_only = settings.service.is_demo();
 
     if draft.rows.is_empty() {
         parts::notice(ui, Status::Neutral, "No commands yet. Add a check below, such as tests or lint.");
     }
     let mut remove = None;
+    let mut focus = draft.focus.take();
     for (index, row) in draft.rows.iter_mut().enumerate() {
         parts::card(ui, |ui| {
             let p = palette(ui.ctx());
@@ -124,8 +151,20 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
             });
             ui.add_space(space::XS);
             ui.add_enabled_ui(!read_only, |ui| {
-                parts::input(ui, &mut row.command, "e.g. cargo test --workspace", Type::Mono, ui.available_width());
+                let field =
+                    parts::input(ui, &mut row.command, "e.g. cargo test --workspace", Type::Mono, ui.available_width());
+                if focus.as_deref() == Some(row.check.as_str()) {
+                    focus = None;
+                    field.request_focus();
+                    field.scroll_to_me(Some(Align::Center));
+                }
             });
+            if !read_only && row.command.trim().is_empty() {
+                let chosen = suggestion_chips(ui, &draft.suggested, &row.check);
+                if let Some(command) = chosen {
+                    row.command = command;
+                }
+            }
         });
     }
     if let Some(index) = remove {
@@ -160,6 +199,26 @@ fn saved(service: &ProductService, repo: &RepositoryState) -> BTreeMap<String, C
         .config()
         .and_then(|config| config.find_repository(&repo.id))
         .map_or_else(|| repo.commands.clone(), |tracked| tracked.commands)
+}
+
+/// Clickable commands from the checkout, best match for `check` first;
+/// returns the one clicked.
+fn suggestion_chips(ui: &mut Ui, suggested: &[CommandSuggestion], check: &str) -> Option<String> {
+    let ranked = suggest::rank(suggested, check);
+    if ranked.is_empty() {
+        return None;
+    }
+    let mut chosen = None;
+    ui.add_space(space::XS);
+    ui.horizontal_wrapped(|ui| {
+        for suggestion in ranked.into_iter().take(CHIPS) {
+            let chip = Chip::new(&suggestion.command).icon(icons::TERMINAL);
+            if ui.add(chip).on_hover_text(format!("From {}", suggestion.source)).clicked() {
+                chosen = Some(suggestion.command.clone());
+            }
+        }
+    });
+    chosen
 }
 
 fn add_row(ui: &mut Ui, draft: &mut Draft, state: &ProductState, repo_id: &str) {

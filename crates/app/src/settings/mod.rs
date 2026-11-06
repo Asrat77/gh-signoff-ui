@@ -78,6 +78,8 @@ pub(crate) struct Settings {
     /// The repository the commands and branch rules sections show.
     selected_repo: Option<String>,
     commands: Option<commands::Draft>,
+    /// A repository and check Commands should show on its next frame.
+    configure: Option<(String, String)>,
     rules: Option<rules::Form>,
 }
 
@@ -102,6 +104,7 @@ impl Settings {
             discovery: discovery::Discovery::default(),
             selected_repo: None,
             commands: None,
+            configure: None,
             rules: None,
         }
     }
@@ -113,6 +116,15 @@ impl Settings {
         self.section = Section::BranchRules;
         self.selected_repo = Some(repo_id.to_owned());
         rules::set_up(self, repo_id, branch);
+    }
+
+    /// Opens Commands on the repository `repo_id` with a row for `check`
+    /// and its command field focused: the way to map a local command to a
+    /// required check. The caller opens the window.
+    pub(crate) fn configure_check(&mut self, repo_id: &str, check: &str) {
+        self.section = Section::Commands;
+        self.selected_repo = Some(repo_id.to_owned());
+        self.configure = Some((repo_id.to_owned(), check.to_owned()));
     }
 
     /// Asks for a checkout with the folder picker and starts tracking it.

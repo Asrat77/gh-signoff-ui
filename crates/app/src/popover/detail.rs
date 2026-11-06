@@ -84,6 +84,12 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
                     if check_row(ui, app, &pr, check, target.as_ref()).clicked() && check.configured {
                         app.glance.check = Some(check.name.clone());
                     }
+                    if !check.configured && check.state != CheckState::Success {
+                        let chip = Chip::new("Configure").icon(icons::TERMINAL);
+                        if ui.add(chip).on_hover_text(format!("Map a local command to {}", check.name)).clicked() {
+                            configure(app, &pr, &check.name);
+                        }
+                    }
                 }
                 if let (Some(check), Some(run)) = (&target, &run) {
                     ui.add_space(space::XS);
@@ -136,6 +142,21 @@ fn target<'a>(app: &Signoff, pr: &'a PullRequestState) -> Option<&'a Check> {
         return Some(check);
     }
     required.find(|check| pr.blocking.as_deref() == Some(&check.name) && check.configured)
+}
+
+/// The check the merge waits on when it has no local command and no other
+/// check is picked: the page's button then offers to set one up.
+fn to_configure<'a>(pr: &'a PullRequestState, target: Option<&Check>) -> Option<&'a Check> {
+    if target.is_some() {
+        return None;
+    }
+    glance::required(pr).find(|check| pr.blocking.as_deref() == Some(&check.name) && !check.configured)
+}
+
+/// Opens Settings → Commands on `check` of this pull request's repository.
+fn configure(app: &mut Signoff, pr: &PullRequestState, check: &str) {
+    app.settings.configure_check(&pr.repo_id, check);
+    app.settings_open = true;
 }
 
 /// The run request for `check` on `pr`.
@@ -219,8 +240,9 @@ fn problems(ui: &mut Ui, pr: &PullRequestState) {
 
 /// The page's main button: run and sign off the target check, stop it
 /// while it runs, or open a ready pull request to merge.
-fn actions(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) {
+fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) {
     let can_run = app.demo || pr.checked_out;
+    let unmapped = to_configure(pr, target);
     match (target, run) {
         (Some(check), Some(run)) if run.running() => {
             let label = format!("Stop {}", check.name);
@@ -237,6 +259,12 @@ fn actions(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, target: Option<&Ch
                 app.runs.start(request(pr, check));
             }
         }
+        _ if unmapped.is_some() => {
+            let name = unmapped.map(|check| check.name.as_str()).unwrap_or_default();
+            if ui.add(Button::new(&format!("Configure {name}")).icon(icons::TERMINAL)).clicked() {
+                configure(app, pr, name);
+            }
+        }
         _ => {
             let (label, kind) = if pr.ready {
                 ("Open pull request to merge", ButtonKind::Accent)
@@ -251,7 +279,12 @@ fn actions(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, target: Option<&Ch
     ui.add_space(space::S);
     let hint = match target {
         _ if app.demo => "Demo: runs are simulated and nothing is signed off on GitHub.".to_owned(),
-        Some(check) if !check.configured => format!("Map a local command to {} in Settings to run it.", check.name),
+        _ if unmapped.is_some() => {
+            format!(
+                "Map a local command to {} to run it from here.",
+                unmapped.map(|c| c.name.as_str()).unwrap_or_default()
+            )
+        }
         _ if pr.checked_out => "Your checkout is on this commit.".to_owned(),
         _ => format!("Check out {} at {} to verify it locally.", pr.pr.head_ref, glance::short_sha(&pr.pr.head_sha)),
     };
