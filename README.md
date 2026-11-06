@@ -8,8 +8,10 @@ This is the product, not a browser dashboard. The normal experience is a compact
 
 Signoff is being rewritten in Rust as a native app for macOS, Windows and Linux, with no Go, Electron or Node. It is built with [egui](https://github.com/emilk/egui) on [fastframe](https://github.com/crmne/fastframe) (tray, window lifecycle, themes). Until it reaches parity, the Go and Electron app described below remains the shipping version.
 
-- `crates/core` (`signoff-core`): the logic, with no UI. gh reads, branch-protection resolution, config and history (same file formats as before), the multi-repository state and the demo data.
+- `crates/core` (`signoff-core`): the logic, with no UI. gh reads, branch-protection resolution, config and history (same file formats as before), the multi-repository state and the demo data. `verify` runs a check's mapped command on the pull request's head commit and writes `gh signoff --commit <sha>` only when it passed.
 - `crates/app` (`signoff`): the tray app. A tray item coloured by overall health, a small window, and a settings window; GitHub is refreshed on a background thread.
+
+Verify and sign off: a check with a mapped command gets a Verify button once the pull request's head commit is checked out. The command runs in your login shell (`$SHELL -l -c`, or `cmd /C` on Windows) inside the checkout, with its output streamed under the check and its timeout enforced on everything it starts. On exit code 0, Signoff confirms that neither the checkout nor the pull request on GitHub moved, then signs off that exact commit. Runs and signoffs are recorded in the local history.
 
 Requires Rust 1.98 (pinned in `rust-toolchain.toml`, so rustup installs it). On Linux the window needs `libxkbcommon-x11` and the tray needs a StatusNotifier host.
 
