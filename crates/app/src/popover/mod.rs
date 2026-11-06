@@ -6,6 +6,7 @@
 //! pull request's page. Everything shown comes from the latest state the
 //! background refresh copied in, so drawing never waits on `gh`.
 
+mod command_palette;
 mod detail;
 mod list;
 mod parts;
@@ -17,6 +18,8 @@ use signoff_ui::theme::radius;
 use crate::app::Signoff;
 use crate::glance::Filter;
 
+pub(crate) use command_palette::CommandPalette;
+
 /// What the popover is showing.
 #[derive(Debug, Default)]
 pub(crate) struct Glance {
@@ -26,6 +29,8 @@ pub(crate) struct Glance {
     pub(crate) page: Page,
     /// The check picked on a pull request's page, to run.
     pub(crate) check: Option<String>,
+    /// The command palette, while it is open.
+    pub(crate) palette: Option<CommandPalette>,
 }
 
 /// The page the sheet shows.
@@ -56,4 +61,5 @@ pub(crate) fn show(ui: &mut Ui, app: &mut Signoff) {
             Page::PullRequest { repo_id, number } => detail::show(ui, app, &repo_id, number),
         }
     });
+    command_palette::show(ui, app);
 }

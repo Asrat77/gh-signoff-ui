@@ -395,7 +395,8 @@ impl Window {
             }
             _ => {}
         }
-        if escape {
+        // Escape closes the command palette first.
+        if escape && self.app.glance.palette.is_none() {
             self.app.hide(ctx);
         }
     }

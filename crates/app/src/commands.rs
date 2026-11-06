@@ -199,7 +199,8 @@ mod tests {
             assert!(has(&list, |c| matches!(c, Command::OpenUrl(url) if *url == pr.pr.url)));
         }
         assert!(has(&list, |c| *c == Command::Refresh));
-        for section in [Section::Repositories, Section::Commands, Section::BranchRules, Section::History, Section::General]
+        for section in
+            [Section::Repositories, Section::Commands, Section::BranchRules, Section::History, Section::General]
         {
             assert!(has(&list, |c| *c == Command::Settings(section)));
         }
@@ -231,8 +232,11 @@ mod tests {
                 }
                 Command::Copy(command) => {
                     assert!(
-                        state.pull_requests.iter().any(|pr| glance::required(pr)
-                            .any(|c| &c.command == command && c.state != CheckState::Success)),
+                        state
+                            .pull_requests
+                            .iter()
+                            .any(|pr| glance::required(pr)
+                                .any(|c| &c.command == command && c.state != CheckState::Success)),
                         "{command}"
                     );
                 }
