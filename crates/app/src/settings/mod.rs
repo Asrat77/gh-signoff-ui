@@ -83,6 +83,8 @@ pub(crate) struct Settings {
     rules: Option<rules::Form>,
     /// The `gh signoff` install is running; the app sets this each frame.
     pub(crate) installing: bool,
+    /// Whether the global shortcut works; the app sets this when it changes.
+    pub(crate) shortcut_status: crate::hotkey::Status,
 }
 
 /// What the settings asked the app for this frame.
@@ -92,6 +94,8 @@ pub(crate) struct Effects {
     pub(crate) refresh: bool,
     /// Install the `gh signoff` extension.
     pub(crate) install: bool,
+    /// The global shortcut changed: register it again.
+    pub(crate) shortcut: bool,
 }
 
 impl Settings {
@@ -111,6 +115,7 @@ impl Settings {
             configure: None,
             rules: None,
             installing: false,
+            shortcut_status: crate::hotkey::Status::Off,
         }
     }
 
@@ -183,6 +188,15 @@ impl Settings {
     /// Whether desktop notifications are on. They are until switched off.
     pub(crate) fn notifications_on(&self) -> bool {
         self.service.config().is_none_or(|config| config.snapshot().notifications)
+    }
+
+    /// Whether the global shortcut is on, and its config string (empty: the
+    /// default). On with the default until a config says otherwise.
+    pub(crate) fn shortcut_config(&self) -> (bool, String) {
+        self.service.config().map_or((true, String::new()), |config| {
+            let config = config.snapshot();
+            (config.shortcut_enabled, config.shortcut)
+        })
     }
 
     /// Whether edits are refused: demo data has no config to change.

@@ -844,6 +844,24 @@ fn the_notifications_switch_is_on_by_default_and_saved() {
     assert!(service.config().expect("config").snapshot().notifications);
 }
 
+#[test]
+fn the_global_shortcut_switch_is_on_by_default_and_saved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.run_ok();
+    assert_eq!(harness.state().settings.shortcut_config(), (true, String::new()));
+
+    harness.get_by_label("Global shortcut").click();
+    harness.run_ok();
+    assert!(!service.config().expect("config").snapshot().shortcut_enabled);
+
+    harness.get_by_label("Global shortcut").click();
+    harness.run_ok();
+    assert!(service.config().expect("config").snapshot().shortcut_enabled);
+}
+
 /// A state where `gh` is ready and only the extension is missing.
 fn without_extension(mut state: ProductState) -> ProductState {
     state.env.gh_installed = true;
