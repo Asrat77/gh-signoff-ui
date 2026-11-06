@@ -36,6 +36,7 @@ open = "5"
 # the system notification centre on macOS and toast notifications on Windows.
 notify-rust = "4.18"
 global-hotkey = "0.9.0"
+notify.workspace = true
 
 [dev-dependencies]
 # Drives the real widgets through their accessibility tree, without a window.

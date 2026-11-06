@@ -5,8 +5,9 @@
 //!
 //! - **The scheduler** decides when to read. Some things read at once: the
 //!   app starting, Refresh (and the popover opening on stale data), the
-//!   config changing a repository and a signoff landing on one. Between
-//!   those, full reads follow [`cadence::wait`]: often
+//!   config changing a repository, a signoff landing on one, and a
+//!   checkout's `HEAD` or branches changing on disk ([`GitWatcher`],
+//!   debounced). Between those, full reads follow [`cadence::wait`]: often
 //!   while the popover is open or something is in flight, rarely when
 //!   nothing is open, backing off after failures and never before GitHub's
 //!   rate limit lifts. Waking from sleep (the clocks disagree about how long
@@ -25,7 +26,8 @@
 //! state when the revision moved. [`Pulse`] is what the scheduler knows
 //! about how reads are going, for the popover's live indicator.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
@@ -36,6 +38,7 @@ use signoff_core::product::PARALLEL_REPOSITORIES;
 use signoff_core::{CheckState, ProductService, ProductState};
 
 use crate::cadence::{self, Signals};
+use crate::watcher::GitWatcher;
 
 type Wake = Arc<dyn Fn() + Send + Sync>;
 
@@ -55,6 +58,8 @@ enum Command {
         visible: bool,
         running: bool,
     },
+    /// These repositories' checkouts changed on disk.
+    GitChanged(Vec<String>),
     /// A read finished: whether it failed, or `None` when it says nothing
     /// about the connection (overtaken, or rate limited).
     Read(Option<bool>),
@@ -179,6 +184,11 @@ pub(crate) struct Pulse {
 /// jumping (the computer slept) soon after waking.
 const TICK: Duration = Duration::from_secs(15);
 
+/// A checkout's changes are read once they have been quiet this long...
+const GIT_QUIET: Duration = Duration::from_millis(300);
+/// ...or this long after the first, if they keep coming (a rebase).
+const GIT_MAX_DELAY: Duration = Duration::from_secs(2);
+
 /// Demo data never changes on its own: no timed reads.
 const UNTIMED: Duration = Duration::from_secs(24 * 3600);
 
@@ -198,6 +208,11 @@ struct Schedule {
     settled_at: Instant,
     /// When the next timed full read starts.
     next: Instant,
+    /// Repositories whose checkouts changed, waiting for the changes to
+    /// stop, with when the first and the latest came.
+    git: BTreeSet<String>,
+    git_first: Option<Instant>,
+    git_last: Option<Instant>,
 }
 
 impl Schedule {
@@ -213,6 +228,9 @@ impl Schedule {
             full: true,
             settled_at: now,
             next: now,
+            git: BTreeSet::new(),
+            git_first: None,
+            git_last: None,
         };
         schedule.next = now + schedule.wait(None);
         schedule
@@ -276,6 +294,25 @@ impl Schedule {
         self.failures = 0;
     }
 
+    fn git_changed(&mut self, ids: Vec<String>, now: Instant) {
+        self.git.extend(ids);
+        self.git_first.get_or_insert(now);
+        self.git_last = Some(now);
+    }
+
+    fn git_due(&self) -> Option<Instant> {
+        Some((self.git_last? + GIT_QUIET).min(self.git_first? + GIT_MAX_DELAY))
+    }
+
+    /// The repositories whose checkouts changed, once the changes settled.
+    fn take_git(&mut self, now: Instant) -> Vec<String> {
+        if self.git_due().is_none_or(|due| due > now) {
+            return Vec::new();
+        }
+        (self.git_first, self.git_last) = (None, None);
+        std::mem::take(&mut self.git).into_iter().collect()
+    }
+
     /// Whether the next timed full read is due.
     fn full_due(&self, now: Instant) -> bool {
         now >= self.next
@@ -283,7 +320,7 @@ impl Schedule {
 
     /// When something next needs doing, if nothing comes in first.
     fn deadline(&self) -> Instant {
-        self.next
+        self.git_due().map_or(self.next, |due| due.min(self.next))
     }
 
     fn pulse(&self) -> Pulse {
@@ -338,10 +375,10 @@ impl Refresher {
             }
         }
         let scheduler = {
-            let (service, queue, pulse) = (service.clone(), queue.clone(), pulse.clone());
+            let (service, queue, pulse, commands) = (service.clone(), queue.clone(), pulse.clone(), commands.clone());
             thread::Builder::new()
                 .name("signoff-refresh".into())
-                .spawn(move || schedule(&service, &queue, &inbox, &*wake, &pulse))
+                .spawn(move || schedule(&service, &queue, &inbox, &commands, &*wake, &pulse))
         };
         match scheduler {
             Ok(thread) => threads.push(thread),
@@ -447,15 +484,36 @@ fn read(service: &ProductService, queue: &Queue, wake: &dyn Fn(), commands: &Sen
     }
 }
 
-/// The scheduler: turns commands and the cadence into jobs.
+/// Watches the checkouts of the repositories that are read.
+fn watch(watcher: &mut Option<GitWatcher>, service: &ProductService) {
+    let (Some(watcher), Some(config)) = (watcher, service.config()) else { return };
+    let repositories: Vec<(String, PathBuf)> = config
+        .snapshot()
+        .repositories
+        .into_iter()
+        .filter(|repo| repo.enabled)
+        .map(|repo| (repo.id, repo.path))
+        .collect();
+    watcher.watch(repositories);
+}
+
+/// The scheduler: turns commands, the cadence and the watchers into jobs.
 fn schedule(
     service: &ProductService,
     queue: &Queue,
     inbox: &mpsc::Receiver<Command>,
+    commands: &Sender<Command>,
     wake: &dyn Fn(),
     pulse: &Mutex<Pulse>,
 ) {
     let mut plan = Schedule::new(Instant::now(), !service.is_demo());
+    let mut watcher = service.config().map(|_| {
+        let commands = commands.clone();
+        GitWatcher::new(move |ids| {
+            let _ = commands.send(Command::GitChanged(ids));
+        })
+    });
+    watch(&mut watcher, service);
     loop {
         let (asked, asked_wall) = (Instant::now(), Timestamp::now());
         let expected = plan.deadline().saturating_duration_since(asked).min(TICK);
@@ -477,9 +535,11 @@ fn schedule(
             Ok(Command::ConfigChanged) => {
                 let ids = service.sync_config();
                 queue.update(|jobs| ids.into_iter().for_each(|id| jobs.read(id, true)));
+                watch(&mut watcher, service);
                 wake();
             }
             Ok(Command::Activity { visible, running }) => plan.set_activity(visible, running, rate),
+            Ok(Command::GitChanged(ids)) => plan.git_changed(ids, now),
             Ok(Command::Read(failed)) => plan.record(failed),
             Ok(Command::Idle) => {
                 plan.settle(now, wall, &service.cached(), rate);
@@ -491,6 +551,10 @@ fn schedule(
                 break;
             }
             Err(RecvTimeoutError::Timeout) => {}
+        }
+        let changed = plan.take_git(now);
+        if !changed.is_empty() {
+            queue.update(|jobs| changed.into_iter().for_each(|id| jobs.read(id, true)));
         }
         if plan.full_due(now) {
             queue.update(|jobs| jobs.plan(false));
@@ -650,6 +714,27 @@ mod tests {
         s.record(Some(false));
         s.settle(t0 + secs(50), wall(50), &open(false), None);
         assert_eq!(s.deadline(), t0 + cadence::BACKGROUND);
+    }
+
+    #[test]
+    fn checkout_changes_are_read_once_they_stop() {
+        let t0 = Instant::now();
+        let mut s = settled(t0, &open(false));
+        s.git_changed(vec!["a".into()], t0);
+        assert_eq!(s.deadline(), t0 + GIT_QUIET);
+        s.git_changed(vec!["b".into(), "a".into()], t0 + Duration::from_millis(200));
+        assert!(s.take_git(t0 + Duration::from_millis(300)).is_empty(), "still changing");
+        assert_eq!(s.take_git(t0 + Duration::from_millis(500)), ["a", "b"]);
+        assert!(s.take_git(t0 + secs(1)).is_empty(), "taken once");
+        assert_eq!(s.deadline(), t0 + cadence::BACKGROUND);
+
+        // A rebase that keeps changing them is read every couple of seconds.
+        let t1 = t0 + secs(5);
+        for step in 0..10 {
+            s.git_changed(vec!["a".into()], t1 + Duration::from_millis(step * 250));
+        }
+        assert_eq!(s.deadline(), t1 + GIT_MAX_DELAY);
+        assert_eq!(s.take_git(t1 + GIT_MAX_DELAY), ["a"]);
     }
 
     #[test]

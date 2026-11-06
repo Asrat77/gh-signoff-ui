@@ -3394,6 +3394,7 @@ dependencies = [
  "global-hotkey",
  "jiff",
  "log",
+ "notify",
  "notify-rust",
  "open",
  "rfd",

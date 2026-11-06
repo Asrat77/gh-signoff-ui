@@ -37,6 +37,9 @@ thiserror = "2"
 # corporate CAs in the OS store work, HTTPS_PROXY/NO_PROXY from the env.
 ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
 tempfile = "3"
+# Watches each checkout's HEAD and branches, so checking out a branch is
+# read at once instead of on the next timed read.
+notify = "8.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
