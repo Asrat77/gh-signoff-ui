@@ -140,39 +140,54 @@ pub(crate) fn contents(ui: &mut Ui, settings: &mut Settings, state: &ProductStat
     Frame::new().fill(p.window).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
         ui.horizontal_top(|ui| {
-            Frame::new().inner_margin(Margin::same(18)).show(ui, |ui| {
-                ui.set_width(170.0);
-                ui.set_min_height(ui.available_height());
-                ui.label(RichText::new("Settings").font(Type::Title.font()).color(p.text));
-                ui.add_space(space::L);
-                for section in Section::ALL {
-                    let chip = Chip::new(section.label()).icon(section.icon()).selected(settings.section == section);
-                    if ui.add(chip.width(170.0)).clicked() {
-                        settings.section = section;
-                    }
-                    ui.add_space(space::XS);
-                }
-            });
-            ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                Frame::new().inner_margin(Margin { left: 6, right: 22, top: 22, bottom: 22 }).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    if settings.read_only() {
-                        parts::notice(
-                            ui,
-                            signoff_ui::Status::Neutral,
-                            "Demo data: settings are shown but nothing is saved or sent to GitHub.",
-                        );
-                    }
-                    match settings.section {
-                        Section::General => general::show(ui, settings, state, &mut effects),
-                        Section::Repositories => repositories::show(ui, settings, state, &mut effects),
-                        Section::Commands => commands::show(ui, settings, state, &mut effects),
-                        Section::BranchRules => rules::show(ui, settings, state, &mut effects),
-                        Section::History => history::show(ui, state),
-                    }
+            // Each column stacks its own contents top to bottom; inside the
+            // row they would otherwise run sideways.
+            ui.vertical(|ui| nav(ui, settings));
+            ui.vertical(|ui| {
+                ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    section(ui, settings, state, &mut effects);
                 });
             });
         });
     });
     effects
+}
+
+/// The column of sections.
+fn nav(ui: &mut Ui, settings: &mut Settings) {
+    let p = palette(ui.ctx());
+    Frame::new().inner_margin(Margin::same(18)).show(ui, |ui| {
+        ui.set_width(170.0);
+        ui.set_min_height(ui.available_height());
+        ui.label(RichText::new("Settings").font(Type::Title.font()).color(p.text));
+        ui.add_space(space::L);
+        for section in Section::ALL {
+            let chip = Chip::new(section.label()).icon(section.icon()).selected(settings.section == section);
+            if ui.add(chip.width(170.0)).clicked() {
+                settings.section = section;
+            }
+            ui.add_space(space::XS);
+        }
+    });
+}
+
+/// The chosen section.
+fn section(ui: &mut Ui, settings: &mut Settings, state: &ProductState, effects: &mut Effects) {
+    Frame::new().inner_margin(Margin { left: 6, right: 22, top: 22, bottom: 22 }).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        if settings.read_only() {
+            parts::notice(
+                ui,
+                signoff_ui::Status::Neutral,
+                "Demo data: settings are shown but nothing is saved or sent to GitHub.",
+            );
+        }
+        match settings.section {
+            Section::General => general::show(ui, settings, state, effects),
+            Section::Repositories => repositories::show(ui, settings, state, effects),
+            Section::Commands => commands::show(ui, settings, state, effects),
+            Section::BranchRules => rules::show(ui, settings, state, effects),
+            Section::History => history::show(ui, state),
+        }
+    });
 }
