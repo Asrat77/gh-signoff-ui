@@ -490,6 +490,14 @@ impl ProductService {
         Self { source, state: RwLock::new(ProductState::default()), refreshing: Mutex::new(()) }
     }
 
+    /// Serves `state` as if just refreshed, for tests elsewhere in the crate.
+    #[cfg(test)]
+    pub(crate) fn with_state(state: ProductState) -> Self {
+        let service = Self::demo();
+        *service.state.write().unwrap_or_else(PoisonError::into_inner) = state;
+        service
+    }
+
     /// Whether this serves demo data.
     pub fn is_demo(&self) -> bool {
         matches!(self.source, Source::Demo)

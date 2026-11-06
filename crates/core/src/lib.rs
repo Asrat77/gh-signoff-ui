@@ -10,6 +10,8 @@
 //! - [`config`] and [`history`] are the two files Signoff keeps on disk.
 //! - [`product`] assembles the whole multi-repository state, and
 //!   [`ProductService`] keeps the latest copy of it.
+//! - [`verify`] runs a check's local command on the pull request's head
+//!   commit and writes the signoff only when it passed.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
 pub mod checks;
@@ -19,6 +21,7 @@ pub mod gh;
 pub mod history;
 pub mod product;
 pub mod runner;
+pub mod verify;
 
 pub use checks::{Check, CheckState, Rules, Tally};
 pub use config::{
@@ -28,3 +31,4 @@ pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, R
 pub use history::{ActivityEvent, ActivityKind, HistoryStore};
 pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequestState, RepositoryState};
 pub use runner::{CANCELLED, Output, Runner, SystemRunner, TIMED_OUT};
+pub use verify::{Outcome, Phase, Verifier, VerifyError, VerifyEvent, VerifyRequest};
