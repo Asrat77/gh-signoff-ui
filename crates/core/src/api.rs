@@ -453,6 +453,7 @@ impl Api {
             let response = match self.transport.get(url, &headers) {
                 Ok(response) => response,
                 Err(err) => {
+                    log::warn!("GitHub API unreachable, reading through gh for a while: {err}");
                     *lock(&self.offline_since) = Some(Instant::now());
                     return Err(ApiError::Transport(err));
                 }

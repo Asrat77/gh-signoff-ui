@@ -291,7 +291,7 @@ pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &Stat
     if let Some(api) = gh.api().filter(|api| api.usable()) {
         match read_with_api(gh, api, tracked) {
             Ok(read) => return read,
-            Err(err) => log::info!("reading {} through gh: {err}", tracked.name_with_owner),
+            Err(err) => log::debug!("reading {} through gh: {err}", tracked.name_with_owner),
         }
     }
     read_with_gh(gh, tracked, cache)
