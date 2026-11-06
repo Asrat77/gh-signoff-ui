@@ -14,7 +14,7 @@ use crate::app::Signoff;
 use crate::glance::{self, Filter};
 
 /// Room kept under the list for the main button and the "updated" line.
-const FOOTER: f32 = 96.0;
+const FOOTER: f32 = 112.0;
 
 /// What the list asks for this frame.
 enum Action {

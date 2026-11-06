@@ -48,6 +48,7 @@ cargo run -p signoff-ui --example gallery -- --run    # start the demo run
 
 ## Licences
 
-JetBrains Mono is bundled under the SIL Open Font License 1.1
-(`fonts/JetBrainsMono-LICENSE.txt`). Inter comes from `fastframe-fonts` under the
-same licence, and the Phosphor icons from `egui-phosphor` under MIT.
+JetBrains Mono and Inter are bundled under the SIL Open Font License 1.1
+(`fonts/JetBrainsMono-LICENSE.txt`, `fonts/Inter-LICENSE.txt`). The bundled Inter is
+Inter 4.1 with only the digits made tabular; `fonts/tools/freeze_digits.py` rebuilds
+it. The Phosphor icons come from `egui-phosphor` under MIT.
