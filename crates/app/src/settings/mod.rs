@@ -7,6 +7,7 @@
 
 mod commands;
 mod general;
+mod history;
 mod jobs;
 mod parts;
 mod repositories;
@@ -36,10 +37,12 @@ pub(crate) enum Section {
     Commands,
     /// The signoff checks a branch requires.
     BranchRules,
+    /// Local runs and signoffs.
+    History,
 }
 
 impl Section {
-    const ALL: [Self; 4] = [Self::General, Self::Repositories, Self::Commands, Self::BranchRules];
+    const ALL: [Self; 5] = [Self::General, Self::Repositories, Self::Commands, Self::BranchRules, Self::History];
 
     fn label(self) -> &'static str {
         match self {
@@ -47,6 +50,7 @@ impl Section {
             Self::Repositories => "Repositories",
             Self::Commands => "Commands",
             Self::BranchRules => "Branch rules",
+            Self::History => "History",
         }
     }
 
@@ -56,6 +60,7 @@ impl Section {
             Self::Repositories => icons::REPOSITORY,
             Self::Commands => icons::TERMINAL,
             Self::BranchRules => icons::BRANCH,
+            Self::History => icons::HISTORY,
         }
     }
 }
@@ -163,6 +168,7 @@ pub(crate) fn contents(ui: &mut Ui, settings: &mut Settings, state: &ProductStat
                         Section::Repositories => repositories::show(ui, settings, state, &mut effects),
                         Section::Commands => commands::show(ui, settings, state, &mut effects),
                         Section::BranchRules => rules::show(ui, settings, state, &mut effects),
+                        Section::History => history::show(ui, state),
                     }
                 });
             });
