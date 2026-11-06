@@ -319,9 +319,22 @@ impl Gh {
         Ok(RepoInfo {
             name_with_owner: view.name_with_owner,
             default_branch: view.default_branch_ref.map(|b| b.name).unwrap_or_default(),
+            ..self.local_head(dir)
+        })
+    }
+
+    /// The branch and commit checked out at `dir`, from the files under
+    /// `.git` when they say for certain, otherwise from `git`. Empty when
+    /// neither can tell (an unborn branch).
+    pub fn local_head(&self, dir: &Path) -> RepoInfo {
+        if let Some(head) = crate::git::read_head(dir) {
+            return RepoInfo { current_branch: head.branch, head_sha: head.sha, ..RepoInfo::default() };
+        }
+        RepoInfo {
             current_branch: self.git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default(),
             head_sha: self.git(dir, &["rev-parse", "HEAD"]).unwrap_or_default(),
-        })
+            ..RepoInfo::default()
+        }
     }
 
     /// The pull request for the branch checked out at `dir`. No pull request

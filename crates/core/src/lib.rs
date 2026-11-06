@@ -25,6 +25,7 @@ pub mod config;
 pub mod demo;
 pub mod discover;
 pub mod gh;
+mod git;
 pub mod history;
 pub mod product;
 pub mod rules;
