@@ -35,6 +35,8 @@ rfd = "0.15"
 [dev-dependencies]
 # Drives the real widgets through their accessibility tree, without a window.
 egui_kittest = "0.36"
+# Marks the test thread as the UI thread, so a blocking file write fails.
+fastframe-file.workspace = true
 tempfile.workspace = true
 
 # Installable packages, built with cargo-packager (`cargo packager --release

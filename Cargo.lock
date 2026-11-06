@@ -3126,6 +3126,7 @@ dependencies = [
  "egui_kittest",
  "env_logger",
  "fastframe-dirs",
+ "fastframe-file",
  "fastframe-shell",
  "fastframe-tray",
  "jiff",
