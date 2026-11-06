@@ -15,11 +15,13 @@
 //!   commit and writes the signoff only when it passed.
 //! - [`rules`] edits the signoff checks branch protection requires,
 //!   leaving every other rule alone.
+//! - [`discover`] finds the GitHub checkouts already on this computer.
 //! - [`demo`] is fixed sample data that never touches GitHub.
 
 pub mod checks;
 pub mod config;
 pub mod demo;
+pub mod discover;
 pub mod gh;
 pub mod history;
 pub mod product;
