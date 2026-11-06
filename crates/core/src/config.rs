@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::{PoisonError, RwLock};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use fastframe_file::{Access, Writer};
 use serde::{Deserialize, Serialize};
@@ -180,11 +180,27 @@ pub enum ConfigError {
 /// which replaces the file atomically, readable only by the user. Changing
 /// methods never wait for the disk, so the UI thread may call them; call
 /// [`ConfigStore::flush`] before the app exits.
+///
+/// Whoever shows state derived from the config can
+/// [`subscribe`](ConfigStore::subscribe) to hear about each change at once,
+/// rather than waiting for the next refresh to notice it.
 #[derive(Debug)]
 pub struct ConfigStore {
     path: PathBuf,
     config: RwLock<AppConfig>,
     writer: Writer,
+    listeners: Listeners,
+}
+
+/// Callbacks run after each change.
+#[derive(Default)]
+struct Listeners(Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>);
+
+impl std::fmt::Debug for Listeners {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let count = self.0.lock().map(|l| l.len()).unwrap_or_default();
+        f.debug_tuple("Listeners").field(&count).finish()
+    }
 }
 
 impl ConfigStore {
@@ -205,19 +221,26 @@ impl ConfigStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => AppConfig::default(),
             Err(source) => return Err(ConfigError::Io { action: "reading", path, source }),
         };
-        Ok(Self { path, config: RwLock::new(config), writer: Writer::new() })
+        Ok(Self { path, config: RwLock::new(config), writer: Writer::new(), listeners: Listeners::default() })
     }
 
     /// A store that holds `config` and saves to `path`.
     pub fn with_config(path: impl Into<PathBuf>, mut config: AppConfig) -> Self {
         config.normalize();
-        Self { path: path.into(), config: RwLock::new(config), writer: Writer::new() }
+        Self { path: path.into(), config: RwLock::new(config), writer: Writer::new(), listeners: Listeners::default() }
     }
 
     /// Waits, at most [`fastframe_file::FLUSH_TIMEOUT`], until every change
     /// is on disk. Returns whether it is.
     pub fn flush(&self) -> bool {
         self.writer.flush(fastframe_file::FLUSH_TIMEOUT)
+    }
+
+    /// Calls `listener` after every change from now on, on the thread that
+    /// made it and after the new config is readable. Keep it quick: the UI
+    /// thread makes most changes.
+    pub fn subscribe(&self, listener: impl Fn() + Send + Sync + 'static) {
+        self.listeners.0.lock().unwrap_or_else(PoisonError::into_inner).push(Arc::new(listener));
     }
 
     /// The config file.
@@ -319,6 +342,12 @@ impl ConfigStore {
         next.normalize();
         self.save(&next)?;
         *guard = next;
+        drop(guard);
+        // Copied out so a listener may subscribe or read the config.
+        let listeners = self.listeners.0.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        for listener in listeners {
+            listener();
+        }
         Ok(value)
     }
 
@@ -377,6 +406,22 @@ mod tests {
         store.set_refresh_seconds(120).expect("save");
         assert!(store.flush(), "written");
         assert_eq!(ConfigStore::open(&path).expect("reload").snapshot().refresh_seconds, 120);
+    }
+
+    #[test]
+    fn tells_subscribers_about_each_change_after_it_applies() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(ConfigStore::with_config(dir.path().join("config.json"), AppConfig::default()));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (weak, log) = (Arc::downgrade(&store), seen.clone());
+        store.subscribe(move || {
+            let seconds = weak.upgrade().map(|s| s.snapshot().refresh_seconds);
+            log.lock().expect("seen").push(seconds);
+        });
+        store.set_refresh_seconds(45).expect("save");
+        assert!(store.set_refresh_seconds(1).is_err());
+        assert!(store.remove_repository("missing").is_err());
+        assert_eq!(*seen.lock().expect("seen"), [Some(45)], "only changes that applied, and readable");
     }
 
     #[test]
