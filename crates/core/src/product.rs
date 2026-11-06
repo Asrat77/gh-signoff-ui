@@ -511,6 +511,24 @@ impl ProductService {
         }
     }
 
+    /// The `gh` client, config and history, outside demo mode.
+    pub(crate) fn github(&self) -> Option<(&Gh, &Arc<ConfigStore>, &Arc<HistoryStore>)> {
+        match &self.source {
+            Source::GitHub { gh, config, history, .. } => Some((gh, config, history)),
+            Source::Demo => None,
+        }
+    }
+
+    /// Starts tracking the checkout at `path`. Blocks on `gh`.
+    ///
+    /// # Errors
+    ///
+    /// In demo mode, or when [`ConfigStore::add_repository`] fails.
+    pub fn add_repository(&self, path: &Path) -> Result<TrackedRepository, String> {
+        let (gh, config, _) = self.github().ok_or("repositories cannot be added in demo mode")?;
+        config.add_repository(gh, path).map_err(|err| err.to_string())
+    }
+
     /// The latest state, without reading anything.
     pub fn cached(&self) -> ProductState {
         self.state.read().unwrap_or_else(PoisonError::into_inner).clone()

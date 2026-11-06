@@ -14,8 +14,11 @@ use std::path::Path;
 
 use serde_json::json;
 
+use crate::checks::CheckState;
 use crate::checks::{merge_signoff_contexts, valid_context_name};
 use crate::gh::{Gh, GhError, ProtectionStatus};
+use crate::history::{ActivityEvent, ActivityKind};
+use crate::product::ProductService;
 
 /// Why the required checks could not be changed.
 #[derive(Debug, thiserror::Error)]
@@ -187,6 +190,75 @@ impl Gh {
     }
 }
 
+/// The signoff checks a branch requires now, as check names (`tests`, or
+/// `signoff` for the bare check), and whether protection could be read.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BranchChecks {
+    /// Signoff check names, sorted.
+    pub checks: Vec<String>,
+    /// Every context the branch requires, signoff or not.
+    pub contexts: Vec<String>,
+    /// Whether the branch is protected at all.
+    pub protected: bool,
+}
+
+/// `signoff/tests` → `tests`; the bare `signoff` stays.
+fn check_name(context: &str) -> String {
+    context.strip_prefix("signoff/").unwrap_or(context).to_owned()
+}
+
+impl ProductService {
+    /// The signoff checks `branch` of the tracked repository `repo_id`
+    /// requires. Blocks on `gh`.
+    ///
+    /// # Errors
+    ///
+    /// In demo mode, for an unknown repository, or when protection is
+    /// unreadable.
+    pub fn signoff_checks(&self, repo_id: &str, branch: &str) -> Result<BranchChecks, String> {
+        let (gh, config, _) = self.github().ok_or("branch rules are read-only in demo mode")?;
+        let repo = config.find_repository(repo_id).ok_or("that repository is no longer tracked")?;
+        let (contexts, protection) = gh.protection_contexts(&repo.path, &repo.name_with_owner, &path_segment(branch));
+        if protection == ProtectionStatus::Unreadable {
+            return Err(RulesError::Unreadable(branch.to_owned()).to_string());
+        }
+        let mut checks: Vec<String> =
+            contexts.iter().filter(|c| crate::checks::is_signoff_context(c)).map(|c| check_name(c)).collect();
+        checks.sort();
+        Ok(BranchChecks { checks, contexts, protected: protection == ProtectionStatus::Ok })
+    }
+
+    /// Makes `branch` of the tracked repository `repo_id` require exactly
+    /// the signoff checks `names`, keeping every other rule, and records the
+    /// change in the history. Blocks on `gh`.
+    ///
+    /// # Errors
+    ///
+    /// In demo mode, for an unknown repository, or when
+    /// [`Gh::set_signoff_checks`] fails.
+    pub fn set_signoff_checks(&self, repo_id: &str, branch: &str, names: &[String]) -> Result<Write, String> {
+        let (gh, config, history) = self.github().ok_or("branch rules are read-only in demo mode")?;
+        let repo = config.find_repository(repo_id).ok_or("that repository is no longer tracked")?;
+        let write =
+            gh.set_signoff_checks(&repo.path, &repo.name_with_owner, branch, names).map_err(|err| err.to_string())?;
+        if write != Write::Unchanged {
+            let event = ActivityEvent {
+                kind: ActivityKind::Rules,
+                repo_id: repo.id.clone(),
+                repo: repo.name_with_owner.clone(),
+                check: names.join(", "),
+                state: CheckState::Success,
+                detail: format!("Updated required signoff checks on {}", branch.trim()),
+                ..ActivityEvent::default()
+            };
+            if let Err(err) = history.append(event) {
+                log::warn!("could not record the rules change: {err}");
+            }
+        }
+        Ok(write)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,6 +370,41 @@ mod tests {
             "gh api --method PUT repos/o/r/branches/release%2F1.0/protection/required_status_checks/contexts --input -"
         );
         assert_eq!(input.as_deref(), Some(r#"{"contexts":["ci/build","signoff/tests"]}"#));
+    }
+
+    #[test]
+    fn the_service_records_a_change_in_the_history() {
+        use crate::config::{AppConfig, ConfigStore, TrackedRepository};
+        use crate::history::HistoryStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = TrackedRepository {
+            id: "r1".into(),
+            path: dir.path().to_owned(),
+            name_with_owner: "o/r".into(),
+            default_branch: "main".into(),
+            enabled: true,
+            ..TrackedRepository::default()
+        };
+        let config = ConfigStore::with_config(
+            dir.path().join("config.json"),
+            AppConfig { repositories: vec![repo], ..AppConfig::default() },
+        );
+        let history = Arc::new(HistoryStore::open(dir.path().join("history.json")).expect("history"));
+        let runner = script(vec![("protection --jq", r#"["signoff/tests"]"#, 0)]);
+        let service = ProductService::new(Gh::new(runner), Arc::new(config), history.clone(), None);
+
+        let read = service.signoff_checks("r1", "main").expect("read");
+        assert_eq!(read.checks, strings(&["tests"]));
+        assert!(read.protected);
+
+        let write = service.set_signoff_checks("r1", "main", &strings(&["tests", "lint"])).expect("set");
+        assert_eq!(write, Write::ReplaceContexts(strings(&["signoff/lint", "signoff/tests"])));
+        let events = history.snapshot(0);
+        assert_eq!(events[0].kind, ActivityKind::Rules);
+        assert_eq!(events[0].detail, "Updated required signoff checks on main");
+
+        assert!(ProductService::demo().set_signoff_checks("r1", "main", &[]).is_err());
     }
 
     #[test]
