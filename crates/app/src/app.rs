@@ -16,6 +16,7 @@ use signoff_ui::widgets::toast;
 
 use crate::anchor::{self, Corner, POPOVER};
 use crate::checkouts::Checkouts;
+use crate::notifier;
 use crate::popover::{self, Glance};
 use crate::runs::Runs;
 use crate::settings::{self, Settings};
@@ -221,8 +222,17 @@ impl Signoff {
                 }
             }
         }
+        let runs = self.runs.take_finished();
+        let mut transitions = Vec::new();
         if let Some(state) = self.refresher.changed_since(&mut self.seen) {
+            transitions = signoff_core::transitions(Some(&self.state), &state, &state.env.login);
             self.state = state;
+        }
+        if !self.demo && (!transitions.is_empty() || !runs.is_empty()) {
+            // A window that is open and in front already shows the change.
+            let hidden = ctx.is_none_or(|ctx| !ctx.input(|i| i.viewport().focused.unwrap_or(true)));
+            let enabled = self.settings.notifications_on();
+            notifier::deliver(notifier::notices(enabled, hidden, &transitions, &runs, &self.state));
         }
         let health = self.state.summary.status;
         if self.shown_health != Some(health)

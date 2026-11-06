@@ -10,6 +10,7 @@ mod app;
 mod autostart;
 mod checkouts;
 mod glance;
+mod notifier;
 mod paths;
 mod popover;
 mod runs;

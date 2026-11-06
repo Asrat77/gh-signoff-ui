@@ -819,3 +819,22 @@ fn the_demo_simulates_a_checkout_and_then_offers_to_run() {
     harness.get_by_label("Check out #485").click();
     step_until(&mut harness, "the simulated checkout", |h| h.query_by_label_contains("Run & sign off").is_some());
 }
+
+#[test]
+fn the_notifications_switch_is_on_by_default_and_saved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.run_ok();
+    assert!(harness.state().settings.notifications_on());
+
+    harness.get_by_label("Notifications").click();
+    harness.run_ok();
+    assert!(!service.config().expect("config").snapshot().notifications);
+    assert!(!harness.state().settings.notifications_on());
+
+    harness.get_by_label("Notifications").click();
+    harness.run_ok();
+    assert!(service.config().expect("config").snapshot().notifications);
+}

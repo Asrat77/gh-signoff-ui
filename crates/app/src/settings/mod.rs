@@ -175,6 +175,11 @@ impl Settings {
         self.service.flush();
     }
 
+    /// Whether desktop notifications are on. They are until switched off.
+    pub(crate) fn notifications_on(&self) -> bool {
+        self.service.config().is_none_or(|config| config.snapshot().notifications)
+    }
+
     /// Whether edits are refused: demo data has no config to change.
     pub(crate) fn read_only(&self) -> bool {
         self.service.is_demo()

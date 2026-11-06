@@ -26,8 +26,24 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, e
     }
     ui.add_space(space::S);
 
+    notifications(ui, settings);
+    ui.add_space(space::S);
+
     refresh_interval(ui, settings, effects);
     environment(ui, state);
+}
+
+fn notifications(ui: &mut Ui, settings: &Settings) {
+    let mut on = settings.notifications_on();
+    let hint =
+        "When the popover is hidden: one of your pull requests starts failing or is ready to merge, or a run finishes.";
+    let toggle = ui.add_enabled(!settings.read_only(), ToggleRow::new(&mut on, "Notifications", hint));
+    if toggle.changed()
+        && let Some(config) = settings.service.config()
+        && let Err(err) = config.set_notifications(on)
+    {
+        toast(ui.ctx(), err.to_string(), Status::Failing);
+    }
 }
 
 fn refresh_interval(ui: &mut Ui, settings: &Settings, effects: &mut Effects) {
