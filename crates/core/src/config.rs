@@ -69,13 +69,16 @@ pub struct AppConfig {
     pub version: u32,
     /// Seconds between background refreshes.
     pub refresh_seconds: u32,
+    /// Tell the person with a desktop notification when one of their pull
+    /// requests starts failing or becomes ready, or a local run finishes.
+    pub notifications: bool,
     /// Tracked checkouts, sorted by GitHub name.
     pub repositories: Vec<TrackedRepository>,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        Self { version: CURRENT_VERSION, refresh_seconds: 30, repositories: Vec::new() }
+        Self { version: CURRENT_VERSION, refresh_seconds: 30, notifications: true, repositories: Vec::new() }
     }
 }
 
@@ -334,6 +337,18 @@ impl ConfigStore {
         })
     }
 
+    /// Turns desktop notifications on or off.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be saved.
+    pub fn set_notifications(&self, on: bool) -> Result<(), ConfigError> {
+        self.change(|config| {
+            config.notifications = on;
+            Ok(())
+        })
+    }
+
     /// Applies `edit` and saves. The change is kept only if both succeed.
     fn change<T>(&self, edit: impl FnOnce(&mut AppConfig) -> Result<T, ConfigError>) -> Result<T, ConfigError> {
         let mut guard = self.config.write().unwrap_or_else(PoisonError::into_inner);
@@ -443,6 +458,20 @@ mod tests {
             let mode = std::fs::metadata(&path).expect("stat").permissions().mode();
             assert_eq!(mode & 0o077, 0, "config permissions {mode:o} should be private");
         }
+    }
+
+    /// Notifications are on unless a config says otherwise, and the switch
+    /// is kept.
+    #[test]
+    fn notifications_default_on_for_old_configs_and_the_switch_is_saved() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, r#"{"version":1,"refreshSeconds":30,"repositories":[]}"#).expect("write");
+        let store = ConfigStore::open(&path).expect("open");
+        assert!(store.snapshot().notifications, "an old file has no setting: on");
+        store.set_notifications(false).expect("save");
+        assert!(store.flush());
+        assert!(!ConfigStore::open(&path).expect("reload").snapshot().notifications);
     }
 
     /// The Go version's file must keep loading.
