@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.98"
+license = "MIT"
+repository = "https://github.com/Asrat77/gh-signoff-ui"
+
+[workspace.dependencies]
+signoff-core = { path = "crates/core" }
+
+# UI: egui on fastframe (https://github.com/crmne/fastframe, MIT). fastframe
+# is not on crates.io yet, so every crate is pinned to the same release tag.
+egui = { version = "0.36.2", default-features = false }
+eframe = { version = "0.36.2", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+fastframe-dirs = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+fastframe-file = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+fastframe-shell = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+fastframe-theme = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+fastframe-tray = { git = "https://github.com/crmne/fastframe", tag = "v0.16.1" }
+
+jiff = { version = "0.2", features = ["serde"] }
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["auto-color", "humantime"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

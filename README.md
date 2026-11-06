@@ -4,6 +4,24 @@ Signoff is a macOS menu-bar companion for [`basecamp/gh-signoff`](https://github
 
 This is the product, not a browser dashboard. The normal experience is a compact menu-bar popover with a separate native settings window.
 
+## Rust rewrite (in progress)
+
+Signoff is being rewritten in Rust as a native app for macOS, Windows and Linux, with no Go, Electron or Node. It is built with [egui](https://github.com/emilk/egui) on [fastframe](https://github.com/crmne/fastframe) (tray, window lifecycle, themes). Until it reaches parity, the Go and Electron app described below remains the shipping version.
+
+- `crates/core` (`signoff-core`): the logic, with no UI. gh reads, branch-protection resolution, config and history (same file formats as before), the multi-repository state and the demo data.
+- `crates/app` (`signoff`): the tray app. A tray item coloured by overall health, a small window, and a settings window; GitHub is refreshed on a background thread.
+
+Requires Rust 1.98 (pinned in `rust-toolchain.toml`, so rustup installs it). On Linux the window needs `libxkbcommon-x11` and the tray needs a StatusNotifier host.
+
+```bash
+cargo run -p signoff -- --demo      # sample data, no GitHub reads or writes
+cargo run -p signoff                # your tracked repositories
+cargo run -p signoff -- --hidden    # start in the tray
+cargo test --workspace
+```
+
+The first run copies an existing config and history from the previous version, so tracked repositories carry over.
+
 ## Product capabilities
 
 - Track multiple local GitHub repositories and either your PRs or every open PR.

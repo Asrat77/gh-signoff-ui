@@ -1,0 +1,731 @@
+//! Reads from GitHub through the `gh` CLI, and from the local checkout
+//! through `git`.
+
+use std::fmt;
+use std::path::Path;
+use std::sync::Arc;
+
+use jiff::Timestamp;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::checks::{CheckState, is_signoff_context};
+use crate::runner::{Runner, SystemRunner};
+
+/// Open pull requests read per repository.
+pub const PULL_REQUEST_LIMIT: usize = 30;
+
+const PULL_REQUEST_FIELDS: &str =
+    "number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt";
+
+/// `statusCheckRollup` rides along on the pull-request list, which keeps a
+/// refresh to a couple of calls per repository instead of one per pull
+/// request. It carries context, state and time but not the creator or
+/// description, so attribution still needs [`Gh::commit_statuses`]; the
+/// product's status cache only pays for that when something changed.
+const PULL_REQUEST_LIST_FIELDS: &str =
+    "number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt,statusCheckRollup";
+
+/// Why a `gh` or `git` call failed.
+#[derive(Debug, thiserror::Error)]
+pub enum GhError {
+    /// The program could not be started (most often: `gh` is not installed).
+    #[error("launching {program}: {source}")]
+    Launch {
+        /// The program that failed to start.
+        program: String,
+        /// Why.
+        source: std::io::Error,
+    },
+    /// The program ran and exited non-zero.
+    #[error("{command}: exit {code}: {message}")]
+    Exit {
+        /// The command line, for the message.
+        command: String,
+        /// Its exit code.
+        code: i32,
+        /// Its stderr, or stdout when stderr was empty.
+        message: String,
+    },
+    /// The program's output was not the JSON expected.
+    #[error("parsing output of {command}: {source}")]
+    Json {
+        /// The command line, for the message.
+        command: String,
+        /// Why.
+        source: serde_json::Error,
+    },
+}
+
+impl GhError {
+    /// The message of a non-zero exit, if that is what this is.
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            Self::Exit { message, .. } => Some(message),
+            _ => None,
+        }
+    }
+
+    /// Whether GitHub answered 404/403. Branch protection does that for a
+    /// caller without admin, the common case for contributors, which must not
+    /// be fatal.
+    pub fn is_not_found(&self) -> bool {
+        self.message().is_some_and(|m| {
+            ["404", "Not Found", "403", "Branch not protected", "Resource not accessible"]
+                .iter()
+                .any(|needle| m.contains(needle))
+        })
+    }
+}
+
+/// Everything that can be wrong before there is anything to show. The UI
+/// renders a specific remedy for each missing piece.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Environment {
+    /// `gh --version` ran.
+    pub gh_installed: bool,
+    /// What it reported, without the `gh version ` prefix.
+    pub gh_version: String,
+    /// `gh api user` answered with a login.
+    pub authenticated: bool,
+    /// That login.
+    pub login: String,
+    /// The probed directory is inside a git checkout.
+    pub in_git_repo: bool,
+    /// The `gh signoff` extension is installed.
+    pub signoff_installed: bool,
+    /// Its version.
+    pub signoff_version: String,
+}
+
+/// A local checkout and the GitHub repository behind it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RepoInfo {
+    /// `owner/name`.
+    pub name_with_owner: String,
+    /// The default branch on GitHub.
+    pub default_branch: String,
+    /// The branch checked out locally.
+    pub current_branch: String,
+    /// The commit checked out locally.
+    pub head_sha: String,
+}
+
+/// One open pull request.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PrInfo {
+    /// Its number.
+    pub number: u64,
+    /// Its title.
+    pub title: String,
+    /// The author's login.
+    pub author: String,
+    /// Its web URL.
+    pub url: String,
+    /// `OPEN`, `CLOSED` or `MERGED`.
+    pub state: String,
+    /// The head commit.
+    pub head_sha: String,
+    /// The head branch.
+    pub head_ref: String,
+    /// The branch it merges into, whose protection gates it.
+    pub base_ref: String,
+    /// `MERGEABLE`, `CONFLICTING` or `UNKNOWN`.
+    pub mergeable: String,
+    /// Whether it is a draft.
+    pub is_draft: bool,
+    /// When it last changed.
+    pub updated_at: Timestamp,
+    /// The signoff-relevant commit statuses from `statusCheckRollup`. Empty
+    /// when the pull request came from [`Gh::current_pull_request`].
+    pub contexts: Vec<CommitStatus>,
+}
+
+/// One commit status.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CommitStatus {
+    /// `signoff`, `signoff/tests`, `ci/build`…
+    pub context: String,
+    /// Its state, in the REST API's lower-case spelling.
+    pub state: CheckState,
+    /// Free text; gh-signoff writes `<user> signed off`.
+    pub description: String,
+    /// Who posted it. GitHub sometimes reports none.
+    pub creator: String,
+    /// The creator's avatar.
+    pub avatar_url: String,
+    /// When it was posted.
+    pub created_at: Timestamp,
+    /// Where it links.
+    pub target_url: String,
+}
+
+/// The three outcomes of reading branch protection, which GitHub reports
+/// with the same 404:
+///
+/// - `{"message":"Branch not protected"}`: the branch has no rules.
+/// - `{"message":"Not Found"}`: the caller lacks admin, or it is gone.
+///
+/// Collapsing them would either tell an owner their permissions are wrong,
+/// or tell a contributor that nothing is required when something is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtectionStatus {
+    /// Read, and these are the rules.
+    Ok,
+    /// The branch has no protection.
+    Absent,
+    /// Not readable with the caller's permissions.
+    Unreadable,
+}
+
+/// A `gh` (and `git`) client.
+#[derive(Clone)]
+pub struct Gh {
+    runner: Arc<dyn Runner>,
+}
+
+impl fmt::Debug for Gh {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gh").finish_non_exhaustive()
+    }
+}
+
+impl Default for Gh {
+    fn default() -> Self {
+        Self::new(Arc::new(SystemRunner::default()))
+    }
+}
+
+impl Gh {
+    /// A client that spawns processes through `runner`.
+    pub fn new(runner: Arc<dyn Runner>) -> Self {
+        Self { runner }
+    }
+
+    fn exec(&self, dir: Option<&Path>, program: &str, args: &[&str]) -> Result<String, GhError> {
+        let out = self
+            .runner
+            .run(dir, None, program, args)
+            .map_err(|source| GhError::Launch { program: program.to_owned(), source })?;
+        if out.code != 0 {
+            let message = if out.stderr.is_empty() { out.stdout } else { out.stderr };
+            return Err(GhError::Exit { command: format!("{program} {}", args.join(" ")), code: out.code, message });
+        }
+        Ok(out.stdout)
+    }
+
+    fn json<T: DeserializeOwned>(&self, dir: Option<&Path>, args: &[&str]) -> Result<T, GhError> {
+        let stdout = self.exec(dir, "gh", args)?;
+        serde_json::from_str(&stdout)
+            .map_err(|source| GhError::Json { command: format!("gh {}", args.join(" ")), source })
+    }
+
+    fn git(&self, dir: &Path, args: &[&str]) -> Option<String> {
+        self.exec(Some(dir), "git", args).ok()
+    }
+
+    /// Checks `gh`, its sign-in, the checkout at `dir` and the extension.
+    pub fn probe_environment(&self, dir: Option<&Path>) -> Environment {
+        let mut env = Environment::default();
+
+        if let Ok(out) = self.exec(None, "gh", &["--version"]) {
+            env.gh_installed = true;
+            let line = out.lines().next().unwrap_or_default();
+            env.gh_version = line.trim_start_matches("gh version ").to_owned();
+        }
+
+        #[derive(Deserialize)]
+        struct Account {
+            #[serde(default)]
+            login: String,
+        }
+        if let Ok(account) = self.json::<Account>(None, &["api", "user", "--jq", "{login: .login}"]) {
+            env.authenticated = !account.login.is_empty();
+            env.login = account.login;
+        }
+
+        if self.exec(dir, "git", &["rev-parse", "--git-dir"]).is_ok() {
+            env.in_git_repo = true;
+        }
+
+        // `gh signoff version` prints "gh-signoff 0.3.0"; a non-zero exit
+        // means the extension is not installed.
+        if let Ok(out) = self.exec(dir, "gh", &["signoff", "version"]) {
+            env.signoff_installed = true;
+            env.signoff_version = out.trim_start_matches("gh-signoff").trim().to_owned();
+        }
+        env
+    }
+
+    /// The GitHub repository behind the checkout at `dir`, and what is
+    /// checked out there.
+    ///
+    /// # Errors
+    ///
+    /// When `gh repo view` fails: not a GitHub checkout, or not signed in.
+    pub fn repo(&self, dir: &Path) -> Result<RepoInfo, GhError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct View {
+            name_with_owner: String,
+            #[serde(default)]
+            default_branch_ref: Option<Branch>,
+        }
+        #[derive(Deserialize)]
+        struct Branch {
+            name: String,
+        }
+        let view: View = self.json(Some(dir), &["repo", "view", "--json", "nameWithOwner,defaultBranchRef"])?;
+        Ok(RepoInfo {
+            name_with_owner: view.name_with_owner,
+            default_branch: view.default_branch_ref.map(|b| b.name).unwrap_or_default(),
+            current_branch: self.git(dir, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default(),
+            head_sha: self.git(dir, &["rev-parse", "HEAD"]).unwrap_or_default(),
+        })
+    }
+
+    /// The pull request for the branch checked out at `dir`. No pull request
+    /// is an ordinary state (`Ok(None)`): you are often on a branch before
+    /// opening one.
+    ///
+    /// # Errors
+    ///
+    /// When `gh pr view` fails for any other reason.
+    pub fn current_pull_request(&self, dir: &Path) -> Result<Option<PrInfo>, GhError> {
+        match self.json::<RawPr>(Some(dir), &["pr", "view", "--json", PULL_REQUEST_FIELDS]) {
+            Ok(raw) => Ok(Some(raw.into_info())),
+            Err(err)
+                if err.is_not_found()
+                    || err.to_string().contains("no pull requests found")
+                    || err.to_string().contains("no open pull requests") =>
+            {
+                Ok(None)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    /// The open pull requests in the repository at `dir`: the user's own, or
+    /// everyone's when `all`. The second value says the list was cut at
+    /// [`PULL_REQUEST_LIMIT`].
+    ///
+    /// # Errors
+    ///
+    /// When `gh pr list` fails.
+    pub fn pull_requests(&self, dir: &Path, all: bool) -> Result<(Vec<PrInfo>, bool), GhError> {
+        let limit = (PULL_REQUEST_LIMIT + 1).to_string();
+        let mut args = vec!["pr", "list", "--state", "open", "--limit", &limit];
+        if !all {
+            args.extend(["--author", "@me"]);
+        }
+        args.extend(["--json", PULL_REQUEST_LIST_FIELDS]);
+        let raw: Vec<RawPr> = self.json(Some(dir), &args)?;
+        let (raw, truncated) = limit_pull_requests(raw);
+        Ok((raw.into_iter().map(RawPr::into_info).collect(), truncated))
+    }
+
+    /// Every status posted to `sha`, newest first, with who posted it.
+    ///
+    /// # Errors
+    ///
+    /// When the status API call fails.
+    pub fn commit_statuses(&self, dir: &Path, repo: &str, sha: &str) -> Result<Vec<CommitStatus>, GhError> {
+        #[derive(Deserialize)]
+        struct Combined {
+            #[serde(default)]
+            statuses: Vec<RawStatus>,
+        }
+        #[derive(Deserialize)]
+        struct RawStatus {
+            #[serde(default)]
+            context: String,
+            #[serde(default)]
+            state: CheckState,
+            #[serde(default)]
+            description: Option<String>,
+            #[serde(default, deserialize_with = "timestamp_or_default")]
+            created_at: Timestamp,
+            #[serde(default)]
+            target_url: Option<String>,
+            #[serde(default)]
+            creator: Option<Creator>,
+        }
+        #[derive(Deserialize)]
+        struct Creator {
+            #[serde(default)]
+            login: String,
+            #[serde(default)]
+            avatar_url: String,
+        }
+        let path = format!("repos/{repo}/commits/{sha}/status");
+        let raw: Combined = self.json(Some(dir), &["api", &path])?;
+        Ok(raw
+            .statuses
+            .into_iter()
+            .map(|s| {
+                let (creator, avatar_url) = s.creator.map(|c| (c.login, c.avatar_url)).unwrap_or_default();
+                CommitStatus {
+                    context: s.context,
+                    state: s.state,
+                    description: s.description.unwrap_or_default(),
+                    creator,
+                    avatar_url,
+                    created_at: s.created_at,
+                    target_url: s.target_url.unwrap_or_default(),
+                }
+            })
+            .collect())
+    }
+
+    /// The status contexts branch protection requires on `branch`, and which
+    /// of the three outcomes reading it had.
+    pub fn protection_contexts(&self, dir: &Path, repo: &str, branch: &str) -> (Vec<String>, ProtectionStatus) {
+        let path = format!("repos/{repo}/branches/{branch}/protection");
+        match self.json::<Vec<String>>(Some(dir), &["api", &path, "--jq", "[.required_status_checks.contexts[]?]"]) {
+            Ok(contexts) => (contexts, ProtectionStatus::Ok),
+            Err(err) if err.message().is_some_and(|m| m.contains("Branch not protected")) => {
+                (Vec::new(), ProtectionStatus::Absent)
+            }
+            Err(_) => (Vec::new(), ProtectionStatus::Unreadable),
+        }
+    }
+
+    /// Refuses unless the checkout at `dir` is at `expected`, so a command
+    /// never vouches for a commit it did not run on.
+    ///
+    /// # Errors
+    ///
+    /// A message for the user when it is not, or cannot be checked.
+    pub fn require_checked_out_commit(&self, dir: &Path, expected: &str) -> Result<(), String> {
+        let actual = self.exec(Some(dir), "git", &["rev-parse", "HEAD"]).map_err(|err| {
+            let detail = err.message().filter(|m| !m.is_empty()).unwrap_or("git rev-parse failed").to_owned();
+            format!("could not verify the checked-out commit: {detail}")
+        })?;
+        if actual != expected {
+            return Err(format!(
+                "this checkout is at {}, not pull request commit {}; check out the PR branch and refresh",
+                short_sha(&actual),
+                short_sha(expected)
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The first eight characters of a commit id.
+pub fn short_sha(sha: &str) -> &str {
+    sha.get(..8).unwrap_or(sha)
+}
+
+/// Whether two sets of statuses agree on every signoff context and its
+/// state, which decides whether a refresh learned anything that warrants a
+/// second call for attribution.
+pub fn same_contexts(a: &[CommitStatus], b: &[CommitStatus]) -> bool {
+    use std::collections::BTreeMap;
+    let index = |list: &[CommitStatus]| -> BTreeMap<String, CheckState> {
+        list.iter().filter(|s| is_signoff_context(&s.context)).map(|s| (s.context.clone(), s.state)).collect()
+    };
+    index(a) == index(b)
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct RawPr {
+    number: u64,
+    title: String,
+    url: String,
+    state: String,
+    author: Option<Author>,
+    head_ref_oid: String,
+    head_ref_name: String,
+    base_ref_name: String,
+    mergeable: String,
+    is_draft: bool,
+    #[serde(deserialize_with = "timestamp_or_default")]
+    updated_at: Timestamp,
+    status_check_rollup: Option<Vec<RollupEntry>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct Author {
+    #[serde(default)]
+    login: String,
+}
+
+/// One entry of `statusCheckRollup`. The list mixes Actions `CheckRun`s with
+/// commit `StatusContext`s; only the latter can be a signoff.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct RollupEntry {
+    #[serde(rename = "__typename")]
+    type_name: String,
+    context: String,
+    state: String,
+    #[serde(deserialize_with = "timestamp_or_default")]
+    started_at: Timestamp,
+    target_url: Option<String>,
+}
+
+impl RawPr {
+    /// The commit statuses in the rollup. GraphQL spells states in upper
+    /// case; [`CheckState::parse`] normalises them.
+    pub(crate) fn rollup_contexts(&self) -> Vec<CommitStatus> {
+        self.status_check_rollup
+            .iter()
+            .flatten()
+            .filter(|e| e.type_name == "StatusContext" && !e.context.is_empty())
+            .map(|e| CommitStatus {
+                context: e.context.clone(),
+                state: CheckState::parse(&e.state),
+                created_at: e.started_at,
+                target_url: e.target_url.clone().unwrap_or_default(),
+                ..CommitStatus::default()
+            })
+            .collect()
+    }
+
+    fn into_info(self) -> PrInfo {
+        let contexts = self.rollup_contexts();
+        PrInfo {
+            number: self.number,
+            title: self.title,
+            author: self.author.map(|a| a.login).unwrap_or_default(),
+            url: self.url,
+            state: self.state,
+            head_sha: self.head_ref_oid,
+            head_ref: self.head_ref_name,
+            base_ref: self.base_ref_name,
+            mergeable: self.mergeable,
+            is_draft: self.is_draft,
+            updated_at: self.updated_at,
+            contexts,
+        }
+    }
+}
+
+pub(crate) fn limit_pull_requests<T>(mut raw: Vec<T>) -> (Vec<T>, bool) {
+    if raw.len() <= PULL_REQUEST_LIMIT {
+        return (raw, false);
+    }
+    raw.truncate(PULL_REQUEST_LIMIT);
+    (raw, true)
+}
+
+/// A timestamp, or the epoch for `null` or a missing value.
+fn timestamp_or_default<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Timestamp, D::Error> {
+    Ok(Option::<Timestamp>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checks::{resolve_checks, tally};
+    use crate::runner::fake::{FakeRunner, fail, ok};
+    use std::collections::BTreeMap;
+
+    fn gh(runner: &Arc<FakeRunner>) -> Gh {
+        Gh::new(runner.clone())
+    }
+
+    #[test]
+    fn repo_uses_git_for_the_local_checkout() {
+        let fake = Arc::new(FakeRunner::new(vec![
+            ok("repo view", r#"{"nameWithOwner":"Asrat77/shakha","defaultBranchRef":{"name":"master"}}"#),
+            ok("rev-parse --abbrev-ref", "dependabot/github_actions/actions/checkout-7"),
+            ok("rev-parse HEAD", "b3c837bd2fae5f34633831c84cd45a856d99a76e"),
+        ]));
+        let info = gh(&fake).repo(Path::new("/repo")).expect("repo");
+        assert_eq!(info.name_with_owner, "Asrat77/shakha");
+        assert_eq!(info.default_branch, "master");
+        assert_eq!(info.current_branch, "dependabot/github_actions/actions/checkout-7");
+        assert_eq!(info.head_sha, "b3c837bd2fae5f34633831c84cd45a856d99a76e");
+    }
+
+    /// The list must carry status state with it; a per-pull-request status
+    /// call during a plain list would reintroduce the O(N) refresh cost.
+    #[test]
+    fn pull_requests_carry_rollup_state_and_cost_one_call() {
+        let fake = Arc::new(FakeRunner::new(vec![ok(
+            "pr list",
+            r#"[{
+            "number":1,"title":"Bump actions/checkout from 4 to 7","url":"https://github.com/Asrat77/shakha/pull/1",
+            "state":"OPEN","author":{"login":"app/dependabot"},
+            "headRefOid":"b3c837bd2fae5f34633831c84cd45a856d99a76e",
+            "headRefName":"dependabot/github_actions/actions/checkout-7","baseRefName":"master",
+            "mergeable":"MERGEABLE","isDraft":false,"updatedAt":"2026-08-10T08:18:52Z",
+            "statusCheckRollup":[
+                {"__typename":"CheckRun","name":"lint","conclusion":"FAILURE","status":"COMPLETED"},
+                {"__typename":"StatusContext","context":"signoff/lint","state":"SUCCESS","startedAt":"2026-08-10T08:18:52Z","targetUrl":""},
+                {"__typename":"StatusContext","context":"signoff/tests","state":"SUCCESS","startedAt":"2026-08-10T08:18:36Z","targetUrl":""}
+            ]}]"#,
+        )]));
+        let (prs, truncated) = gh(&fake).pull_requests(Path::new("/repo"), true).expect("list");
+        assert!(!truncated);
+        assert_eq!(prs.len(), 1);
+        assert_eq!(prs[0].author, "app/dependabot");
+        assert_eq!(prs[0].contexts.len(), 2, "the Actions CheckRun is not a signoff");
+        assert!(prs[0].contexts.iter().all(|c| c.state == CheckState::Success));
+        assert_eq!(fake.commands().len(), 1);
+    }
+
+    #[test]
+    fn pull_requests_are_scoped_to_the_author_unless_all() {
+        for (all, want_mine) in [(false, true), (true, false)] {
+            let fake = Arc::new(FakeRunner::new(vec![ok("pr list", "[]")]));
+            gh(&fake).pull_requests(Path::new("/repo"), all).expect("list");
+            assert_eq!(fake.called("--author @me"), want_mine, "all = {all}");
+        }
+    }
+
+    #[test]
+    fn pull_request_limit_reports_truncation() {
+        let (limited, truncated) = limit_pull_requests(vec![0; PULL_REQUEST_LIMIT + 1]);
+        assert!(truncated);
+        assert_eq!(limited.len(), PULL_REQUEST_LIMIT);
+        let (limited, truncated) = limit_pull_requests(vec![0; PULL_REQUEST_LIMIT]);
+        assert!(!truncated);
+        assert_eq!(limited.len(), PULL_REQUEST_LIMIT);
+    }
+
+    /// A branch without a pull request is an ordinary state, not an error.
+    #[test]
+    fn no_pull_request_is_absent_not_an_error() {
+        let fake = Arc::new(FakeRunner::new(vec![fail("pr view", "no pull requests found for branch \"feature\"")]));
+        assert_eq!(gh(&fake).current_pull_request(Path::new("/repo")).expect("absent"), None);
+    }
+
+    /// Observed on a real signoff: the status API returned `creator: null`,
+    /// and the name is only recoverable from the description.
+    #[test]
+    fn commit_statuses_survive_a_null_creator() {
+        let fake = Arc::new(FakeRunner::new(vec![ok(
+            "commits/",
+            r#"{"statuses":[
+            {"context":"signoff/tests","state":"success","description":"Asrat signed off",
+             "created_at":"2026-08-10T08:18:36Z","target_url":null,"creator":null}]}"#,
+        )]));
+        let statuses = gh(&fake).commit_statuses(Path::new("/repo"), "Asrat77/shakha", "b3c837b").expect("statuses");
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].creator, "");
+        assert_eq!(crate::checks::actor_from(&statuses[0]), "Asrat");
+    }
+
+    #[test]
+    fn protection_distinguishes_absent_from_unreadable() {
+        let cases = [
+            (
+                ok("protection", r#"["signoff/tests","signoff/lint"]"#),
+                ProtectionStatus::Ok,
+                vec!["signoff/tests", "signoff/lint"],
+            ),
+            (fail("protection", "gh: Branch not protected (HTTP 404)"), ProtectionStatus::Absent, vec![]),
+            (fail("protection", "gh: Not Found (HTTP 404)"), ProtectionStatus::Unreadable, vec![]),
+        ];
+        for (reply, want, contexts) in cases {
+            let fake = Arc::new(FakeRunner::new(vec![reply]));
+            let (got, status) = gh(&fake).protection_contexts(Path::new("/repo"), "o/r", "main");
+            assert_eq!(status, want);
+            assert_eq!(got, contexts);
+        }
+    }
+
+    /// The push-but-not-admin case: protection gates the merge but cannot be
+    /// read. Readiness must fall back rather than claim a green it cannot
+    /// verify.
+    #[test]
+    fn unreadable_protection_does_not_claim_readiness() {
+        let fake = Arc::new(FakeRunner::new(vec![fail("protection", "gh: Not Found (HTTP 404)")]));
+        let (_, status) = gh(&fake).protection_contexts(Path::new("/repo"), "o/r", "main");
+        let checks = resolve_checks(&[], &BTreeMap::new(), status != ProtectionStatus::Unreadable);
+        let t = tally(&checks);
+        assert!(!t.ready);
+        assert_eq!((t.passed, t.total), (0, 1));
+    }
+
+    #[test]
+    fn probe_reports_missing_pieces() {
+        let fake = Arc::new(FakeRunner::new(vec![
+            ok("gh --version", "gh version 2.95.0 (2026-06-17)\nhttps://github.com/cli/cli"),
+            ok("api user", r#"{"login":"Asrat77"}"#),
+            ok("rev-parse --git-dir", ".git"),
+            fail("signoff version", "unknown command"),
+        ]));
+        let env = gh(&fake).probe_environment(Some(Path::new("/repo")));
+        assert!(env.gh_installed);
+        assert_eq!(env.gh_version, "2.95.0 (2026-06-17)");
+        assert!(env.authenticated);
+        assert_eq!(env.login, "Asrat77");
+        assert!(env.in_git_repo);
+        assert!(!env.signoff_installed);
+    }
+
+    /// GraphQL spells states in upper case, unlike the REST API. Everything
+    /// downstream compares lower case, so that must not leak out.
+    #[test]
+    fn rollup_contexts_normalise_state_and_drop_check_runs() {
+        let entry = |type_name: &str, context: &str, state: &str| RollupEntry {
+            type_name: type_name.into(),
+            context: context.into(),
+            state: state.into(),
+            ..RollupEntry::default()
+        };
+        let raw = RawPr {
+            status_check_rollup: Some(vec![
+                entry("CheckRun", "", "SUCCESS"),
+                entry("StatusContext", "signoff/tests", "SUCCESS"),
+                entry("StatusContext", "signoff/lint", "FAILURE"),
+                entry("StatusContext", "", "SUCCESS"),
+            ]),
+            ..RawPr::default()
+        };
+        let got = raw.rollup_contexts();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].context.as_str(), got[0].state), ("signoff/tests", CheckState::Success));
+        assert_eq!(got[1].state, CheckState::Failure);
+    }
+
+    #[test]
+    fn same_contexts_notices_changes_and_ignores_noise() {
+        let s = |context: &str, state| CommitStatus { context: context.into(), state, ..CommitStatus::default() };
+        let base = [s("signoff/tests", CheckState::Success)];
+        assert!(same_contexts(&base, &[s("signoff/tests", CheckState::Success)]));
+        assert!(!same_contexts(&base, &[s("signoff/tests", CheckState::Failure)]));
+        assert!(!same_contexts(
+            &base,
+            &[s("signoff/tests", CheckState::Success), s("signoff/lint", CheckState::Success)]
+        ));
+        assert!(!same_contexts(&base, &[]));
+        assert!(same_contexts(&base, &[s("signoff/tests", CheckState::Success), s("ci/build", CheckState::Failure)]));
+    }
+
+    #[test]
+    fn run_requires_the_pull_request_commit_to_be_checked_out() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git").args(args).current_dir(dir.path()).output().expect("git");
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "-c",
+            "user.name=Signoff Test",
+            "-c",
+            "user.email=signoff@example.test",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "initial",
+        ]);
+        let sha = git(&["rev-parse", "HEAD"]);
+
+        let gh = Gh::default();
+        assert_eq!(gh.require_checked_out_commit(dir.path(), &sha), Ok(()));
+        assert!(gh.require_checked_out_commit(dir.path(), &"0".repeat(40)).is_err());
+    }
+}

@@ -8,3 +8,4 @@ desktop/bin/*
 !desktop/bin/.gitkeep
 test-results/
 playwright-report/
+/target/

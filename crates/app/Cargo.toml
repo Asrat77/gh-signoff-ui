@@ -1,0 +1,34 @@
+[package]
+name = "signoff"
+description = "Signoff: see and sign off your pull requests from the tray."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+default-run = "signoff"
+
+[[bin]]
+name = "signoff"
+path = "src/main.rs"
+
+[features]
+# Start on the demo data by default (the same as passing --demo). Nothing is
+# read from or written to GitHub.
+demo = []
+
+[dependencies]
+signoff-core.workspace = true
+egui.workspace = true
+eframe.workspace = true
+fastframe-dirs.workspace = true
+fastframe-shell.workspace = true
+fastframe-theme.workspace = true
+fastframe-tray.workspace = true
+jiff.workspace = true
+log.workspace = true
+env_logger.workspace = true
+directories = "6"
+
+[lints]
+workspace = true
