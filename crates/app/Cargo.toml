@@ -37,5 +37,27 @@ rfd = "0.15"
 egui_kittest = "0.36"
 tempfile.workspace = true
 
+# Installable packages, built with cargo-packager (`cargo packager --release
+# -p signoff`). See .github/workflows/package.yml for the formats per OS.
+[package.metadata.packager]
+product-name = "Signoff"
+identifier = "dev.signoff.Signoff"
+description = "See and sign off your pull requests from the tray."
+category = "DeveloperTool"
+homepage = "https://github.com/Asrat77/gh-signoff-ui"
+authors = ["Signoff contributors"]
+before-packaging-command = "cargo build --release -p signoff"
+out-dir = "../../target/packages"
+binaries-dir = "../../target/release"
+binaries = [{ path = "signoff", main = true }]
+icons = ["../../assets/icon.png"]
+
+[package.metadata.packager.macos]
+minimum-system-version = "11.0"
+info-plist-path = "packaging/Info.plist"
+
+[package.metadata.packager.deb]
+depends = ["libxkbcommon-x11-0"]
+
 [lints]
 workspace = true
