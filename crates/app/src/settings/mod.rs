@@ -6,6 +6,7 @@
 //! background thread through [`Jobs`], so the window never blocks.
 
 mod commands;
+mod discovery;
 mod general;
 mod history;
 mod jobs;
@@ -73,6 +74,7 @@ pub(crate) struct Settings {
     /// Whether Signoff starts at login, read when the window first opens.
     launch_at_login: Option<bool>,
     repositories: repositories::Form,
+    discovery: discovery::Discovery,
     /// The repository the commands and branch rules sections show.
     selected_repo: Option<String>,
     commands: Option<commands::Draft>,
@@ -97,6 +99,7 @@ impl Settings {
             section: Section::default(),
             launch_at_login: None,
             repositories: repositories::Form::default(),
+            discovery: discovery::Discovery::default(),
             selected_repo: None,
             commands: None,
             rules: None,
@@ -115,6 +118,29 @@ impl Settings {
     /// Asks for a checkout with the folder picker and starts tracking it.
     pub(crate) fn choose_and_add(&mut self, ctx: &egui::Context) {
         repositories::choose_and_add(ctx, self);
+    }
+
+    /// The checkouts found on this computer, with Add buttons; draws nothing
+    /// when there are none. `compact` caps the list for a small screen.
+    pub(crate) fn show_suggestions(&mut self, ui: &mut Ui, compact: bool) {
+        discovery::show(ui, self, compact);
+    }
+
+    /// Scans under `home` for suggestions instead of the real home folder.
+    #[cfg(test)]
+    pub(crate) fn find_checkouts_in(&mut self, home: Option<std::path::PathBuf>) {
+        self.discovery = discovery::Discovery::scan_under(home);
+    }
+
+    /// Shows `found` as the suggestions, as if a scan had returned them.
+    #[cfg(test)]
+    pub(crate) fn suggest(&mut self, found: Vec<signoff_core::discover::Found>) {
+        self.discovery = discovery::Discovery::with_found(found);
+    }
+
+    /// Tracks the folders dropped onto the window this frame.
+    pub(crate) fn accept_drops(&mut self, ctx: &egui::Context) {
+        repositories::accept_drops(ctx, self);
     }
 
     /// The checkout being added, while `gh` checks it.
