@@ -20,6 +20,9 @@ pub const DISPLAY: &str = "signoff-display";
 
 const MONO: &str = "jetbrains-mono";
 const ICONS: &str = "phosphor";
+/// The family that draws icons: Phosphor first, so its glyphs win over any
+/// private-use glyphs in the text face.
+const ICON_FAMILY: &str = "signoff-icons";
 const ICONS_FILL: &str = "phosphor-fill";
 
 /// One step of the type scale.
@@ -80,6 +83,13 @@ impl Type {
         FontId::new(self.size(), self.family())
     }
 
+    /// This step's family at another size, for one-off sizes such as a
+    /// button's label.
+    #[must_use]
+    pub fn sized(self, size: f32) -> FontId {
+        FontId::new(size, self.family())
+    }
+
     /// The name used for this step in tests and the gallery.
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -123,10 +133,28 @@ pub fn definitions() -> FontDefinitions {
         let at = keys.len().min(1);
         keys.insert(at, ICONS.into());
     }
+    let mut icon_family = vec![ICONS.to_owned()];
+    icon_family.extend(
+        fonts
+            .families
+            .get(&FontFamily::Proportional)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|key| key != ICONS),
+    );
+    fonts.families.insert(FontFamily::Name(ICON_FAMILY.into()), icon_family);
     let mut fill = vec![ICONS_FILL.to_owned()];
     fill.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
     fonts.families.insert(FontFamily::Name(ICONS_FILL.into()), fill);
     fonts
+}
+
+/// An icon font at `size` points. Draw icons with this rather than a text
+/// font: the text face has private-use glyphs of its own.
+#[must_use]
+pub fn icon(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(ICON_FAMILY.into()))
 }
 
 /// The family that draws filled Phosphor icons.
@@ -152,8 +180,10 @@ mod tests {
         let fonts = definitions();
         assert_eq!(fonts.families[&FontFamily::Monospace][0], MONO);
         assert_eq!(fonts.families[&FontFamily::Name(DISPLAY.into())][0], DISPLAY);
-        for keys in fonts.families.values() {
-            assert_ne!(keys.first().map(String::as_str), Some(ICONS));
+        for (family, keys) in &fonts.families {
+            if *family != icon(12.0).family {
+                assert_ne!(keys.first().map(String::as_str), Some(ICONS));
+            }
         }
     }
 
@@ -163,6 +193,12 @@ mod tests {
         for (family, keys) in &fonts.families {
             assert!(keys.iter().any(|key| key == ICONS || key == ICONS_FILL), "{family:?} cannot draw icons");
         }
+    }
+
+    #[test]
+    fn the_icon_family_leads_with_phosphor() {
+        let fonts = definitions();
+        assert_eq!(fonts.families[&icon(12.0).family][0], ICONS);
     }
 
     #[test]
