@@ -1,7 +1,10 @@
 //! The faces Signoff draws with and the type scale built on them.
 //!
-//! Inter (bundled by `fastframe-fonts`) draws the interface at four weights
-//! plus a heavy display cut for headlines. JetBrains Mono draws branches,
+//! Inter draws the interface at four weights plus a heavy display cut for
+//! headlines. `fastframe-fonts` lays out the families and system fallbacks;
+//! Signoff swaps in its own build of Inter, which keeps only the digits
+//! tabular (see `fonts/tools/freeze_digits.py`), so hyphens and spaces
+//! keep their normal width. JetBrains Mono draws branches,
 //! commit SHAs and command output. Phosphor icons sit behind every family,
 //! so an icon can be mixed into any label.
 
@@ -9,7 +12,12 @@ use std::sync::Arc;
 
 use egui::epaint::text::VariationCoords;
 use egui::{FontData, FontDefinitions, FontFamily, FontId};
-use fastframe_fonts::{FontSetup, INTER, Monospace, Weight};
+use fastframe_fonts::{FontSetup, INTER_REGULAR, Monospace, Weight};
+
+/// Inter 4.1 (variable, `wght` and `opsz` axes) with only its digits
+/// pointed at the tabular glyphs. SIL Open Font License 1.1, shipped as
+/// `fonts/Inter-LICENSE.txt`.
+pub const INTER: &[u8] = include_bytes!("../fonts/InterVariable-SignoffDigits.ttf");
 
 /// JetBrains Mono 2.304, regular. SIL Open Font License 1.1, shipped as
 /// `fonts/JetBrainsMono-LICENSE.txt`.
@@ -113,12 +121,21 @@ pub fn definitions() -> FontDefinitions {
     let mut fonts = FontSetup::default()
         .monospace(Monospace::Font { name: MONO.into(), data: Arc::new(FontData::from_static(JETBRAINS_MONO)) })
         .definitions();
+    // fastframe's Inter has the whole `tnum` feature frozen in, which makes
+    // the space and hyphen tabular too. Keep its layout, swap the face.
+    for weight in Weight::ALL {
+        if let Some(data) = fonts.font_data.get_mut(weight.name()) {
+            let mut face = FontData::from_static(INTER);
+            face.tweak = data.tweak.clone();
+            *data = Arc::new(face);
+        }
+    }
 
     let mut display = FontData::from_static(INTER);
     display.tweak.coords = VariationCoords::new([(b"wght", 800.0), (b"opsz", 32.0)]);
     fonts.font_data.insert(DISPLAY.into(), Arc::new(display));
     let mut behind = fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    behind.retain(|name| name != fastframe_fonts::INTER_REGULAR);
+    behind.retain(|name| name != INTER_REGULAR);
     let mut family = vec![DISPLAY.to_owned()];
     family.extend(behind);
     fonts.families.insert(FontFamily::Name(DISPLAY.into()), family);
@@ -199,6 +216,15 @@ mod tests {
     fn the_icon_family_leads_with_phosphor() {
         let fonts = definitions();
         assert_eq!(fonts.families[&icon(12.0).family][0], ICONS);
+    }
+
+    #[test]
+    fn every_weight_uses_signoffs_inter() {
+        let fonts = definitions();
+        for weight in Weight::ALL {
+            let data = &fonts.font_data[weight.name()];
+            assert_eq!(data.font.as_ref(), INTER, "{weight:?}");
+        }
     }
 
     #[test]
