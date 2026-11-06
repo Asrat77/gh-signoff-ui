@@ -1,0 +1,4 @@
+# fastframe needs Rust 1.98. Pin it so local builds and CI agree.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
