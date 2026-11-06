@@ -2689,6 +2689,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "signoff-ui"
+version = "0.3.0"
+dependencies = [
+ "egui",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
