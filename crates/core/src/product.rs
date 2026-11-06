@@ -14,6 +14,7 @@ use std::thread;
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
+use crate::api::{Api, ApiError, Remote, path_segment};
 use crate::checks::{
     self, Check, CheckState, Rules, display_name, is_signoff_context, latest_signoffs, resolve_checks, rules_for, tally,
 };
@@ -283,8 +284,22 @@ impl StatusCache {
 /// Reads the repository `tracked`: its checkout, open pull requests and
 /// their checks. Also says whether a failure means `gh` is missing or signed
 /// out, so the environment is probed again.
+///
+/// Reads go over the REST API when `gh` has one and a token, and through
+/// `gh` subprocesses otherwise, or when the API cannot be reached.
 pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCache) -> (RepositoryRead, bool) {
-    let mut view = RepositoryState {
+    if let Some(api) = gh.api().filter(|api| api.usable()) {
+        match read_with_api(gh, api, tracked) {
+            Ok(read) => return read,
+            Err(err) => log::info!("reading {} through gh: {err}", tracked.name_with_owner),
+        }
+    }
+    read_with_gh(gh, tracked, cache)
+}
+
+/// What a read knows before it reads anything.
+fn initial_view(tracked: &TrackedRepository) -> RepositoryState {
+    RepositoryState {
         id: tracked.id.clone(),
         path: tracked.path.clone(),
         name_with_owner: tracked.name_with_owner.clone(),
@@ -292,12 +307,127 @@ pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &Stat
         enabled: tracked.enabled,
         commands: tracked.commands.clone(),
         ..RepositoryState::default()
+    }
+}
+
+/// A read that ended in `err`.
+fn failed(mut repository: RepositoryState, err: GhError) -> (RepositoryRead, bool) {
+    repository.error = Some(err.to_string());
+    let environment_failed = err.is_environment_failure();
+    (RepositoryRead { repository, ..RepositoryRead::default() }, environment_failed)
+}
+
+/// Commit statuses read at once per repository over the API.
+const PARALLEL_STATUSES: usize = 4;
+
+/// Reads over the REST API. `Err` only when the API cannot be used at all
+/// (no token, unreachable), for the caller to read through `gh` instead;
+/// anything GitHub answered is a read, failed or not.
+fn read_with_api(gh: &Gh, api: &Api, tracked: &TrackedRepository) -> Result<(RepositoryRead, bool), ApiError> {
+    let mut view = initial_view(tracked);
+    // Which repository and host: from gh, once per checkout per session.
+    let remote = match api.remote(&tracked.path) {
+        Some(remote) => remote,
+        None => match gh.repo(&tracked.path) {
+            Ok(info) => {
+                let remote = Remote {
+                    host: info.host,
+                    name_with_owner: info.name_with_owner,
+                    default_branch: info.default_branch,
+                };
+                api.remember(&tracked.path, remote.clone());
+                remote
+            }
+            Err(err) => return Ok(failed(view, err)),
+        },
     };
-    let failed = |mut repository: RepositoryState, err: GhError| {
-        repository.error = Some(err.to_string());
-        let read = RepositoryRead { repository, ..RepositoryRead::default() };
-        (read, err.is_environment_failure())
+    let local = gh.local_head(&tracked.path);
+    let info = RepoInfo {
+        name_with_owner: remote.name_with_owner.clone(),
+        host: remote.host.clone(),
+        default_branch: remote.default_branch.clone(),
+        current_branch: local.current_branch,
+        head_sha: local.head_sha,
     };
+    view.name_with_owner.clone_from(&info.name_with_owner);
+    view.default_branch.clone_from(&info.default_branch);
+    view.current_branch.clone_from(&info.current_branch);
+    view.current_sha.clone_from(&info.head_sha);
+
+    let (prs, truncated) = match api.pull_requests(&remote) {
+        Ok(found) => found,
+        Err(err) if err.falls_back() => return Err(err),
+        Err(err) => {
+            if err.is_status(404) || err.is_status(403) {
+                // Renamed, moved, or access changed: resolve it again.
+                api.forget(&tracked.path);
+            }
+            return Ok(failed(view, err.into()));
+        }
+    };
+    view.pull_request_count = prs.len();
+    view.pull_requests_truncated = truncated;
+
+    let mut protection: HashMap<String, (Vec<String>, ProtectionStatus)> = HashMap::new();
+    for pr in &prs {
+        if protection.contains_key(&pr.base_ref) {
+            continue;
+        }
+        match api.protection_contexts(&remote, &pr.base_ref) {
+            Ok(found) => protection.insert(pr.base_ref.clone(), found),
+            Err(err) if err.falls_back() => return Err(err),
+            Err(err) => return Ok(failed(view, err.into())),
+        };
+    }
+
+    let statuses = parallel(&prs, PARALLEL_STATUSES, |pr| api.commit_statuses(&remote, &pr.head_sha));
+    let mut pull_requests = Vec::with_capacity(prs.len());
+    let mut history = Vec::new();
+    for (mut pr, statuses) in prs.into_iter().zip(statuses) {
+        let (statuses, warning) = match statuses {
+            Ok(statuses) => (statuses, None),
+            Err(err) if err.falls_back() => return Err(err),
+            // One pull request's statuses (a head force-pushed away between
+            // the list and this call, say) must not hide the rest.
+            Err(err @ (ApiError::Status { .. } | ApiError::Json { .. })) => {
+                (Vec::new(), Some(format!("Could not read its commit statuses ({err}); showing none.")))
+            }
+            Err(err) => return Ok(failed(view, err.into())),
+        };
+        pr.contexts.clone_from(&statuses);
+        let (contexts, status) = protection.get(&pr.base_ref).cloned().unwrap_or((Vec::new(), ProtectionStatus::Ok));
+        let (mut state, events) = build_pull_request_state(tracked, &info, pr, contexts, status, statuses);
+        if warning.is_some() {
+            state.warning = warning;
+        }
+        pull_requests.push(state);
+        history.extend(events);
+    }
+    Ok((RepositoryRead { repository: view, pull_requests, history }, false))
+}
+
+/// `f` applied to every item, `workers` at a time, in order.
+fn parallel<T: Sync, R: Send>(items: &[T], workers: usize, f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let results: Mutex<Vec<Option<R>>> = Mutex::new(items.iter().map(|_| None).collect());
+    thread::scope(|scope| {
+        for _ in 0..workers.min(items.len()) {
+            scope.spawn(|| {
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(index) else { break };
+                    let result = f(item);
+                    results.lock().unwrap_or_else(PoisonError::into_inner)[index] = Some(result);
+                }
+            });
+        }
+    });
+    results.into_inner().unwrap_or_else(PoisonError::into_inner).into_iter().flatten().collect()
+}
+
+/// Reads through `gh` and `git` subprocesses.
+fn read_with_gh(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCache) -> (RepositoryRead, bool) {
+    let mut view = initial_view(tracked);
     let info = match gh.repo(&tracked.path) {
         Ok(info) => info,
         Err(err) => return failed(view, err),
@@ -320,9 +450,17 @@ pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &Stat
     for pr in prs {
         let (contexts, status) = protection
             .entry(pr.base_ref.clone())
-            .or_insert_with(|| gh.protection_contexts(&tracked.path, &info.name_with_owner, &pr.base_ref))
+            .or_insert_with(|| {
+                gh.protection_contexts(&tracked.path, &info.name_with_owner, &path_segment(&pr.base_ref))
+            })
             .clone();
-        let (state, events) = build_pull_request_state(gh, tracked, &info, pr, contexts, status, cache);
+        // State comes from the rollup on the pull-request list, at no extra
+        // call; the cache reaches for the status API only when something
+        // changed.
+        let statuses = cache.resolve(&info.name_with_owner, &pr.head_sha, &pr.contexts, || {
+            gh.commit_statuses(&tracked.path, &info.name_with_owner, &pr.head_sha)
+        });
+        let (state, events) = build_pull_request_state(tracked, &info, pr, contexts, status, statuses);
         pull_requests.push(state);
         history.extend(events);
     }
@@ -330,20 +468,14 @@ pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &Stat
 }
 
 fn build_pull_request_state(
-    gh: &Gh,
     tracked: &TrackedRepository,
     repo: &RepoInfo,
     pr: PrInfo,
     contexts: Vec<String>,
     protection: ProtectionStatus,
-    cache: &StatusCache,
+    statuses: Vec<CommitStatus>,
 ) -> (PullRequestState, Vec<ActivityEvent>) {
     let rules = rules_for(&pr.base_ref, contexts, protection);
-    // State comes from the rollup on the pull-request list, at no extra
-    // call; the cache reaches for the status API only when something changed.
-    let statuses = cache.resolve(&repo.name_with_owner, &pr.head_sha, &pr.contexts, || {
-        gh.commit_statuses(&tracked.path, &repo.name_with_owner, &pr.head_sha)
-    });
 
     let mut checks = resolve_checks(&rules.signoff_contexts, &latest_signoffs(&statuses), rules.readable);
     for check in &mut checks {
@@ -685,6 +817,7 @@ impl ProductService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::fake::{FakeTransport, json, not_modified};
     use crate::config::{AppConfig, RepositoryUpdate};
     use crate::runner::Runner;
     use crate::runner::fake::{FakeRunner, Reply, fail, ok};
@@ -893,6 +1026,155 @@ mod tests {
             1,
             "protection is read once per base branch"
         );
+    }
+
+    /// The same repository as [`one_repository`], as the REST API answers
+    /// it, with `ETag`s.
+    fn rest_answers(transport: &FakeTransport) {
+        transport
+            .answer(
+                "/pulls?",
+                json(
+                    200,
+                    Some("\"pulls\""),
+                    r#"[
+                    {"number":1,"title":"Ready one","state":"open","head":{"sha":"aaa","ref":"feature"},
+                     "base":{"ref":"main"},"user":{"login":"you","type":"User"},"updated_at":"2026-08-10T08:00:00Z"},
+                    {"number":2,"title":"Failing one","state":"open","head":{"sha":"bbb","ref":"other"},
+                     "base":{"ref":"main"},"user":{"login":"ann","type":"User"},"updated_at":"2026-08-09T08:00:00Z"}
+                ]"#,
+                ),
+            )
+            .answer(
+                "/branches/main/protection",
+                json(200, None, r#"{"required_status_checks":{"contexts":["signoff/tests","ci/build"]}}"#),
+            )
+            .answer(
+                "/commits/aaa/status",
+                json(
+                    200,
+                    Some("\"aaa\""),
+                    r#"{"statuses":[{"context":"signoff/tests","state":"success","description":"you signed off",
+                       "created_at":"2026-08-10T08:00:00Z","creator":{"login":"you","avatar_url":""}}]}"#,
+                ),
+            )
+            .answer(
+                "/commits/bbb/status",
+                json(
+                    200,
+                    Some("\"bbb\""),
+                    r#"{"statuses":[{"context":"signoff/tests","state":"failure","created_at":"2026-08-09T08:00:00Z"}]}"#,
+                ),
+            );
+    }
+
+    /// `gh` output for the API path: the probe, `gh repo view` once, and a
+    /// token.
+    fn api_gh(token: bool) -> Vec<Reply> {
+        let mut replies = vec![
+            ok("gh --version", "gh version 2.95.0"),
+            ok("api user", r#"{"login":"you"}"#),
+            ok("rev-parse --git-dir", ".git"),
+            ok("signoff version", "gh-signoff 0.3.0"),
+            ok(
+                "repo view",
+                r#"{"nameWithOwner":"o/r","defaultBranchRef":{"name":"main"},"url":"https://github.com/o/r"}"#,
+            ),
+            ok("rev-parse --abbrev-ref", "feature"),
+            ok("rev-parse HEAD", "aaa"),
+        ];
+        replies.push(if token { ok("auth token", "gho_test") } else { fail("auth token", "not logged in") });
+        replies
+    }
+
+    fn api_fixture(replies: Vec<Reply>) -> (Fixture, Arc<FakeRunner>, Arc<FakeTransport>) {
+        let fake = Arc::new(FakeRunner::new(replies));
+        let transport = Arc::new(FakeTransport::default());
+        let f = fixture(fake.clone(), vec![tracked()]);
+        let gh = Gh::with_api(fake.clone(), transport.clone());
+        let service = Arc::new(ProductService::new(
+            gh,
+            f.config.clone(),
+            Arc::new(HistoryStore::open(f.dir.path().join("h.json")).expect("history")),
+            None,
+        ));
+        (Fixture { service, ..f }, fake, transport)
+    }
+
+    /// The same state as through `gh`, with no `gh` call but the one
+    /// `gh repo view` and the token.
+    #[test]
+    fn reads_over_the_api_like_gh() {
+        let (f, fake, transport) = api_fixture(api_gh(true));
+        rest_answers(&transport);
+        let state = f.service.refresh();
+
+        assert_eq!(state.pull_requests.len(), 2);
+        assert_eq!(state.pull_requests[0].pr.number, 2, "failing sorts first");
+        assert_eq!(state.pull_requests[0].status, Health::Failing);
+        let ready = &state.pull_requests[1];
+        assert_eq!((ready.status, ready.checked_out, ready.pr.state.as_str()), (Health::Ready, true, "OPEN"));
+        assert_eq!(ready.checks[0].actor, "you");
+        assert!(ready.checks[0].configured);
+        assert_eq!(ready.rules.signoff_contexts, ["signoff/tests"]);
+        assert!(state.history.iter().any(|e| e.kind == ActivityKind::Status && e.pr_number == 1));
+        assert!(!fake.called("pr list") && !fake.called("api repos/"), "nothing read through gh");
+        assert_eq!(transport.sent()[0].header("Authorization"), Some("Bearer gho_test"));
+    }
+
+    /// Nothing changed: every resource answers 304 (protection is not even
+    /// asked), nothing new lands, and gh is not asked again.
+    #[test]
+    fn an_unchanged_repository_costs_304s_and_lands_nothing_new() {
+        let (f, fake, transport) = api_fixture(api_gh(true));
+        rest_answers(&transport);
+        let first = f.service.refresh();
+        for (needle, etag) in [("/pulls?", "\"pulls\""), ("/commits/aaa/", "\"aaa\""), ("/commits/bbb/", "\"bbb\"")] {
+            transport.answer(needle, not_modified(etag));
+        }
+        let second = f.service.refresh();
+
+        assert_eq!(second.pull_requests, first.pull_requests, "not replaced: same fetched_at too");
+        assert!(second.repositories[0].fetched_at >= first.repositories[0].fetched_at);
+        assert_eq!(transport.count("/protection"), 1, "protection is kept");
+        assert_eq!(transport.count("/pulls?"), 2);
+        let conditional = transport.sent().iter().filter(|s| s.header("If-None-Match").is_some()).count();
+        assert_eq!(conditional, 3);
+        let gh_calls = |needle: &str| fake.commands().iter().filter(|c| c.contains(needle)).count();
+        assert_eq!((gh_calls("repo view"), gh_calls("auth token")), (1, 1), "resolved once per session");
+    }
+
+    #[test]
+    fn without_a_token_reads_go_through_gh() {
+        let mut replies = api_gh(false);
+        replies.extend(one_repository().into_iter().skip(4));
+        let (f, fake, transport) = api_fixture(replies);
+        let state = f.service.refresh();
+        assert_eq!(state.pull_requests.len(), 2);
+        assert!(fake.called("pr list"));
+        assert!(transport.sent().is_empty());
+    }
+
+    #[test]
+    fn an_unreachable_api_reads_through_gh() {
+        let mut replies = api_gh(true);
+        replies.extend(one_repository().into_iter().skip(4));
+        let (f, fake, transport) = api_fixture(replies);
+        transport.fail("/pulls?", "proxy refused the tunnel");
+        let state = f.service.refresh();
+        assert_eq!(state.pull_requests.len(), 2);
+        assert!(fake.called("pr list"));
+        assert_eq!(transport.sent().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_token_asks_for_a_new_probe() {
+        let (f, fake, transport) = api_fixture(api_gh(true));
+        transport.answer("/pulls?", json(401, None, r#"{"message":"Bad credentials"}"#));
+        let state = f.service.refresh();
+        assert!(state.repositories[0].error.as_deref().is_some_and(|e| e.contains("gh auth login")));
+        f.service.plan_refresh(false);
+        assert_eq!(probes(&fake), 2);
     }
 
     #[test]

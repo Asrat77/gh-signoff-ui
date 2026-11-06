@@ -173,6 +173,12 @@ impl Gh {
                 self.run(Some(dir), None, "gh", &["api", "--method", "DELETE", &base])?;
             }
         }
+        if write != Write::Unchanged
+            && let Some(api) = self.api()
+        {
+            // The next read must show the new rules, not the kept ones.
+            api.forget_protection(repo, branch);
+        }
         Ok(write)
     }
 }

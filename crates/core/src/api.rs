@@ -765,6 +765,11 @@ pub(crate) mod fake {
         pub(crate) fn sent(&self) -> Vec<Sent> {
             self.sent.lock().expect("sent").clone()
         }
+
+        /// Requests whose URL contains `needle`.
+        pub(crate) fn count(&self, needle: &str) -> usize {
+            self.sent().iter().filter(|s| s.url.contains(needle)).count()
+        }
     }
 
     pub(crate) fn json(status: u16, etag: Option<&str>, body: &str) -> HttpResponse {

@@ -1,5 +1,6 @@
-//! Reads from GitHub through the `gh` CLI, and from the local checkout
-//! through `git`.
+//! Reads from GitHub through the `gh` CLI or, when [`Gh::with_api`] gave it
+//! one, the in-process [`Api`] for repository reads; and from the local
+//! checkout through the files under `.git`, or `git`.
 
 use std::fmt;
 use std::path::Path;
@@ -9,6 +10,7 @@ use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
 
+use crate::api::{Api, ApiError, Transport};
 use crate::checks::{CheckState, is_signoff_context};
 use crate::runner::{Runner, SystemRunner};
 
@@ -55,13 +57,17 @@ pub enum GhError {
         /// Why.
         source: serde_json::Error,
     },
+    /// A read through the REST API failed.
+    #[error("GitHub API: {0}")]
+    Api(#[from] ApiError),
 }
 
 impl GhError {
-    /// The message of a non-zero exit, if that is what this is.
+    /// The message of a non-zero exit or an API error answer, if that is
+    /// what this is.
     pub fn message(&self) -> Option<&str> {
         match self {
-            Self::Exit { message, .. } => Some(message),
+            Self::Exit { message, .. } | Self::Api(ApiError::Status { message, .. }) => Some(message),
             _ => None,
         }
     }
@@ -96,6 +102,7 @@ impl GhError {
                 .iter()
                 .any(|needle| message.contains(needle))
             }
+            Self::Api(err) => matches!(err, ApiError::Unauthorized),
             Self::Json { .. } => false,
         }
     }
@@ -128,6 +135,8 @@ pub struct Environment {
 pub struct RepoInfo {
     /// `owner/name`.
     pub name_with_owner: String,
+    /// The GitHub host: `github.com`, or a GitHub Enterprise one.
+    pub host: String,
     /// The default branch on GitHub.
     pub default_branch: String,
     /// The branch checked out locally.
@@ -210,6 +219,7 @@ pub enum ProtectionStatus {
 #[derive(Clone)]
 pub struct Gh {
     runner: Arc<dyn Runner>,
+    api: Option<Arc<Api>>,
 }
 
 impl fmt::Debug for Gh {
@@ -225,9 +235,27 @@ impl Default for Gh {
 }
 
 impl Gh {
-    /// A client that spawns processes through `runner`.
+    /// A client that spawns processes through `runner` for everything.
     pub fn new(runner: Arc<dyn Runner>) -> Self {
-        Self { runner }
+        Self { runner, api: None }
+    }
+
+    /// A client that reads repositories over the REST API through
+    /// `transport` when `gh auth token` gives a token, and spawns processes
+    /// through `runner` for everything else.
+    pub fn with_api(runner: Arc<dyn Runner>, transport: Arc<dyn Transport>) -> Self {
+        let api = Arc::new(Api::new(transport, runner.clone()));
+        Self { runner, api: Some(api) }
+    }
+
+    /// The REST client, if this has one.
+    pub fn api(&self) -> Option<&Arc<Api>> {
+        self.api.as_ref()
+    }
+
+    /// When reading may start again, if GitHub's rate limit stopped it.
+    pub fn next_allowed(&self) -> Option<Timestamp> {
+        self.api.as_ref().and_then(|api| api.next_allowed())
     }
 
     fn exec(&self, dir: Option<&Path>, program: &str, args: &[&str]) -> Result<String, GhError> {
@@ -310,14 +338,17 @@ impl Gh {
             name_with_owner: String,
             #[serde(default)]
             default_branch_ref: Option<Branch>,
+            #[serde(default)]
+            url: String,
         }
         #[derive(Deserialize)]
         struct Branch {
             name: String,
         }
-        let view: View = self.json(Some(dir), &["repo", "view", "--json", "nameWithOwner,defaultBranchRef"])?;
+        let view: View = self.json(Some(dir), &["repo", "view", "--json", "nameWithOwner,defaultBranchRef,url"])?;
         Ok(RepoInfo {
             name_with_owner: view.name_with_owner,
+            host: crate::api::host_of(&view.url),
             default_branch: view.default_branch_ref.map(|b| b.name).unwrap_or_default(),
             ..self.local_head(dir)
         })
