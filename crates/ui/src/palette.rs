@@ -200,6 +200,16 @@ impl Palette {
     }
 }
 
+impl Palette {
+    /// Black or white, whichever reads better on `background`: for a glyph
+    /// on a status-coloured dot.
+    #[must_use]
+    pub fn ink_on(background: Color32) -> Color32 {
+        let black = hex(0x0B0B0C);
+        if contrast(black, background) >= contrast(Color32::WHITE, background) { black } else { Color32::WHITE }
+    }
+}
+
 impl Default for Palette {
     fn default() -> Self {
         Self::dark()
@@ -320,6 +330,17 @@ mod tests {
     fn bases_match_their_constructors() {
         assert_eq!(Palette::base(Base::Dark), Palette::dark());
         assert_eq!(Palette::base(Base::Light), Palette::light());
+    }
+
+    #[test]
+    fn ink_on_picks_the_readable_one() {
+        assert_eq!(Palette::ink_on(Palette::dark().success), hex(0x0B0B0C));
+        assert_eq!(Palette::ink_on(Palette::light().success), Color32::WHITE);
+        for p in [Palette::dark(), Palette::light()] {
+            for color in [p.success, p.warning, p.running, p.danger, p.accent] {
+                assert!(contrast(Palette::ink_on(color), color) >= 3.0);
+            }
+        }
     }
 
     #[test]
