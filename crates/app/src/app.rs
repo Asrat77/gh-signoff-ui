@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use egui::{Pos2, ViewportCommand};
 use fastframe_shell::{Closed, Headless, Held, Lease, Resident};
 use fastframe_tray::{Event, Tray};
+use jiff::Timestamp;
 use signoff_core::{Health, ProductState};
 
 use crate::anchor::{self, Corner, POPOVER};
@@ -40,6 +41,8 @@ pub(crate) struct Signoff {
     anchor: Option<Pos2>,
     /// When the popover last hid itself for losing focus.
     auto_hidden_at: Option<Instant>,
+    /// When the popover last asked for a refresh on opening.
+    asked_at: Option<Instant>,
     closing: Closed,
     show: bool,
     quit: bool,
@@ -50,6 +53,22 @@ pub(crate) struct Signoff {
 /// popover is open takes focus from it first; without this the click would
 /// hide it and open it again at once.
 const SAME_CLICK: Duration = Duration::from_millis(400);
+
+/// How old the last read may be when the popover opens before opening it
+/// reads again.
+const STALE_AFTER_SECS: i64 = 10;
+
+/// How long after asking for a refresh another ask is taken as the same:
+/// the worker needs a moment to report that it is running.
+const ASKED_RECENTLY: Duration = Duration::from_secs(2);
+
+/// Whether opening the popover should read GitHub again: the last read is
+/// older than [`STALE_AFTER_SECS`] and no refresh is running. Before the
+/// first read there is nothing to be stale: the first refresh starts with
+/// the app.
+fn stale(fetched_at: Option<Timestamp>, now: Timestamp, refreshing: bool) -> bool {
+    !refreshing && fetched_at.is_some_and(|at| now.as_second() - at.as_second() >= STALE_AFTER_SECS)
+}
 
 impl Signoff {
     pub(crate) fn new(tray: Option<Tray>, refresher: Refresher, runs: Runs, settings: Settings, demo: bool) -> Self {
@@ -66,6 +85,7 @@ impl Signoff {
             settings,
             anchor: None,
             auto_hidden_at: None,
+            asked_at: None,
             closing: Closed::Hide,
             show: false,
             quit: false,
@@ -80,6 +100,18 @@ impl Signoff {
     /// Asks the background thread for a refresh.
     pub(crate) fn refresh(&self) {
         self.refresher.refresh();
+    }
+
+    /// Reads GitHub again as the popover opens, if what it would show is
+    /// older than [`STALE_AFTER_SECS`] and no refresh is on its way.
+    fn refresh_if_stale(&mut self) {
+        if self.asked_at.is_some_and(|at| at.elapsed() < ASKED_RECENTLY) {
+            return;
+        }
+        if stale(self.state.fetched_at, Timestamp::now(), self.refreshing()) {
+            self.asked_at = Some(Instant::now());
+            self.refresh();
+        }
     }
 
     /// Whether closing the window keeps the app running.
@@ -111,16 +143,22 @@ impl Signoff {
         ctx.send_viewport_cmd(ViewportCommand::Close);
     }
 
+    /// Shows the popover, with data no older than a few seconds.
+    fn open(&mut self) {
+        self.show = true;
+        self.refresh_if_stale();
+    }
+
     /// Handles tray clicks and new state. `ctx` is the window's, if open.
     pub(crate) fn tick(&mut self, ctx: Option<&egui::Context>) {
         let events = self.tray.as_ref().map(Tray::events).unwrap_or_default();
         for event in events {
             match event {
                 Event::Show | Event::Toggle if ctx.is_none() && self.just_hid() => {}
-                Event::Show | Event::Menu(tray::OPEN) => self.show = true,
+                Event::Show | Event::Menu(tray::OPEN) => self.open(),
                 Event::Toggle => match ctx {
                     Some(ctx) => self.hide(ctx),
-                    None => self.show = true,
+                    None => self.open(),
                 },
                 Event::Menu(tray::REFRESH) => self.refresh(),
                 Event::Menu(tray::SETTINGS) => {
@@ -218,6 +256,7 @@ pub(crate) fn window(cc: &eframe::CreationContext<'_>, lease: Lease<Signoff>) ->
     signoff_ui::install(&cc.egui_ctx, signoff_ui::ThemeMode::System);
     let mut app = lease.take(&cc.egui_ctx);
     app.closing = Closed::Hide;
+    app.refresh_if_stale();
     if let Some(tray) = &mut app.tray {
         tray.attach();
     }
@@ -303,5 +342,22 @@ impl eframe::App for Window {
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         // The popover draws its own rounded card; around it is see-through.
         if self.app.is_popover() { [0.0; 4] } else { visuals.panel_fill.to_normalized_gamma_f32() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(second: i64) -> Timestamp {
+        Timestamp::from_second(second).expect("timestamp")
+    }
+
+    #[test]
+    fn opening_reads_again_only_when_the_last_read_is_old() {
+        assert!(!stale(None, at(100), false), "the first refresh is already on its way");
+        assert!(!stale(Some(at(95)), at(100), false), "5 s old is fresh");
+        assert!(stale(Some(at(90)), at(100), false), "10 s old is stale");
+        assert!(!stale(Some(at(0)), at(100), true), "a refresh is already running");
     }
 }

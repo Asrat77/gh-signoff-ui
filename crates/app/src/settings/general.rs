@@ -50,7 +50,10 @@ fn refresh_interval(ui: &mut Ui, settings: &Settings, effects: &mut Effects) {
         if response.drag_stopped() || (response.changed() && !response.dragged()) {
             effects.refresh = true;
         }
-        parts::caption(ui, "Signoff also refreshes when you open the popover or press refresh.");
+        parts::caption(
+            ui,
+            "Signoff also reads again when you open the popover, if the last read is over 10 seconds old, or when you press refresh.",
+        );
     });
 }
 
