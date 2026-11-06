@@ -8,6 +8,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 
+use fastframe_file::{Access, Writer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -197,12 +198,15 @@ pub enum ConfigError {
 
 /// The config file and its loaded contents.
 ///
-/// Every change is saved at once, atomically and readable only by the user.
-/// Saving waits for the disk, so call the changing methods off the UI thread.
+/// Every change takes effect at once and is handed to a background writer,
+/// which replaces the file atomically, readable only by the user. Changing
+/// methods never wait for the disk, so the UI thread may call them; call
+/// [`ConfigStore::flush`] before the app exits.
 #[derive(Debug)]
 pub struct ConfigStore {
     path: PathBuf,
     config: RwLock<AppConfig>,
+    writer: Writer,
 }
 
 impl ConfigStore {
@@ -223,13 +227,19 @@ impl ConfigStore {
             Err(err) if err.kind() == io::ErrorKind::NotFound => AppConfig::default(),
             Err(source) => return Err(ConfigError::Io { action: "reading", path, source }),
         };
-        Ok(Self { path, config: RwLock::new(config) })
+        Ok(Self { path, config: RwLock::new(config), writer: Writer::new() })
     }
 
     /// A store that holds `config` and saves to `path`.
     pub fn with_config(path: impl Into<PathBuf>, mut config: AppConfig) -> Self {
         config.normalize();
-        Self { path: path.into(), config: RwLock::new(config) }
+        Self { path: path.into(), config: RwLock::new(config), writer: Writer::new() }
+    }
+
+    /// Waits, at most [`fastframe_file::FLUSH_TIMEOUT`], until every change
+    /// is on disk. Returns whether it is.
+    pub fn flush(&self) -> bool {
+        self.writer.flush(fastframe_file::FLUSH_TIMEOUT)
     }
 
     /// The config file.
@@ -336,15 +346,17 @@ impl ConfigStore {
         Ok(value)
     }
 
+    /// Hands `config` to the writer. Only serializing can fail here; a
+    /// failed write is logged from the writer's thread.
     fn save(&self, config: &AppConfig) -> Result<(), ConfigError> {
         let mut bytes = serde_json::to_vec_pretty(config)
             .map_err(|source| ConfigError::Parse { path: self.path.clone(), source })?;
         bytes.push(b'\n');
-        fastframe_file::write_private(&self.path, bytes).map_err(|source| ConfigError::Io {
-            action: "writing",
-            path: self.path.clone(),
-            source,
-        })
+        let path = self.path.clone();
+        self.writer.write_or(&self.path, bytes, Access::Private, move || {
+            log::error!("could not write {}", path.display());
+        });
+        Ok(())
     }
 }
 
@@ -381,12 +393,25 @@ mod tests {
     }
 
     #[test]
+    fn saves_from_the_ui_thread_without_waiting_for_the_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        let store = ConfigStore::with_config(&path, AppConfig::default());
+        // A durable write on this thread would now panic in a debug build.
+        fastframe_file::mark_ui_thread();
+        store.set_refresh_seconds(120).expect("save");
+        assert!(store.flush(), "written");
+        assert_eq!(ConfigStore::open(&path).expect("reload").snapshot().refresh_seconds, 120);
+    }
+
+    #[test]
     fn persists_repository_settings_privately() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.json");
         let store =
             ConfigStore::with_config(&path, AppConfig { repositories: vec![tracked()], ..AppConfig::default() });
         store.set_refresh_seconds(45).expect("save");
+        assert!(store.flush(), "written");
 
         let reloaded = ConfigStore::open(&path).expect("reload").snapshot();
         assert_eq!(reloaded.refresh_seconds, 45);

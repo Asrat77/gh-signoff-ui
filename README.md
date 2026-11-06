@@ -1,130 +1,98 @@
 # Signoff
 
-Signoff is a macOS menu-bar companion for [`basecamp/gh-signoff`](https://github.com/basecamp/gh-signoff). It keeps the open pull requests you care about one click away, shows the branch-protection checks that actually gate each PR, runs your configured local verification, and writes the signoff only after that command succeeds.
+Signoff is a tray companion for [`basecamp/gh-signoff`](https://github.com/basecamp/gh-signoff) on macOS, Windows and Linux. It keeps the open pull requests you care about one click away. It shows the branch-protection checks that actually gate each pull request and runs your local verification for each one. It writes the signoff only after that command succeeds.
 
-This is the product, not a browser dashboard. The normal experience is a compact menu-bar popover with a separate native settings window.
+It is a native Rust app built with [egui](https://github.com/emilk/egui) on [fastframe](https://github.com/crmne/fastframe), with no browser engine, Go or Node.
 
-## Rust rewrite (in progress)
+## What it does
 
-Signoff is being rewritten in Rust as a native app for macOS, Windows and Linux, with no Go, Electron or Node. It is built with [egui](https://github.com/emilk/egui) on [fastframe](https://github.com/crmne/fastframe) (tray, window lifecycle, themes). Until it reaches parity, the Go and Electron app described below remains the shipping version.
+- Tracks several local GitHub checkouts and shows either your pull requests or everyone's.
+- The tray icon is a pair of eyes coloured by overall health. Click it to open the glance popover, which lists pull requests failing first, then waiting on you, then ready. Filter by Yours, All, Failing or Ready.
+- Opens a pull request to show each required Signoff context and its latest status on the exact head commit.
+- Maps every check to a local command and timeout. **Run & sign off** streams the output, then calls `gh signoff --commit <sha>` only on exit code 0.
+- Refuses to run when the pull request's head commit isn't checked out locally, and checks again before signing off.
+- Keeps a local history of runs, signoffs and rule changes beside the statuses GitHub reported.
+- Edits only the Signoff contexts a branch requires. Reviews, restrictions and other required checks are left alone.
+- Supports light and dark mode, reduced motion and launch at login.
 
-- `crates/core` (`signoff-core`): the logic, with no UI. gh reads, branch-protection resolution, config and history (same file formats as before), the multi-repository state and the demo data. `verify` runs a check's mapped command on the pull request's head commit and writes `gh signoff --commit <sha>` only when it passed.
-- `crates/ui` (`signoff-ui`): the design system: palette, type, icons and widgets.
-- `crates/app` (`signoff`): the tray app. The tray icon is a pair of eyes coloured by overall health. Clicking it opens the glance popover by the tray: your pull requests across every tracked repository, failing first, then waiting on you, then ready, with Yours/All/Failing/Ready filters. Click a pull request to see each required signoff on its exact head commit. The popover hides when it loses focus or on Escape; drag it by the ember band. GitHub is refreshed on a background thread, so the popover never waits on `gh`.
+## Requirements
 
-Verify and sign off: on a pull request's page, pick a check with a mapped command and press Run & sign off once the pull request's head commit is checked out. The command runs in your login shell (`$SHELL -l -c`, or `cmd /C` on Windows) inside the checkout, with its output streamed under the checks and its timeout enforced on everything it starts. On exit code 0, Signoff confirms that neither the checkout nor the pull request on GitHub moved, then signs off that exact commit. Runs and signoffs are recorded in the local history.
+- [GitHub CLI](https://cli.github.com/), signed in with `gh auth login`
+- `gh extension install basecamp/gh-signoff`
+- On Linux: `libxkbcommon-x11` for the window and a StatusNotifier host for the tray. GNOME needs the AppIndicator extension.
 
-Requires Rust 1.98 (pinned in `rust-toolchain.toml`, so rustup installs it). On Linux the window needs `libxkbcommon-x11` and the tray needs a StatusNotifier host.
+Signoff never reads or stores a GitHub token. Every GitHub read and write goes through `gh`, with your own sign-in.
+
+## Install
+
+Every push to `main` builds packages in the [Package workflow](../../actions/workflows/package.yml). Open the latest run and download the artifact for your OS:
+
+| OS | Artifact | Contents |
+| --- | --- | --- |
+| macOS | `signoff-macos` | `Signoff.app` and a `.dmg` |
+| Windows | `signoff-windows` | `Signoff_<version>_x64-setup.exe` |
+| Linux | `signoff-linux` | an `.AppImage` and a `.deb` |
+
+Pushing a `v*` tag also attaches them to a GitHub release. The packages aren't signed yet:
+
+- **macOS:** right-click `Signoff.app` and choose Open the first time.
+- **Windows:** in the SmartScreen prompt, choose More info, then Run anyway.
+
+## Run from source
+
+Rust 1.98 is pinned in `rust-toolchain.toml`, so rustup installs it for you.
 
 ```bash
 cargo run -p signoff -- --demo      # sample data, no GitHub reads or writes
 cargo run -p signoff                # your tracked repositories
-cargo run -p signoff -- --hidden    # start in the tray
-cargo test --workspace
+cargo run -p signoff -- --hidden    # start in the tray without opening the window
 ```
 
-The first run copies an existing config and history from the previous version, so tracked repositories carry over.
-
-## Product capabilities
-
-- Track multiple local GitHub repositories and either your PRs or every open PR.
-- Sort the glance view by failing, needs-attention, and ready states.
-- Inspect required Signoff contexts and the latest status attached to the exact PR head commit.
-- Map every context to an explicit local command and timeout.
-- Stream command output, then call the real `gh signoff --commit <sha>` only after exit code 0.
-- Refuse to run when the selected PR commit is not the commit checked out locally, and verify it again before signing off.
-- Keep local run/signoff history alongside GitHub commit-status history.
-- Edit only Signoff status-check contexts while preserving reviews, restrictions, and unrelated required checks.
-- Reflect overall health in the colored menu-bar icon.
-- Work in light mode, dark mode, and reduced-motion environments.
-
-## Requirements
-
-- macOS on Apple silicon for the current local package target
-- Node.js 22.12 or newer
-- Go 1.24 or newer
-- [GitHub CLI](https://cli.github.com/) authenticated with `gh auth login`
-- `gh extension install basecamp/gh-signoff`
-
-Signoff never reads or stores a GitHub token. Authentication remains owned by `gh` and the operating-system keychain.
-
-## Run from source
-
-```bash
-npm install
-npm start
-```
-
-The app appears in the menu bar and does not add a Dock icon. On first launch, open Settings and choose one or more local Git checkouts.
-
-For the complete multi-repository sample without GitHub reads or writes:
-
-```bash
-npm run start:demo
-```
+The first run copies the config and history the previous Go/Electron version wrote, so tracked repositories carry over.
 
 ## Configure a repository
 
-1. Add its local checkout under **Settings → Repositories**.
-2. Choose whether to watch **My PRs** or **All open PRs**.
-3. Under **Commands**, map each discovered Signoff context to the command that proves it, for example `bin/test`, `bin/lint`, or `bin/security`.
-4. Check out the PR branch locally. A command is enabled only when `HEAD` equals that PR's head SHA.
-5. Use **Run & sign off** from the PR focus view.
+1. Open Settings from the sliders button on the popover's band, or from the tray menu.
+2. Under **Repositories**, add a local checkout from the folder picker or paste its path. Choose **My pull requests** or **Everyone's**.
+3. Under **Commands**, give each check the command that proves it, for example `cargo test --workspace` or `bin/lint`. Checks that your pull requests require are offered with one click.
+4. Check out the pull request's branch, open the pull request in the popover and press **Run & sign off**.
 
-Command text is accepted only through local settings; a run request cannot supply or override it. Configuration and history are stored with private file permissions in:
-
-```text
-~/Library/Application Support/Signoff/config.json
-~/Library/Application Support/Signoff/history.json
-```
+Commands come only from your local config. Nothing from GitHub can supply or change them. **Settings → General** shows where the config file lives.
 
 ## Branch rules
 
-The Branch rules page changes only required status checks:
+**Settings → Branch rules** reads a branch's protection through `gh` and lists the Signoff checks it requires. You can add or remove checks there and save the change back to GitHub:
 
-- existing non-Signoff contexts are retained;
-- reviews, restrictions, and the rest of the protection rule are untouched;
-- removing every Signoff context does not delete branch protection;
-- an unreadable protection rule is displayed but cannot be edited.
+- Required checks that aren't Signoff checks are shown as locked and kept.
+- Reviews, restrictions and the rest of the protection rule are untouched.
+- Removing every Signoff check leaves the protection rule in place.
+- A branch with no protection is set up with `gh signoff install`.
+- Protection that can't be read is never written.
 
-The real write is made through GitHub's branch-protection status-check subresources. Signoff uses `gh signoff install` only when the branch has no protection rule yet.
+## Project layout
 
-## Build the macOS app
+- `crates/core` (`signoff-core`): the logic, with no UI. It covers `gh` reads, branch-protection resolution and editing, config and history, the multi-repository state, verify and sign off, and the demo data.
+- `crates/ui` (`signoff-ui`): the design system, with the palette, type, icons and widgets. Run `cargo run -p signoff-ui --example gallery` to see them all.
+- `crates/app` (`signoff`): the tray app, popover and settings window.
 
-```bash
-npm run pack:mac
-open dist/mac-arm64/Signoff.app
-```
-
-The local package is written to `dist/mac-arm64/Signoff.app` with the branded icon, the Electron host, and the Go service embedded. It is intentionally unsigned in this repository; public distribution still requires a Developer ID certificate, hardened-runtime signing, and notarization.
-
-## Development and verification
+## Development
 
 ```bash
-npm test
-go test -race ./...
-npm run test:ui
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-`npm test` runs the Go test suite, `go vet`, and JavaScript syntax checks for the renderer, main process, and preload bridge.
+`cargo test` includes UI tests (`crates/app/src/ui_tests.rs`). They drive the real popover and settings through their accessibility tree with [egui_kittest](https://crates.io/crates/egui_kittest), with no window, GPU or GitHub. `gh` and `git` are answered by a script that records each call, so the tests check exactly what would be sent to GitHub.
 
-`npm run test:ui` starts the embedded demo service and runs Playwright checks for the glance view, multi-repository data, run-and-sign-off flow, checked-out-commit guard, fuzzy palette, all settings pages, dark mode, and reduced motion. On macOS it uses the installed Google Chrome; on CI install Playwright's browser with `npx playwright install chromium`.
-
-The Go service remains directly runnable for diagnostics:
+To build packages locally, install [cargo-packager](https://github.com/crabnebula-dev/cargo-packager) and run:
 
 ```bash
-go run . -demo
+cargo packager --release -p signoff --formats deb   # or app,dmg / nsis / appimage
 ```
 
-Useful service flags include `-dir`, `-port`, `-demo`, `-read-only`, `-no-browser`, and `-config`. `-desktop` and `-startup-json` are internal desktop-host integration flags.
+They are written to `target/packages/`.
 
-## Security model
+## License
 
-- The service binds only to `127.0.0.1` on a random port.
-- Every API route requires a random per-process header token and rejects non-loopback browser origins.
-- The token is injected into the local page, never placed in a URL or written to desktop logs.
-- Electron renderers use context isolation, sandboxing, no Node integration, a narrow preload API, and a local-only content-security policy.
-- External navigation is denied except for explicit `https://github.com` links opened in the system browser.
-- A local command and the PR commit are both revalidated before the GitHub signoff write.
-
-Readiness comes from the branch-protection contexts for the PR's base branch. When protection cannot be read, Signoff falls back to the extension's bare `signoff` assumption and labels that uncertainty instead of reporting a false green.
+MIT

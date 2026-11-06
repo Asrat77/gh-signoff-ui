@@ -103,6 +103,11 @@ impl Settings {
         }
     }
 
+    /// Waits, for a bounded time, until config and history are on disk.
+    pub(crate) fn flush(&self) {
+        self.service.flush();
+    }
+
     /// Whether edits are refused: demo data has no config to change.
     pub(crate) fn read_only(&self) -> bool {
         self.service.is_demo()

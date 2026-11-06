@@ -97,6 +97,8 @@ fn settings_harness(service: Arc<ProductService>, state: ProductState) -> Harnes
 /// Sets up fonts and palettes once per context. Fonts apply from the next
 /// frame, so the first frame draws nothing: false until then.
 fn installed(ctx: &egui::Context) -> bool {
+    // As the real shell does: a durable file write while drawing panics.
+    fastframe_file::mark_ui_thread();
     let id = egui::Id::new("ui-tests-installed");
     if ctx.data(|d| d.get_temp::<bool>(id).unwrap_or(false)) {
         return true;

@@ -503,6 +503,15 @@ impl ProductService {
         matches!(self.source, Source::Demo)
     }
 
+    /// Waits, for a bounded time, until config and history changes are on
+    /// disk. Call it before the app exits.
+    pub fn flush(&self) {
+        if let Source::GitHub { config, history, .. } = &self.source {
+            config.flush();
+            history.flush();
+        }
+    }
+
     /// The config store, outside demo mode.
     pub fn config(&self) -> Option<&Arc<ConfigStore>> {
         match &self.source {

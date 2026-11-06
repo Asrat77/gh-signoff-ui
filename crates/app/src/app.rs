@@ -198,6 +198,9 @@ impl Resident for Signoff {
     fn shutdown(&mut self) {
         self.runs.stop_all();
         self.refresher.stop();
+        // Config and history are written in the background; let the last
+        // changes reach the disk before the process ends.
+        self.settings.flush();
     }
 }
 

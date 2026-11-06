@@ -1,0 +1,85 @@
+name: Package
+
+# Builds installable packages on each OS: a .app and .dmg on macOS, an NSIS
+# installer on Windows, and an AppImage and .deb on Linux. They are
+# uploaded as workflow artifacts on every run and attached to the GitHub
+# release when a `v*` tag is pushed. Nothing is signed yet.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - ".github/workflows/package.yml"
+      - "crates/app/Cargo.toml"
+      - "crates/app/packaging/**"
+      - "assets/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PACKAGER_VERSION: 0.11.8
+
+jobs:
+  package:
+    name: package (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos
+            os: macos-latest
+            formats: app,dmg
+          - name: windows
+            os: windows-latest
+            formats: nsis
+          - name: linux
+            os: ubuntu-22.04
+            formats: appimage,deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-packager
+        run: cargo install cargo-packager --version ${{ env.CARGO_PACKAGER_VERSION }} --locked
+      - name: Package
+        run: cargo packager --release -p signoff --formats ${{ matrix.formats }} --verbose
+      - uses: actions/upload-artifact@v4
+        with:
+          name: signoff-${{ matrix.name }}
+          path: |
+            target/packages/*.dmg
+            target/packages/*.app
+            target/packages/*-setup.exe
+            target/packages/*.AppImage
+            target/packages/*.deb
+          if-no-files-found: error
+
+  release:
+    name: attach to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: packages
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packages/*.dmg
+            packages/*-setup.exe
+            packages/*.AppImage
+            packages/*.deb

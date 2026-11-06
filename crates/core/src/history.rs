@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{PoisonError, RwLock};
 
+use fastframe_file::{Access, Writer};
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -65,12 +66,14 @@ pub struct ActivityEvent {
 
 /// The history file and its loaded events.
 ///
-/// Appending saves at once and waits for the disk, so call it off the UI
-/// thread.
+/// Appending takes effect at once and hands the file to a background
+/// writer, so it never waits for the disk. Call [`HistoryStore::flush`]
+/// before the app exits.
 #[derive(Debug)]
 pub struct HistoryStore {
     path: PathBuf,
     events: RwLock<Vec<ActivityEvent>>,
+    writer: Writer,
 }
 
 /// `history.json` beside the config file.
@@ -94,7 +97,7 @@ impl HistoryStore {
             Err(source) => return Err(ConfigError::Io { action: "reading", path, source }),
         };
         sort_and_trim(&mut events);
-        Ok(Self { path, events: RwLock::new(events) })
+        Ok(Self { path, events: RwLock::new(events), writer: Writer::new() })
     }
 
     /// The newest `limit` events (all of them for 0).
@@ -108,7 +111,7 @@ impl HistoryStore {
     ///
     /// # Errors
     ///
-    /// When the file cannot be written; the event is then not kept.
+    /// When the events cannot be serialized; the event is then not kept.
     pub fn append(&self, mut event: ActivityEvent) -> Result<(), ConfigError> {
         if event.at == Timestamp::UNIX_EPOCH {
             event.at = Timestamp::now();
@@ -125,13 +128,18 @@ impl HistoryStore {
         let mut bytes = serde_json::to_vec_pretty(&next)
             .map_err(|source| ConfigError::Parse { path: self.path.clone(), source })?;
         bytes.push(b'\n');
-        fastframe_file::write_private(&self.path, bytes).map_err(|source| ConfigError::Io {
-            action: "writing",
-            path: self.path.clone(),
-            source,
-        })?;
+        let path = self.path.clone();
+        self.writer.write_or(&self.path, bytes, Access::Private, move || {
+            log::error!("could not write {}", path.display());
+        });
         *guard = next;
         Ok(())
+    }
+
+    /// Waits, at most [`fastframe_file::FLUSH_TIMEOUT`], until every event
+    /// is on disk. Returns whether it is.
+    pub fn flush(&self) -> bool {
+        self.writer.flush(fastframe_file::FLUSH_TIMEOUT)
     }
 }
 
@@ -159,6 +167,7 @@ mod tests {
             })
             .expect("append");
         history.append(ActivityEvent { id: "new".into(), at: now, ..ActivityEvent::default() }).expect("append");
+        assert!(history.flush(), "written");
 
         let ids: Vec<String> =
             HistoryStore::open(&path).expect("reload").snapshot(10).into_iter().map(|e| e.id).collect();
