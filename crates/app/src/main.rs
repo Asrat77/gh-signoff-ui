@@ -7,12 +7,15 @@
 
 mod anchor;
 mod app;
+mod autostart;
 mod glance;
 mod paths;
 mod popover;
 mod runs;
+mod settings;
 mod tray;
-mod views;
+#[cfg(test)]
+mod ui_tests;
 mod worker;
 
 use std::path::PathBuf;
@@ -85,6 +88,10 @@ fn main() -> ExitCode {
     };
 
     let waker = Waker::default();
+    let settings = {
+        let wake = waker.clone();
+        settings::Settings::new(service.clone(), move || wake.wake())
+    };
     let refresher = {
         let wake = waker.clone();
         worker::Refresher::spawn(service, move || wake.wake())
@@ -101,7 +108,7 @@ fn main() -> ExitCode {
         log::warn!("no tray is available; closing the window will quit");
     }
 
-    let app = app::Signoff::new(tray, refresher, runs, args.demo);
+    let app = app::Signoff::new(tray, refresher, runs, settings, args.demo);
     let result = Shell::new(app, &waker).idle(fastframe_tray::idle).start_hidden(args.hidden).run(|lease| {
         let options = lease.peek(|app| app::native_options(app.is_popover(), app.anchor()));
         eframe::run_native("Signoff", options, Box::new(move |cc| Ok(app::window(cc, lease))))

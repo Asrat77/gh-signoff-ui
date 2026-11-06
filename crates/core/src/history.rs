@@ -25,6 +25,8 @@ pub enum ActivityKind {
     /// A status read from GitHub.
     #[default]
     Status,
+    /// The required signoff checks of a branch were changed.
+    Rules,
 }
 
 /// One entry of activity.
@@ -197,6 +199,22 @@ mod tests {
         assert_eq!(events[0].kind, ActivityKind::Run);
         assert_eq!(events[0].state, CheckState::Failure);
         assert_eq!(events[0].exit_code, 1);
+    }
+
+    /// The Go version also logged branch-rule edits; one of them must not
+    /// stop the whole file loading.
+    #[test]
+    fn reads_go_rules_events() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history.json");
+        std::fs::write(
+            &path,
+            r#"[{"id":"y","kind":"rules","repoId":"r","repo":"o/r","check":"tests, lint","state":"success",
+            "detail":"Updated required signoff checks on main","at":"2026-08-10T08:18:36Z"}]"#,
+        )
+        .expect("write");
+        let events = HistoryStore::open(&path).expect("open").snapshot(0);
+        assert_eq!(events[0].kind, ActivityKind::Rules);
     }
 
     #[test]

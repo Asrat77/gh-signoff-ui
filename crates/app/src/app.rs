@@ -14,8 +14,9 @@ use signoff_core::{Health, ProductState};
 use crate::anchor::{self, Corner, POPOVER};
 use crate::popover::{self, Glance};
 use crate::runs::Runs;
+use crate::settings::{self, Settings};
+use crate::tray;
 use crate::worker::Refresher;
-use crate::{tray, views};
 
 /// The app's state between windows.
 pub(crate) struct Signoff {
@@ -33,6 +34,8 @@ pub(crate) struct Signoff {
     pub(crate) glance: Glance,
     /// The settings window is open.
     pub(crate) settings_open: bool,
+    /// What the settings window keeps between frames.
+    pub(crate) settings: Settings,
     /// Where the popover last opened, so the next window opens there.
     anchor: Option<Pos2>,
     /// When the popover last hid itself for losing focus.
@@ -49,7 +52,7 @@ pub(crate) struct Signoff {
 const SAME_CLICK: Duration = Duration::from_millis(400);
 
 impl Signoff {
-    pub(crate) fn new(tray: Option<Tray>, refresher: Refresher, runs: Runs, demo: bool) -> Self {
+    pub(crate) fn new(tray: Option<Tray>, refresher: Refresher, runs: Runs, settings: Settings, demo: bool) -> Self {
         Self {
             tray,
             refresher,
@@ -60,6 +63,7 @@ impl Signoff {
             demo,
             glance: Glance::default(),
             settings_open: false,
+            settings,
             anchor: None,
             auto_hidden_at: None,
             closing: Closed::Hide,
@@ -108,7 +112,7 @@ impl Signoff {
     }
 
     /// Handles tray clicks and new state. `ctx` is the window's, if open.
-    fn tick(&mut self, ctx: Option<&egui::Context>) {
+    pub(crate) fn tick(&mut self, ctx: Option<&egui::Context>) {
         let events = self.tray.as_ref().map(Tray::events).unwrap_or_default();
         for event in events {
             match event {
@@ -289,7 +293,7 @@ impl eframe::App for Window {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         popover::show(ui, &mut self.app);
         if self.app.settings_open {
-            views::settings_window(ui.ctx(), &mut self.app);
+            settings::window(ui.ctx(), &mut self.app);
         }
     }
 

@@ -208,9 +208,21 @@ impl Gh {
     }
 
     fn exec(&self, dir: Option<&Path>, program: &str, args: &[&str]) -> Result<String, GhError> {
+        self.run(dir, None, program, args)
+    }
+
+    /// Runs `program` with `input` on stdin; its stdout, or an error when it
+    /// could not start or exited non-zero.
+    pub(crate) fn run(
+        &self,
+        dir: Option<&Path>,
+        input: Option<&str>,
+        program: &str,
+        args: &[&str],
+    ) -> Result<String, GhError> {
         let out = self
             .runner
-            .run(dir, None, program, args)
+            .run(dir, input, program, args)
             .map_err(|source| GhError::Launch { program: program.to_owned(), source })?;
         if out.code != 0 {
             let message = if out.stderr.is_empty() { out.stdout } else { out.stderr };

@@ -111,6 +111,7 @@ impl Widget for Button<'_> {
         let sense = if self.enabled { Sense::click() } else { Sense::hover() };
         let (rect, response) = ui.allocate_exact_size(Vec2::new(width, self.height), sense);
         let response = if self.enabled { response.on_hover_cursor(CursorIcon::PointingHand) } else { response };
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, self.enabled, self.text));
         if ui.is_rect_visible(rect) {
             let (mut fill, mut ink) = self.colors(&p, response.hovered());
             if !self.enabled {
@@ -208,6 +209,7 @@ impl Widget for AddButton<'_> {
         let p = palette(ui.ctx());
         let (rect, response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), self.height), Sense::click());
         let response = response.on_hover_cursor(CursorIcon::PointingHand);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), self.text));
         if ui.is_rect_visible(rect) {
             let painter = ui.painter();
             let ink = if response.hovered() { p.text } else { p.secondary };
