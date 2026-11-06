@@ -145,6 +145,11 @@ impl Runs {
         slots.iter().rev().find(|s| &s.view.request == request).map(|s| s.view.clone())
     }
 
+    /// Whether any run is in progress.
+    pub(crate) fn any_running(&self) -> bool {
+        self.slots.lock().unwrap_or_else(PoisonError::into_inner).iter().any(|s| s.view.running())
+    }
+
     /// The repositories a run signed off on since the last call.
     pub(crate) fn take_signed_off(&self) -> Vec<String> {
         let mut repos = std::mem::take(&mut *self.signed_off.lock().unwrap_or_else(PoisonError::into_inner));

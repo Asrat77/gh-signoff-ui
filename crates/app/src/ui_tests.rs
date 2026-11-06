@@ -1038,3 +1038,47 @@ fn escape_closes_the_palette_and_is_taken_from_the_window() {
     // The window's own handler hides the popover on Escape only while the
     // palette is closed; it is open when that handler runs for this key.
 }
+
+/// The foot of the list says whether what it shows is current, in each of
+/// the scheduler's states.
+#[test]
+fn the_live_indicator_says_how_reads_are_going() {
+    use crate::glance::Liveness;
+    let until = jiff::Timestamp::now() + jiff::SignedDuration::from_mins(30);
+    let cases = [
+        (Liveness::Live, "Live"),
+        (Liveness::Reading, "Reading…"),
+        (Liveness::Offline { retry_in: Some(Duration::from_secs(20)) }, "Offline · retrying in 20s"),
+        (Liveness::Offline { retry_in: None }, "Offline · retrying"),
+        (Liveness::RateLimited { until }, "Rate limited until "),
+    ];
+    for (live, label) in cases {
+        let mut harness = Harness::builder().with_size(egui::vec2(380.0, 60.0)).build_ui(move |ui| {
+            if installed(ui.ctx()) {
+                popover::live_line(ui, live, false, None);
+            }
+        });
+        harness.run_ok();
+        assert!(harness.query_by_label_contains(label).is_some(), "{live:?} should read {label}");
+    }
+}
+
+/// The demo app goes live once its first read settles, and the old
+/// "Updated 12s ago" line is gone.
+#[test]
+fn the_popover_goes_live_after_the_first_read() {
+    let mut harness = popover_harness();
+    step_until(&mut harness, "the first read to settle", |h| h.query_by_label("Live").is_some());
+    assert!(harness.query_by_label_contains("Updated").is_none());
+}
+
+/// General explains how updates work instead of offering an interval.
+#[test]
+fn general_has_no_refresh_interval_to_set() {
+    let (service, state) = demo_state();
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("Refresh every").is_none());
+    assert!(harness.query_by_role(egui::accesskit::Role::Slider).is_none());
+    assert!(harness.query_by_label_contains("every few seconds while the popover is open").is_some());
+}

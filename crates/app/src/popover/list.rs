@@ -2,18 +2,17 @@
 //! failing first, then waiting on you, then ready.
 
 use egui::{Frame, Margin, ScrollArea, Ui};
-use jiff::Timestamp;
 use signoff_core::{Health, ProductState, PullRequestState};
 use signoff_ui::theme::space;
 use signoff_ui::widgets::{Button, ButtonKind, Chip, EmptyState, Headline, IconButton, Mood, PrRow, sheet};
 use signoff_ui::{Status, icons};
 
 use super::Page;
-use super::parts::{self, band, caption, notice, refresh_button};
+use super::parts::{self, band, notice, refresh_button};
 use crate::app::Signoff;
-use crate::glance::{self, Filter};
+use crate::glance::{self, Filter, Liveness};
 
-/// Room kept under the list for the main button and the "updated" line.
+/// Room kept under the list for the main button and the live indicator.
 const FOOTER: f32 = 112.0;
 
 /// What the list asks for this frame.
@@ -41,7 +40,8 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
         if !blocked(ui, app) {
             let installing = app.installer.running();
             let failure = app.installer.failure();
-            action = body(ui, &app.state, &mut app.glance.filter, installing, failure.as_deref());
+            let live = (app.live(), app.refreshing());
+            action = body(ui, &app.state, &mut app.glance.filter, installing, failure.as_deref(), live);
         }
     });
     match action {
@@ -112,6 +112,7 @@ fn body(
     filter: &mut Filter,
     installing: bool,
     install_failure: Option<&str>,
+    (live, reading): (Liveness, bool),
 ) -> Option<Action> {
     let mut action = None;
     Frame::new().inner_margin(Margin { left: 22, right: 22, top: 22, bottom: 14 }).show(ui, |ui| {
@@ -161,10 +162,8 @@ fn body(
             ui.add(Button::new("Nothing waiting on you").kind(ButtonKind::Secondary).enabled(false));
         }
         ui.add_space(space::S);
-        caption(ui, &glance::updated(state.fetched_at, Timestamp::now()));
+        parts::live_line(ui, live, reading, state.fetched_at);
     });
-    // Keep "Updated 12s ago" honest while the window is open.
-    ui.ctx().request_repaint_after_secs(5.0);
     action
 }
 

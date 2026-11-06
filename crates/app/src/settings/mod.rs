@@ -29,7 +29,7 @@ use crate::app::Signoff;
 /// The sections, in the order the column lists them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Section {
-    /// Launch at login, refresh interval, the environment.
+    /// Launch at login, how updates work, the environment.
     #[default]
     General,
     /// The tracked checkouts.

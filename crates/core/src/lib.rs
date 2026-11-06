@@ -15,6 +15,8 @@
 //! - [`product`] reads each tracked repository, and [`ProductService`]
 //!   patches what it reads into the shared state; `store` keeps those
 //!   patches consistent with the app's own changes.
+//! - [`watch_paths`] names the files under `.git` that say what is checked
+//!   out, for the app to watch.
 //! - [`verify`] runs a check's local command on the pull request's head
 //!   commit and writes the signoff only when it passed.
 //! - [`rules`] edits the signoff checks branch protection requires,
@@ -45,6 +47,7 @@ pub mod verify;
 pub use checks::{Check, CheckState, Rules, Tally};
 pub use config::{AppConfig, CommandMapping, ConfigError, ConfigStore, RepositoryUpdate, TrackedRepository};
 pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo};
+pub use git::{WatchPaths, watch_paths};
 pub use history::{ActivityEvent, ActivityKind, HistoryStore};
 pub use notify::{Change, Transition, transitions};
 pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequestState, RepositoryState};

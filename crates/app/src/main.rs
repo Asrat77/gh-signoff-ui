@@ -8,6 +8,7 @@
 mod anchor;
 mod app;
 mod autostart;
+mod cadence;
 mod checkouts;
 mod commands;
 mod glance;
@@ -21,6 +22,7 @@ mod settings;
 mod tray;
 #[cfg(test)]
 mod ui_tests;
+mod watcher;
 mod worker;
 
 use std::path::PathBuf;

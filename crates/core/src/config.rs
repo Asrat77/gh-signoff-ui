@@ -67,7 +67,9 @@ pub struct RepositoryUpdate {
 pub struct AppConfig {
     /// The format version.
     pub version: u32,
-    /// Seconds between background refreshes.
+    /// Seconds between background refreshes, from before Signoff picked
+    /// its own cadence. No longer read; kept so the setting survives a
+    /// save for an older build reading the same file.
     pub refresh_seconds: u32,
     /// Tell the person with a desktop notification when one of their pull
     /// requests starts failing or becomes ready, or a local run finishes.
