@@ -38,6 +38,13 @@
 //!   downstream sees a change. Reads still land in full while a signoff is
 //!   shown optimistically, so it can expire.
 //!
+//! - **Failed reads keep the last good one.** A read that fails (a
+//!   timeout, GitHub unreachable) does not wipe the repository: its pull
+//!   requests stay, with the error and [`RepositoryState::stale_since`]
+//!   saying they are from an earlier read. Only a repository never read
+//!   successfully shows nothing but the error. Otherwise one slow `gh`
+//!   call made pull requests vanish and come back between reads.
+//!
 //! A scheduler only changes when reads start, and needs nothing here.
 
 use std::cmp::Reverse;
@@ -270,6 +277,9 @@ impl Store {
         if read.deferred && shown {
             return false;
         }
+        if read.repository.error.is_some() && self.keep_last_good(&id, read.repository.error.clone(), now) {
+            return true;
+        }
         let unchanged = shown
             && self.fingerprints.get(&id) == Some(&fingerprint)
             && !self.optimistic.iter().any(|o| o.repo_id == id);
@@ -292,6 +302,30 @@ impl Store {
         self.statuses.insert(id, history);
         self.state.fetched_at = Some(now);
         self.reconcile();
+        true
+    }
+
+    /// Lands a failed read of `id` without dropping what it showed: its
+    /// pull requests stay, marked stale since the last read that worked,
+    /// and `error` says why it could not be read again. False when no
+    /// read of it ever worked, so there is nothing to keep.
+    fn keep_last_good(&mut self, id: &str, error: Option<String>, now: Timestamp) -> bool {
+        let Some(slot) = self.state.repositories.iter_mut().find(|r| r.id == id) else { return false };
+        let last_good = match slot.stale_since {
+            Some(since) => since,
+            None if slot.error.is_none() => match slot.fetched_at {
+                Some(at) => at,
+                None => return false,
+            },
+            None => return false,
+        };
+        slot.error = error;
+        slot.stale_since = Some(last_good);
+        slot.fetched_at = Some(now);
+        // The next read that works lands in full, even if it finds what
+        // the last good one did, so the error and the stale mark go.
+        self.fingerprints.remove(id);
+        self.state.fetched_at = Some(now);
         true
     }
 
@@ -578,6 +612,71 @@ mod tests {
         land(&mut store, "r1", vec![pr("r1", 5, CheckState::Pending, "me", 0)], at(3));
         assert_eq!(numbers(&store), [5, 2], "r1's closed pull request went, r2's stayed");
         assert_eq!(store.state.fetched_at, Some(at(3)));
+    }
+
+    fn failed_read(repo: &str, error: &str) -> RepositoryRead {
+        let mut read = read(repo, Vec::new());
+        read.repository.error = Some(error.into());
+        read
+    }
+
+    /// Starts and lands a read of `repo` that failed with `error`.
+    fn land_failure(store: &mut Store, repo: &str, error: &str, now: Timestamp) -> bool {
+        let (ticket, _) = store.begin_read(repo).expect("readable");
+        let landed = store.land(&ticket, failed_read(repo, error), now);
+        store.finish(Some(Vec::new()));
+        landed
+    }
+
+    #[test]
+    fn a_failed_read_keeps_the_last_good_pull_requests() {
+        let mut store = store(&[tracked("r1"), tracked("r2")]);
+        let found = || vec![pr("r1", 1, CheckState::Pending, "me", 0), pr("r1", 2, CheckState::Failure, "me", 0)];
+        land(&mut store, "r1", found(), at(1));
+        land(&mut store, "r2", vec![pr("r2", 3, CheckState::Pending, "me", 0)], at(1));
+        let before = store.state.summary.clone();
+
+        assert!(land_failure(&mut store, "r1", "gh timed out after 30s", at(2)));
+        assert!(land_failure(&mut store, "r1", "gh timed out after 30s", at(3)));
+        assert_eq!(numbers(&store), [2, 1, 3], "nothing vanished");
+        assert_eq!(store.state.summary, before, "the counts hold");
+        let repo = &store.state.repositories[0];
+        assert_eq!(repo.error.as_deref(), Some("gh timed out after 30s"));
+        assert_eq!(repo.stale_since, Some(at(1)), "since the last read that worked");
+        assert_eq!(repo.fetched_at, Some(at(3)));
+        assert_eq!(repo.pull_request_count, 2);
+        assert!(!repo.unknown(), "what it has open is known, if old");
+
+        // The same pull requests read again clear the error and stale mark.
+        land(&mut store, "r1", found(), at(4));
+        let repo = &store.state.repositories[0];
+        assert_eq!((repo.error.as_deref(), repo.stale_since), (None, None));
+        assert_eq!(numbers(&store), [2, 1, 3]);
+    }
+
+    #[test]
+    fn a_repository_never_read_shows_its_error_and_counts_as_unknown() {
+        let mut store = store(&[tracked("r1")]);
+        assert!(store.state.repositories[0].unknown(), "not read yet");
+        assert!(land_failure(&mut store, "r1", "gh timed out after 30s", at(1)));
+        assert!(land_failure(&mut store, "r1", "gh timed out after 30s", at(2)));
+        let repo = &store.state.repositories[0];
+        assert!(!repo.loading && repo.error.is_some() && repo.stale_since.is_none());
+        assert!(repo.unknown());
+        assert!(store.state.pull_requests.is_empty());
+
+        land(&mut store, "r1", vec![pr("r1", 1, CheckState::Pending, "me", 0)], at(3));
+        assert!(!store.state.repositories[0].unknown());
+        assert!(store.state.repositories[0].error.is_none());
+    }
+
+    #[test]
+    fn a_signoff_shown_survives_a_failed_read() {
+        let mut store = store(&[tracked("r1")]);
+        land(&mut store, "r1", vec![pr("r1", 1, CheckState::Pending, "me", 0)], at(0));
+        assert!(store.mark_signed_off("r1", 1, "tests", "sha1", "me", at(1)));
+        land_failure(&mut store, "r1", "boom", at(1));
+        assert_eq!(tests_state(&store, 1), CheckState::Success);
     }
 
     #[test]

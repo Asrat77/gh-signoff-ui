@@ -103,6 +103,18 @@ pub struct RepositoryState {
     pub loading: bool,
     /// When it was last read; `None` before that, and while paused.
     pub fetched_at: Option<Timestamp>,
+    /// The last read failed (see `error`), so the pull requests shown are
+    /// the ones an earlier read found at this time. `None` when what is
+    /// shown is current, or when nothing was ever read.
+    pub stale_since: Option<Timestamp>,
+}
+
+impl RepositoryState {
+    /// It is read, but what it has open is not known: not read yet, or
+    /// every read so far failed. Its pull requests may be missing.
+    pub fn unknown(&self) -> bool {
+        self.enabled && (self.fetched_at.is_none() || (self.error.is_some() && self.stale_since.is_none()))
+    }
 }
 
 /// One open pull request and its signoff checks.
