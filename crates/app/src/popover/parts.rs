@@ -67,6 +67,43 @@ pub(super) fn notice(ui: &mut Ui, status: Status, text: &str) {
     ui.add_space(space::S);
 }
 
+/// One notice for every read that failed: a sentence, and the raw errors
+/// behind a "Details" disclosure. `problems` is each failure's repository
+/// (empty when it is not one repository's) and its raw error.
+pub(super) fn read_problems(ui: &mut Ui, problems: &[(String, String)]) {
+    if problems.is_empty() {
+        return;
+    }
+    let described: Vec<_> = problems.iter().map(|(repo, raw)| crate::problem::describe(repo, raw)).collect();
+    let title = match described.as_slice() {
+        [only] => only.title.clone(),
+        many => format!("Couldn't read {} repositories. Showing the last pull requests Signoff saw.", many.len()),
+    };
+    let p = palette(ui.ctx());
+    Frame::new().fill(p.surface).corner_radius(radius::ROW).inner_margin(Margin::symmetric(14, 10)).show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
+            let status = Status::Failing;
+            ui.label(RichText::new(status.icon()).font(signoff_ui::fonts::icon(15.0)).color(status.color(&p)));
+            ui.add(egui::Label::new(RichText::new(title).font(Type::Caption.font()).color(p.text)).wrap());
+        });
+        egui::CollapsingHeader::new(RichText::new("Details").font(Type::Caption.font()).color(p.secondary))
+            .id_salt("read-problems")
+            .show(ui, |ui| {
+                for ((repo, _), problem) in problems.iter().zip(&described) {
+                    if !repo.is_empty() {
+                        ui.label(RichText::new(repo).font(Type::Caption.font()).color(p.text));
+                    }
+                    let raw = RichText::new(&problem.details).font(Type::Mono.font()).color(p.secondary);
+                    ui.add(egui::Label::new(raw).wrap());
+                    ui.add_space(space::S);
+                }
+            });
+    });
+    ui.add_space(space::S);
+}
+
 /// Whether the popover should offer to install `gh signoff`: `gh` is ready
 /// and only the extension is missing.
 pub(super) fn needs_extension(env: &Environment) -> bool {

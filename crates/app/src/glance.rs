@@ -78,13 +78,16 @@ pub(crate) fn count(state: &ProductState, filter: Filter) -> usize {
     state.pull_requests.iter().filter(|pr| filter.keeps(pr, &state.env.login)).count()
 }
 
-/// The big line at the top of the list and the line under it.
-pub(crate) fn headline(state: &ProductState) -> (String, String) {
-    let summary = &state.summary;
-    let failing = summary.failing;
-    let waiting = summary.needs_attention - failing;
-    if summary.needs_attention > 0 {
-        let title = match summary.needs_attention {
+/// The big line at the top of the list and the line under it. It counts
+/// what `filter` shows, so it never disagrees with the rows under it or
+/// with the button.
+pub(crate) fn headline(state: &ProductState, filter: Filter) -> (String, String) {
+    let shown = visible(state, filter);
+    let of = |health: Health| shown.iter().filter(|pr| pr.status == health).count();
+    let (failing, waiting, ready) = (of(Health::Failing), of(Health::Attention), of(Health::Ready));
+    let needs = failing + waiting;
+    if needs > 0 {
+        let title = match needs {
             1 => "1 PR needs you".to_owned(),
             n => format!("{n} PRs need you"),
         };
@@ -96,17 +99,17 @@ pub(crate) fn headline(state: &ProductState) -> (String, String) {
             parts.push(format!("{waiting} waiting on your signoff"));
         }
         (title, parts.join(" · "))
-    } else if summary.ready > 0 {
-        let title = format!("{} ready to merge", summary.ready);
-        let detail = if summary.ready == summary.total_pull_requests {
+    } else if ready > 0 {
+        let detail = if ready == shown.len() {
             "Every required signoff passes on head.".to_owned()
         } else {
-            let other = summary.total_pull_requests - summary.ready;
-            format!("{other} more with no signoffs required.")
+            format!("{} more with no signoffs required.", shown.len() - ready)
         };
-        (title, detail)
+        (format!("{ready} ready to merge"), detail)
     } else if let Some(unknown) = unknown_line(state) {
         unknown
+    } else if filter == Filter::Yours && !state.pull_requests.is_empty() {
+        ("Nothing to sign off".to_owned(), "None of your pull requests need a signoff.".to_owned())
     } else {
         ("Nothing to sign off".to_owned(), "No open pull request needs a signoff.".to_owned())
     }
@@ -333,16 +336,28 @@ mod tests {
 
     #[test]
     fn the_headline_counts_what_needs_you() {
-        let (title, detail) = headline(&demo_state());
+        let (title, detail) = headline(&demo_state(), Filter::All);
         assert_eq!(title, "2 PRs need you");
         assert_eq!(detail, "1 failing · 1 waiting on your signoff");
 
+        let ready = ProductState {
+            pull_requests: vec![pr("a", Health::Ready), pr("a", Health::Ready)],
+            ..ProductState::default()
+        };
+        assert_eq!(headline(&ready, Filter::All).0, "2 ready to merge");
+        assert_eq!(headline(&ProductState::default(), Filter::All).0, "Nothing to sign off");
+    }
+
+    #[test]
+    fn the_headline_follows_the_chip() {
         let mut state = ProductState::default();
-        state.summary.total_pull_requests = 2;
-        state.summary.ready = 2;
-        assert_eq!(headline(&state).0, "2 ready to merge");
-        state.summary.ready = 0;
-        assert_eq!(headline(&state).0, "Nothing to sign off");
+        state.env.login = "me".into();
+        state.pull_requests =
+            vec![pr("me", Health::Attention), pr("you", Health::Failing), pr("you", Health::Attention)];
+        assert_eq!(headline(&state, Filter::All).0, "3 PRs need you");
+        assert_eq!(headline(&state, Filter::Yours), ("1 PR needs you".into(), "1 waiting on your signoff".into()));
+        assert_eq!(headline(&state, Filter::Failing).0, "1 PR needs you");
+        assert_eq!(headline(&state, Filter::Ready).0, "Nothing to sign off");
     }
 
     #[test]
@@ -356,24 +371,27 @@ mod tests {
             ..RepositoryState::default()
         };
         let mut state = ProductState { repositories: vec![repo("a", None, false)], ..ProductState::default() };
-        assert_eq!(headline(&state).0, "Nothing to sign off");
+        assert_eq!(headline(&state, Filter::All).0, "Nothing to sign off");
 
         state.repositories.push(RepositoryState { fetched_at: None, ..repo("b", None, false) });
-        assert_eq!(headline(&state), ("Still reading".into(), "Waiting on 1 of your repositories…".into()));
+        assert_eq!(
+            headline(&state, Filter::All),
+            ("Still reading".into(), "Waiting on 1 of your repositories…".into())
+        );
 
         state.repositories[1] = repo("bella_sports", Some("gh timed out"), false);
-        assert_eq!(headline(&state).0, "Couldn't read bella_sports");
+        assert_eq!(headline(&state, Filter::All).0, "Couldn't read bella_sports");
         state.repositories.push(repo("c", Some("gh timed out"), false));
-        assert_eq!(headline(&state).0, "Couldn't read 2 repositories");
+        assert_eq!(headline(&state, Filter::All).0, "Couldn't read 2 repositories");
 
         // A failed read that kept the last good one: what it has open is known.
         state.repositories[1].stale_since = Some(Timestamp::UNIX_EPOCH);
         state.repositories[2].stale_since = Some(Timestamp::UNIX_EPOCH);
-        assert_eq!(headline(&state).0, "Nothing to sign off");
+        assert_eq!(headline(&state, Filter::All).0, "Nothing to sign off");
 
         // Paused repositories are not read, so they are not missing.
         state.repositories.push(RepositoryState { enabled: false, fetched_at: None, ..repo("d", None, false) });
-        assert_eq!(headline(&state).0, "Nothing to sign off");
+        assert_eq!(headline(&state, Filter::All).0, "Nothing to sign off");
     }
 
     #[test]
