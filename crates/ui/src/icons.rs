@@ -39,6 +39,8 @@ pub const REMOVE: &str = ph::X;
 pub const LOCKED: &str = ph::LOCK_SIMPLE;
 /// Copy to the clipboard.
 pub const COPY: &str = ph::COPY;
+/// Hand something to an AI coding agent.
+pub const AGENT: &str = ph::ROBOT;
 /// Search and quick actions.
 pub const SEARCH: &str = ph::MAGNIFYING_GLASS;
 
