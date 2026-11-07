@@ -103,6 +103,18 @@ pub struct RepositoryState {
     pub loading: bool,
     /// When it was last read; `None` before that, and while paused.
     pub fetched_at: Option<Timestamp>,
+    /// The last read failed (see `error`), so the pull requests shown are
+    /// the ones an earlier read found at this time. `None` when what is
+    /// shown is current, or when nothing was ever read.
+    pub stale_since: Option<Timestamp>,
+}
+
+impl RepositoryState {
+    /// It is read, but what it has open is not known: not read yet, or
+    /// every read so far failed. Its pull requests may be missing.
+    pub fn unknown(&self) -> bool {
+        self.enabled && (self.fetched_at.is_none() || (self.error.is_some() && self.stale_since.is_none()))
+    }
 }
 
 /// One open pull request and its signoff checks.
@@ -291,8 +303,11 @@ impl StatusCache {
 pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCache) -> (RepositoryRead, bool) {
     if let Some(api) = gh.api().filter(|api| api.usable()) {
         match read_with_api(gh, api, tracked) {
-            Ok(read) => return read,
-            Err(err) => log::debug!("reading {} through gh: {err}", tracked.name_with_owner),
+            Ok(read) => {
+                api.note_fallback(&tracked.name_with_owner, None);
+                return read;
+            }
+            Err(err) => api.note_fallback(&tracked.name_with_owner, Some(&err)),
         }
     }
     read_with_gh(gh, tracked, cache)
@@ -344,9 +359,14 @@ const PARALLEL_STATUSES: usize = 4;
 /// anything GitHub answered is a read, failed or not.
 fn read_with_api(gh: &Gh, api: &Api, tracked: &TrackedRepository) -> Result<(RepositoryRead, bool), ApiError> {
     let mut view = initial_view(tracked);
-    // Which repository and host: from gh, once per checkout per session.
-    let remote = match api.remote(&tracked.path) {
-        Some(remote) => remote,
+    // Which repository and host: from the checkout's git config when it
+    // says for certain, otherwise from gh; once per checkout per session.
+    let from_checkout = || remote_from_checkout(tracked).filter(|_| !api.needs_gh(&tracked.path));
+    let remote = match api.remote(&tracked.path).or_else(from_checkout) {
+        Some(remote) => {
+            api.remember(&tracked.path, remote.clone());
+            remote
+        }
         None => match gh.repo(&tracked.path) {
             Ok(info) => {
                 let remote = Remote {
@@ -423,6 +443,24 @@ fn read_with_api(gh: &Gh, api: &Api, tracked: &TrackedRepository) -> Result<(Rep
         history.extend(events);
     }
     Ok((RepositoryRead { repository: view, pull_requests, history, deferred: false }, false))
+}
+
+/// The remote of `tracked` without asking `gh`: the repository and default
+/// branch saved when it was added, on the host its git remote names. A
+/// repository renamed since answers 404, after which `gh` is asked.
+///
+/// `gh repo view` was the one `gh` call left on the REST path, and on a
+/// slow machine it timed out before the API was ever tried.
+fn remote_from_checkout(tracked: &TrackedRepository) -> Option<Remote> {
+    if tracked.default_branch.is_empty() {
+        return None;
+    }
+    let host = crate::git::github_host(&tracked.path, &tracked.name_with_owner)?;
+    Some(Remote {
+        host,
+        name_with_owner: tracked.name_with_owner.clone(),
+        default_branch: tracked.default_branch.clone(),
+    })
 }
 
 /// `f` applied to every item, `workers` at a time, in order.
@@ -929,8 +967,8 @@ mod tests {
     use super::*;
     use crate::api::fake::{FakeTransport, json, not_modified};
     use crate::config::{AppConfig, RepositoryUpdate};
-    use crate::runner::Runner;
     use crate::runner::fake::{FakeRunner, Reply, fail, ok};
+    use crate::runner::{Runner, TIMED_OUT};
 
     #[test]
     fn summary_uses_the_worst_pull_request() {
@@ -1198,9 +1236,16 @@ mod tests {
     }
 
     fn api_fixture(replies: Vec<Reply>) -> (Fixture, Arc<FakeRunner>, Arc<FakeTransport>) {
+        api_fixture_with(replies, vec![tracked()])
+    }
+
+    fn api_fixture_with(
+        replies: Vec<Reply>,
+        repos: Vec<TrackedRepository>,
+    ) -> (Fixture, Arc<FakeRunner>, Arc<FakeTransport>) {
         let fake = Arc::new(FakeRunner::new(replies));
         let transport = Arc::new(FakeTransport::default());
-        let f = fixture(fake.clone(), vec![tracked()]);
+        let f = fixture(fake.clone(), repos);
         let gh = Gh::with_api(fake.clone(), transport.clone());
         let service = Arc::new(ProductService::new(
             gh,
@@ -1254,6 +1299,28 @@ mod tests {
         assert_eq!((gh_calls("repo view"), gh_calls("auth token")), (1, 1), "resolved once per session");
     }
 
+    /// The checkout's git config names the repository on github.com, so
+    /// the REST path needs no `gh repo view`, until GitHub refuses it.
+    #[test]
+    fn the_remote_comes_from_the_checkout_until_github_refuses_it() {
+        let checkout = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(checkout.path().join(".git")).expect("mkdir");
+        std::fs::write(checkout.path().join(".git/config"), "[remote \"origin\"]\n\turl = git@github.com:o/r.git\n")
+            .expect("config");
+        let repo = TrackedRepository { path: checkout.path().into(), default_branch: "main".into(), ..tracked() };
+        let (f, fake, transport) = api_fixture_with(api_gh(true), vec![repo]);
+        rest_answers(&transport);
+        assert_eq!(f.service.refresh().pull_requests.len(), 2);
+        assert!(!fake.called("repo view"), "resolved from .git/config");
+
+        transport.answer("/pulls?", json(404, None, r#"{"message":"Not Found"}"#));
+        f.service.refresh();
+        assert!(!fake.called("repo view"));
+        rest_answers(&transport);
+        f.service.refresh();
+        assert!(fake.called("repo view"), "after a 404, gh resolves it");
+    }
+
     #[test]
     fn without_a_token_reads_go_through_gh() {
         let mut replies = api_gh(false);
@@ -1275,6 +1342,28 @@ mod tests {
         assert_eq!(state.pull_requests.len(), 2);
         assert!(fake.called("pr list"));
         assert_eq!(transport.sent().len(), 1);
+    }
+
+    /// The Mac this was found on: the API cannot be reached, and `gh`,
+    /// which reads instead, times out. What was read before stays.
+    #[test]
+    fn when_the_api_is_unreachable_and_gh_times_out_the_last_read_stays() {
+        let mut replies = api_gh(true);
+        replies.push(Reply { matches: "pr list", stdout: "", stderr: "gh timed out after 60s", code: TIMED_OUT });
+        let (f, fake, transport) = api_fixture(replies);
+        rest_answers(&transport);
+        let first = f.service.refresh();
+        assert_eq!(first.pull_requests.len(), 2);
+
+        transport.fail("/pulls?", "tls: unknown certificate authority");
+        let second = f.service.refresh();
+        assert!(fake.called("pr list"), "read through gh");
+        assert_eq!(second.pull_requests, first.pull_requests, "nothing vanished");
+        assert_eq!(second.summary, first.summary, "the counts hold");
+        let repo = &second.repositories[0];
+        assert!(repo.error.as_deref().is_some_and(|e| e.contains("timed out")));
+        assert_eq!(repo.stale_since, first.repositories[0].fetched_at);
+        assert!(f.service.read_failed("r1"), "the scheduler still backs off");
     }
 
     #[test]

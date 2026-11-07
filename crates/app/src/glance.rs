@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
-use signoff_core::{Check, CheckState, Health, ProductState, PullRequestState};
+use signoff_core::{Check, CheckState, Health, ProductState, PullRequestState, RepositoryState};
 use signoff_ui::Status;
 use signoff_ui::widgets::Segment;
 
@@ -106,16 +106,32 @@ pub(crate) fn headline(state: &ProductState, filter: Filter) -> (String, String)
             format!("{} more with no signoffs required.", shown.len() - ready)
         };
         (format!("{ready} ready to merge"), detail)
-    } else if state.repositories.iter().any(|repo| repo.error.is_some()) {
-        // A failed read is not an empty one.
-        (
-            "Couldn't read everything".to_owned(),
-            "Some repositories didn't answer, so this may be incomplete.".to_owned(),
-        )
+    } else if let Some(unknown) = unknown_line(state) {
+        unknown
     } else if filter == Filter::Yours && !state.pull_requests.is_empty() {
         ("Nothing to sign off".to_owned(), "None of your pull requests need a signoff.".to_owned())
     } else {
         ("Nothing to sign off".to_owned(), "No open pull request needs a signoff.".to_owned())
+    }
+}
+
+/// What to say instead of "Nothing to sign off" while some repository's
+/// open pull requests are not known: not read yet, or every read of it
+/// failed. Saying nothing needs you then would be a guess.
+fn unknown_line(state: &ProductState) -> Option<(String, String)> {
+    let unknown: Vec<&RepositoryState> = state.repositories.iter().filter(|repo| repo.unknown()).collect();
+    let failed: Vec<&RepositoryState> = unknown.iter().copied().filter(|repo| repo.error.is_some()).collect();
+    match (failed.as_slice(), unknown.len()) {
+        (_, 0) => None,
+        ([], waiting) => Some(("Still reading".to_owned(), format!("Waiting on {waiting} of your repositories…"))),
+        ([repo], _) => {
+            let name = repo.name_with_owner.rsplit_once('/').map_or(repo.name_with_owner.as_str(), |(_, name)| name);
+            Some((format!("Couldn't read {name}"), "Its pull requests may need you.".to_owned()))
+        }
+        (failed, _) => Some((
+            format!("Couldn't read {} repositories", failed.len()),
+            "Their pull requests may need you.".to_owned(),
+        )),
     }
 }
 
@@ -345,13 +361,37 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_read_is_never_called_nothing_to_sign_off() {
-        let broken = signoff_core::RepositoryState {
-            error: Some("gh timed out".into()),
-            ..signoff_core::RepositoryState::default()
+    fn the_headline_never_says_nothing_to_sign_off_while_a_repository_is_unknown() {
+        let repo = |name: &str, error: Option<&str>, stale: bool| RepositoryState {
+            name_with_owner: format!("o/{name}"),
+            enabled: true,
+            error: error.map(Into::into),
+            fetched_at: Some(Timestamp::UNIX_EPOCH),
+            stale_since: stale.then_some(Timestamp::UNIX_EPOCH),
+            ..RepositoryState::default()
         };
-        let state = ProductState { repositories: vec![broken], ..ProductState::default() };
-        assert_eq!(headline(&state, Filter::All).0, "Couldn't read everything");
+        let mut state = ProductState { repositories: vec![repo("a", None, false)], ..ProductState::default() };
+        assert_eq!(headline(&state, Filter::All).0, "Nothing to sign off");
+
+        state.repositories.push(RepositoryState { fetched_at: None, ..repo("b", None, false) });
+        assert_eq!(
+            headline(&state, Filter::All),
+            ("Still reading".into(), "Waiting on 1 of your repositories…".into())
+        );
+
+        state.repositories[1] = repo("bella_sports", Some("gh timed out"), false);
+        assert_eq!(headline(&state, Filter::All).0, "Couldn't read bella_sports");
+        state.repositories.push(repo("c", Some("gh timed out"), false));
+        assert_eq!(headline(&state, Filter::All).0, "Couldn't read 2 repositories");
+
+        // A failed read that kept the last good one: what it has open is known.
+        state.repositories[1].stale_since = Some(Timestamp::UNIX_EPOCH);
+        state.repositories[2].stale_since = Some(Timestamp::UNIX_EPOCH);
+        assert_eq!(headline(&state, Filter::All).0, "Nothing to sign off");
+
+        // Paused repositories are not read, so they are not missing.
+        state.repositories.push(RepositoryState { enabled: false, fetched_at: None, ..repo("d", None, false) });
+        assert_eq!(headline(&state, Filter::All).0, "Nothing to sign off");
     }
 
     #[test]
