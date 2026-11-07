@@ -889,21 +889,21 @@ fn the_global_shortcut_switch_is_on_by_default_and_saved() {
 }
 
 #[test]
-fn the_separate_worktree_switch_is_off_by_default_and_saved() {
+fn the_separate_worktree_switch_is_on_by_default_and_saved() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
     let state = service.cached_or_config_state();
     let mut harness = settings_harness(service.clone(), state);
     harness.run_ok();
-    assert!(!harness.state().settings.isolated_worktrees_on());
-
-    harness.get_by_label("Verify in a separate worktree").click();
-    harness.run_ok();
-    assert!(service.config().expect("config").snapshot().isolated_worktrees);
+    assert!(harness.state().settings.isolated_worktrees_on());
 
     harness.get_by_label("Verify in a separate worktree").click();
     harness.run_ok();
     assert!(!service.config().expect("config").snapshot().isolated_worktrees);
+
+    harness.get_by_label("Verify in a separate worktree").click();
+    harness.run_ok();
+    assert!(service.config().expect("config").snapshot().isolated_worktrees);
 }
 
 /// Answers like [`Script`], but holds every `git fetch` until opened and

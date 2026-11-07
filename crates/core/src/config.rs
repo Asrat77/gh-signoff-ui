@@ -15,7 +15,11 @@ use sha2::{Digest as _, Sha256};
 use crate::gh::{Gh, GhError};
 
 /// The config format version this build writes.
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// - 1: the Go version's format.
+/// - 2: verifying in a separate worktree is on by default. Files from
+///   version 1 are switched on once, as that build saved its default off.
+pub const CURRENT_VERSION: u32 = 2;
 /// The longest a mapped command may run.
 pub const MAX_TIMEOUT_SECONDS: u32 = 7200;
 /// The timeout of a mapped command that names none.
@@ -101,7 +105,7 @@ pub struct AppConfig {
     pub shortcut: String,
     /// Run a pull request's checks in a separate worktree that Signoff
     /// manages, at the pull request's head, instead of requiring the
-    /// tracked checkout to be there. Off unless the person turns it on.
+    /// tracked checkout to be there. On unless the person turns it off.
     pub isolated_worktrees: bool,
     /// Tracked checkouts, sorted by GitHub name.
     pub repositories: Vec<TrackedRepository>,
@@ -115,18 +119,27 @@ impl Default for AppConfig {
             notifications: true,
             shortcut_enabled: true,
             shortcut: String::new(),
-            isolated_worktrees: false,
+            isolated_worktrees: true,
             repositories: Vec::new(),
         }
     }
 }
 
 impl AppConfig {
+    /// Brings a file written by an older build up to [`CURRENT_VERSION`].
+    /// A file from a newer build is left as it is.
+    fn migrate(&mut self) {
+        if self.version < 2 {
+            // Version 1 always wrote the setting, and wrote its default off,
+            // so a saved "off" is not a choice the person made.
+            self.isolated_worktrees = true;
+            self.version = 2;
+        }
+    }
+
     /// Fills defaults, bounds values and sorts, as every load and save does.
     pub fn normalize(&mut self) {
-        if self.version == 0 {
-            self.version = CURRENT_VERSION;
-        }
+        self.migrate();
         if self.refresh_seconds < 10 {
             self.refresh_seconds = 30;
         }
@@ -638,19 +651,44 @@ mod tests {
         assert_eq!(loaded.shortcut, "Alt+Shift+KeyS");
     }
 
-    /// Verifying in a separate worktree is off unless a config says
+    /// Verifying in a separate worktree is on unless a config says
     /// otherwise, and the switch is kept.
     #[test]
-    fn isolated_worktrees_default_off_for_old_configs_and_the_switch_is_saved() {
+    fn isolated_worktrees_default_on_and_the_switch_is_saved() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("config.json");
-        std::fs::write(&path, r#"{"version":1,"refreshSeconds":30,"repositories":[]}"#).expect("write");
         let store = ConfigStore::open(&path).expect("open");
-        assert!(!store.snapshot().isolated_worktrees, "an old file has no setting: off");
-        store.set_isolated_worktrees(true).expect("save");
+        assert!(store.snapshot().isolated_worktrees, "a new config: on");
+        store.set_isolated_worktrees(false).expect("save");
         assert!(store.flush());
-        assert!(std::fs::read_to_string(&path).expect("read").contains(r#""isolatedWorktrees": true"#));
-        assert!(ConfigStore::open(&path).expect("reload").snapshot().isolated_worktrees);
+        let saved = std::fs::read_to_string(&path).expect("read");
+        assert!(saved.contains(r#""isolatedWorktrees": false"#), "{saved}");
+        assert!(saved.contains(r#""version": 2"#), "{saved}");
+        assert!(!ConfigStore::open(&path).expect("reload").snapshot().isolated_worktrees, "turned off stays off");
+    }
+
+    /// A version 1 file saved the setting off because that was its
+    /// default, so it is switched on once; other settings are kept.
+    #[test]
+    fn version_1_configs_switch_isolated_worktrees_on_once() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        for old in [
+            r#"{"version":1,"refreshSeconds":30,"repositories":[]}"#,
+            r#"{"version":1,"refreshSeconds":30,"notifications":false,"isolatedWorktrees":false,"repositories":[]}"#,
+            r#"{"version":0,"refreshSeconds":30,"isolatedWorktrees":false,"repositories":[]}"#,
+        ] {
+            std::fs::write(&path, old).expect("write");
+            let config = ConfigStore::open(&path).expect("open").snapshot();
+            assert!(config.isolated_worktrees, "{old}");
+            assert_eq!(config.version, CURRENT_VERSION, "{old}");
+            assert_eq!(config.notifications, !old.contains("notifications"), "{old}");
+        }
+        let newer = r#"{"version":3,"refreshSeconds":30,"isolatedWorktrees":false,"repositories":[]}"#;
+        std::fs::write(&path, newer).expect("write");
+        let config = ConfigStore::open(&path).expect("open").snapshot();
+        assert!(!config.isolated_worktrees, "a newer build's choice is kept");
+        assert_eq!(config.version, 3);
     }
 
     /// The Go version's file must keep loading.
