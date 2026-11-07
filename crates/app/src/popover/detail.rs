@@ -3,11 +3,11 @@
 
 use egui::Response;
 use egui::{Align, Frame, Layout, Margin, RichText, ScrollArea, Ui};
-use signoff_core::{ActivityKind, Check, CheckState, Phase, PullRequestState, VerifyRequest};
-use signoff_ui::theme::{size, space};
+use signoff_core::{ActivityKind, Check, CheckState, Ending, Outcome, Phase, PullRequestState, VerifyRequest};
+use signoff_ui::theme::{radius, size, space};
 use signoff_ui::widgets::{
     Button, ButtonKind, CheckRow, Chip, EmptyState, Headline, IconButton, IconButtonKind, LogLine, LogView, Mood,
-    Segments, sheet,
+    Segments, sheet, toast,
 };
 use signoff_ui::{Status, Type, icons, palette};
 
@@ -15,6 +15,7 @@ use super::Page;
 use super::parts::{band, caption, height_above, notice, refresh_button};
 use crate::app::Signoff;
 use crate::checkouts::Checkout;
+use crate::failure::{self, Failure};
 use crate::glance;
 use crate::runs::{self, RunView};
 
@@ -104,8 +105,17 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
                 }
                 if let (Some(check), Some(run)) = (&target, &run) {
                     ui.add_space(space::XS);
-                    run_log(ui, check, run);
-                    if !run.running() && ui.add(Chip::new("Clear output").icon(icons::REMOVE)).clicked() {
+                    let failure = run.result.as_ref().and_then(|result| failure::describe(&check.name, result));
+                    if let Some(failure) = &failure {
+                        failure_card(ui, app, &pr, check, run, failure);
+                    }
+                    if !run.lines.is_empty() {
+                        run_log(ui, check, run);
+                    }
+                    if failure.is_none()
+                        && !run.running()
+                        && ui.add(Chip::new("Clear output").icon(icons::REMOVE)).clicked()
+                    {
                         app.runs.dismiss(&request(&pr, check));
                     }
                 } else if let (Some(check), None) = (&target, &run)
@@ -269,18 +279,115 @@ fn run_log(ui: &mut Ui, check: &Check, run: &RunView) {
             lines.push(LogLine::Success(format!("{} signed off {}", icons::CHECK, check.name)));
             ("signed off".to_owned(), Status::Ready)
         }
-        Some(Ok(outcome)) => {
-            let message = outcome.message.clone().unwrap_or_else(|| format!("exit {}", outcome.code));
-            lines.push(LogLine::Failure(message));
-            (format!("exit {}", outcome.code), Status::Failing)
-        }
-        Some(Err(refused)) => {
-            lines.push(LogLine::Failure(refused.clone()));
-            ("refused".to_owned(), Status::Failing)
-        }
+        // The card above says what happened; the log ends the way a
+        // terminal would.
+        Some(Ok(outcome)) => match outcome.ending {
+            Ending::CheckFailed => {
+                lines.push(LogLine::Failure(format!("exit {}", outcome.code)));
+                (format!("exit {}", outcome.code), Status::Failing)
+            }
+            Ending::TimedOut => {
+                lines.push(LogLine::Failure("timed out".to_owned()));
+                ("timed out".to_owned(), Status::Failing)
+            }
+            Ending::Stopped => {
+                lines.push(LogLine::Step("stopped".to_owned()));
+                ("stopped".to_owned(), Status::Neutral)
+            }
+            Ending::Interrupted | Ending::SignedOff => ("not signed off".to_owned(), Status::Attention),
+        },
+        Some(Err(_)) => ("didn't start".to_owned(), Status::Attention),
     };
     let title = format!("{} output", check.name);
     ui.add(LogView::new(&title, &lines).phase(&phase, status).max_height(150.0));
+}
+
+/// What a run that did not sign off means, and what to do next: for a
+/// failed check, hand it to a coding agent or copy its output; open it in
+/// History or dismiss it from the corner. The main button below runs it
+/// again. The card scrolls into view once, when the run ends.
+fn failure_card(
+    ui: &mut Ui,
+    app: &mut Signoff,
+    pr: &PullRequestState,
+    check: &Check,
+    run: &RunView,
+    failure: &Failure,
+) {
+    let p = palette(ui.ctx());
+    let accent = failure.status.color(&p);
+    let outcome = run.result.as_ref().and_then(|result| result.as_ref().ok());
+    let entry = outcome.and_then(|outcome| outcome.entry.clone());
+    let lines: Vec<String> = run.lines.iter().cloned().collect();
+    // A tint of the status colour, so the chips' own fill reads as pills.
+    let card = Frame::new()
+        .fill(accent.gamma_multiply(0.08))
+        .stroke(egui::Stroke::new(1.0, accent.gamma_multiply(0.55)))
+        .corner_radius(radius::ROW)
+        .inner_margin(Margin::symmetric(14, 12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_top(|ui| {
+                ui.spacing_mut().item_spacing.x = space::S;
+                ui.label(RichText::new(failure.status.icon()).font(signoff_ui::fonts::icon(17.0)).color(accent));
+                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                    ui.spacing_mut().item_spacing.x = space::XS;
+                    let dismiss = IconButton::new(icons::REMOVE, "Dismiss").kind(IconButtonKind::OnSheet).size(28.0);
+                    if ui.add(dismiss).clicked() {
+                        app.runs.dismiss(&request(pr, check));
+                    }
+                    if let Some(entry) = &entry {
+                        let history =
+                            IconButton::new(icons::HISTORY, "Open in History").kind(IconButtonKind::OnSheet).size(28.0);
+                        if ui.add(history).clicked() {
+                            app.settings.open_history(Some(entry.clone()));
+                            app.settings_open = true;
+                        }
+                    }
+                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                        ui.label(RichText::new(&failure.title).font(Type::Row.font()).color(p.text).strong());
+                        ui.add_space(2.0);
+                        let detail = RichText::new(&failure.detail).font(Type::Caption.font()).color(p.secondary);
+                        ui.add(egui::Label::new(detail).wrap());
+                    });
+                });
+            });
+            let copy_agent = failure.check_failed && outcome.is_some();
+            if !copy_agent && lines.is_empty() && !failure.timed_out {
+                return;
+            }
+            ui.add_space(space::S);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(space::XS, space::XS);
+                if let Some(outcome) = outcome.filter(|_| copy_agent) {
+                    let chip = Chip::new("Copy for agent").icon(icons::AGENT);
+                    let hover =
+                        "Copy a prompt with the command, the commit and the output, to paste into a coding agent";
+                    if ui.add(chip).on_hover_text(hover).clicked() {
+                        ui.ctx().copy_text(failure::agent_prompt(pr, &check.name, outcome, &lines));
+                        toast(ui.ctx(), "Copied a prompt for your coding agent", Status::Ready);
+                    }
+                }
+                if !lines.is_empty() && ui.add(Chip::new("Copy output").icon(icons::COPY)).clicked() {
+                    ui.ctx().copy_text(failure::plain_output(outcome, &lines));
+                    toast(ui.ctx(), "Copied the output", Status::Ready);
+                }
+                if failure.timed_out && ui.add(Chip::new("Change timeout").icon(icons::TERMINAL)).clicked() {
+                    configure(app, pr, &check.name);
+                }
+            });
+        });
+    // Once per ending: a new run that fails again scrolls again.
+    let seen = egui::Id::new(("failure-seen", &pr.id, &check.name, run.lines.len(), entry));
+    if !ui.data(|data| data.get_temp::<bool>(seen).unwrap_or(false)) {
+        ui.data_mut(|data| data.insert_temp(seen, true));
+        card.response.scroll_to_me(Some(Align::TOP));
+    }
+}
+
+/// Whether the latest run of `check` here failed the check itself.
+fn check_failed(run: Option<&RunView>) -> bool {
+    run.and_then(|run| run.result.as_ref()).is_some_and(|result| result.as_ref().is_ok_and(Outcome::check_failed))
 }
 
 /// What stops this pull request's checks from being trusted as shown.
@@ -338,7 +445,7 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
             }
         }
         (Some(check), _) if runnable(app, check) => {
-            let again = check.state == CheckState::Success;
+            let again = check.state == CheckState::Success || check_failed(run);
             let label =
                 if again { format!("Run {} again", check.name) } else { format!("Run & sign off {}", check.name) };
             let hover = if isolated {
@@ -381,6 +488,7 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
         Some(Checkout::Running) => format!("Running gh pr checkout {number}…"),
         _ if run.is_some_and(|run| run.running() && run.phase == Phase::Prepare) => "Preparing worktree…".to_owned(),
         _ if offered && confirming => format!("{}?", switch(app, pr)),
+        _ if check_failed(run) => "Fix what it found, then run it again to sign off.".to_owned(),
         _ if isolated && unmapped.is_none() => format!(
             "Runs in a separate worktree at {}; your checkout is not touched.",
             glance::short_sha(&pr.pr.head_sha)
