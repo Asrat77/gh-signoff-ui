@@ -107,7 +107,7 @@ mod tests {
     }
 
     fn outcome(phase: Phase, code: i32, message: Option<&str>) -> Outcome {
-        Outcome { phase, code, message: message.map(str::to_owned) }
+        Outcome { phase, code, message: message.map(str::to_owned), ..Outcome::default() }
     }
 
     #[test]

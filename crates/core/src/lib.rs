@@ -64,5 +64,5 @@ pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequ
 pub use rules::{RulesError, Write as RulesWrite};
 pub use runner::{CANCELLED, Output, Runner, SystemRunner, TIMED_OUT};
 pub use suggest::CommandSuggestion;
-pub use verify::{Outcome, Phase, Verifier, VerifyError, VerifyEvent, VerifyRequest};
+pub use verify::{Ending, Outcome, Phase, Verifier, VerifyError, VerifyEvent, VerifyRequest};
 pub use worktree::Worktrees;
