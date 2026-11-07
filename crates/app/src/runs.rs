@@ -9,7 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 
-use signoff_core::{Outcome, Phase, Verifier, VerifyEvent, VerifyRequest};
+use signoff_core::{ActivityEvent, Outcome, Phase, Verifier, VerifyEvent, VerifyRequest};
+use signoff_ui::Status;
+use signoff_ui::widgets::LogLine;
 
 use crate::notifier::RunFinished;
 
@@ -168,5 +170,63 @@ impl Runs {
         for slot in self.slots.lock().unwrap_or_else(PoisonError::into_inner).iter() {
             slot.cancel.store(true, Ordering::Release);
         }
+    }
+}
+
+/// A past run's output, as history kept it, for the log view, ending with
+/// how it went. Empty when history kept no output for it.
+pub(crate) fn past_log(event: &ActivityEvent) -> Vec<LogLine> {
+    if event.output.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = Vec::with_capacity(event.output.len() + 2);
+    if event.output_dropped > 0 {
+        lines.push(LogLine::Step(format!("… {} earlier lines", event.output_dropped)));
+    }
+    lines.extend(event.output.iter().cloned().map(LogLine::Output));
+    let (end, _) = past_result(event);
+    lines.push(if event.exit_code == 0 { LogLine::Success(end) } else { LogLine::Failure(end) });
+    lines
+}
+
+/// "exit 0 in 6.2s" for a past run, and how it reads.
+pub(crate) fn past_result(event: &ActivityEvent) -> (String, Status) {
+    let status = if event.exit_code == 0 { Status::Ready } else { Status::Failing };
+    let text = if event.duration_millis > 0 {
+        format!("exit {} in {:.1}s", event.exit_code, event.duration_millis as f64 / 1000.0)
+    } else {
+        format!("exit {}", event.exit_code)
+    };
+    (text, status)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_past_run_reads_back_with_how_it_ended() {
+        let event = ActivityEvent {
+            output: vec!["$ make test".into(), "1 failed".into()],
+            output_dropped: 3,
+            exit_code: 2,
+            duration_millis: 1500,
+            ..ActivityEvent::default()
+        };
+        assert_eq!(
+            past_log(&event),
+            [
+                LogLine::Step("… 3 earlier lines".into()),
+                LogLine::Output("$ make test".into()),
+                LogLine::Output("1 failed".into()),
+                LogLine::Failure("exit 2 in 1.5s".into()),
+            ]
+        );
+        assert_eq!(past_result(&event).1, Status::Failing);
+    }
+
+    #[test]
+    fn an_entry_without_output_has_no_log() {
+        assert!(past_log(&ActivityEvent::default()).is_empty());
     }
 }

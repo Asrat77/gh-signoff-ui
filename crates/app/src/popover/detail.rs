@@ -16,7 +16,7 @@ use super::parts::{band, caption, height_above, notice, refresh_button};
 use crate::app::Signoff;
 use crate::checkouts::Checkout;
 use crate::glance;
-use crate::runs::RunView;
+use crate::runs::{self, RunView};
 
 /// Room kept under the checks for the actions.
 const FOOTER: f32 = 116.0;
@@ -152,8 +152,8 @@ fn picked(app: &Signoff, check: &Check) -> bool {
 }
 
 /// What the last local run of `check` on this pull request did, from
-/// history, for a check with no run in this session. History keeps the
-/// result, not the output, so the line says how to see it again.
+/// history, for a check with no run in this session: its output when
+/// history kept it, else how it ended.
 fn last_run(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, check: &Check) {
     let last = app.state.history.iter().find(|event| {
         event.kind == ActivityKind::Run
@@ -161,24 +161,24 @@ fn last_run(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, check: &Check) {
             && event.pr_number == pr.pr.number
             && event.check == check.name
     });
-    let text = match last {
-        Some(event) => {
-            let outcome = if event.exit_code == 0 { "passed" } else { "failed" };
-            let secs = event.duration_millis as f64 / 1000.0;
-            format!(
-                "Last run {}: {outcome} (exit {}) in {secs:.1}s. Run it again to see its output.",
-                event.at.strftime("%Y-%m-%d %H:%M"),
-                event.exit_code
-            )
-        }
-        None => format!("{} has not been run from here on this pull request yet.", check.name),
+    let Some(event) = last else {
+        let text = format!("{} has not been run from here on this pull request yet.", check.name);
+        return notice(ui, Status::Neutral, &text);
     };
-    let status = match last {
-        Some(event) if event.exit_code != 0 => Status::Failing,
-        Some(_) => Status::Ready,
-        None => Status::Neutral,
-    };
-    notice(ui, status, &text);
+    let when = event.at.strftime("%Y-%m-%d %H:%M").to_string();
+    let lines = runs::past_log(event);
+    if !lines.is_empty() {
+        let (result, status) = runs::past_result(event);
+        let title = format!("{} · last run {when}", check.name);
+        ui.add(LogView::new(&title, &lines).phase(&result, status).max_height(150.0));
+        return;
+    }
+    // Runs from before history kept output.
+    let outcome = if event.exit_code == 0 { "passed" } else { "failed" };
+    let secs = event.duration_millis as f64 / 1000.0;
+    let text =
+        format!("Last run {when}: {outcome} (exit {}) in {secs:.1}s. Run it again to see its output.", event.exit_code);
+    notice(ui, if event.exit_code == 0 { Status::Ready } else { Status::Failing }, &text);
 }
 
 /// The check the page's button acts on: the one running, else the one

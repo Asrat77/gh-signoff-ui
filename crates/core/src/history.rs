@@ -15,6 +15,19 @@ use crate::config::ConfigError;
 /// Events kept on disk.
 pub const MAX_EVENTS: usize = 500;
 
+/// Output lines kept per event; earlier ones are counted, not kept.
+pub const MAX_OUTPUT_LINES: usize = 400;
+
+/// Output bytes kept per event, so one noisy run cannot bloat the file.
+pub const MAX_OUTPUT_BYTES: usize = 32 * 1024;
+
+/// A longer line is cut to this many bytes.
+const MAX_LINE_BYTES: usize = 2 * 1024;
+
+/// Only the newest events with output keep it; older ones keep their
+/// result. Bounds the file at about this many times [`MAX_OUTPUT_BYTES`].
+pub const EVENTS_WITH_OUTPUT: usize = 50;
+
 /// What happened.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -62,6 +75,63 @@ pub struct ActivityEvent {
     pub duration_millis: i64,
     /// When.
     pub at: Timestamp,
+    /// The last lines it printed, oldest first, so the run can be seen
+    /// again. Empty for events without output and for older ones.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output: Vec<String>,
+    /// Lines dropped from the front of `output` to keep it small.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub output_dropped: usize,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// The tail of a run's output, as kept in history: at most
+/// [`MAX_OUTPUT_LINES`] lines and about [`MAX_OUTPUT_BYTES`] bytes, the
+/// newest ones.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OutputTail {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+    dropped: usize,
+}
+
+impl OutputTail {
+    /// Adds a line, dropping the oldest ones past the limits. A very long
+    /// line is cut short.
+    pub fn push(&mut self, line: &str) {
+        let line = if line.len() > MAX_LINE_BYTES {
+            let mut end = MAX_LINE_BYTES;
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", &line[..end])
+        } else {
+            line.to_owned()
+        };
+        self.bytes += line.len();
+        self.lines.push_back(line);
+        while self.lines.len() > MAX_OUTPUT_LINES || (self.bytes > MAX_OUTPUT_BYTES && self.lines.len() > 1) {
+            if let Some(old) = self.lines.pop_front() {
+                self.bytes -= old.len();
+                self.dropped += 1;
+            }
+        }
+    }
+
+    /// Starts over, as for a new step of a run.
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Moves the kept lines into `event`, leaving this empty.
+    pub fn take_into(&mut self, event: &mut ActivityEvent) {
+        let tail = std::mem::take(self);
+        event.output = tail.lines.into();
+        event.output_dropped = tail.dropped;
+    }
 }
 
 /// The history file and its loaded events.
@@ -146,6 +216,10 @@ impl HistoryStore {
 fn sort_and_trim(events: &mut Vec<ActivityEvent>) {
     events.sort_by_key(|e| std::cmp::Reverse(e.at));
     events.truncate(MAX_EVENTS);
+    for event in events.iter_mut().filter(|e| !e.output.is_empty()).skip(EVENTS_WITH_OUTPUT) {
+        event.output = Vec::new();
+        event.output_dropped = 0;
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +298,75 @@ mod tests {
         .expect("write");
         let events = HistoryStore::open(&path).expect("open").snapshot(0);
         assert_eq!(events[0].kind, ActivityKind::Rules);
+    }
+
+    #[test]
+    fn output_survives_a_reload() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("history.json");
+        let history = HistoryStore::open(&path).expect("open");
+        let mut tail = OutputTail::default();
+        tail.push("$ cargo test");
+        tail.push("test result: ok");
+        let mut event = ActivityEvent { kind: ActivityKind::Run, ..ActivityEvent::default() };
+        tail.take_into(&mut event);
+        history.append(event).expect("append");
+        assert!(history.flush(), "written");
+
+        let events = HistoryStore::open(&path).expect("reload").snapshot(0);
+        assert_eq!(events[0].output, ["$ cargo test", "test result: ok"]);
+        assert_eq!(events[0].output_dropped, 0);
+    }
+
+    #[test]
+    fn events_without_output_leave_it_out_of_the_file() {
+        let json = serde_json::to_string(&ActivityEvent::default()).expect("json");
+        assert!(!json.contains("output"), "{json}");
+    }
+
+    #[test]
+    fn the_tail_keeps_the_newest_lines() {
+        let mut tail = OutputTail::default();
+        for n in 0..MAX_OUTPUT_LINES + 5 {
+            tail.push(&n.to_string());
+        }
+        let mut event = ActivityEvent::default();
+        tail.take_into(&mut event);
+        assert_eq!(event.output.len(), MAX_OUTPUT_LINES);
+        assert_eq!(event.output_dropped, 5);
+        assert_eq!(event.output[0], "5");
+        assert_eq!(tail, OutputTail::default(), "taken");
+    }
+
+    #[test]
+    fn the_tail_stays_under_its_byte_limit() {
+        let mut tail = OutputTail::default();
+        let long = "é".repeat(MAX_LINE_BYTES);
+        for _ in 0..40 {
+            tail.push(&long);
+        }
+        let mut event = ActivityEvent::default();
+        tail.take_into(&mut event);
+        let bytes: usize = event.output.iter().map(String::len).sum();
+        assert!(bytes <= MAX_OUTPUT_BYTES, "{bytes}");
+        assert!(event.output[0].ends_with('…'), "long lines are cut");
+        assert!(event.output_dropped > 0);
+    }
+
+    #[test]
+    fn only_the_newest_events_keep_their_output() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history = HistoryStore::open(dir.path().join("history.json")).expect("open");
+        let now = Timestamp::now();
+        for n in 0..=EVENTS_WITH_OUTPUT {
+            let at = now - SignedDuration::from_secs(i64::try_from(n).expect("small"));
+            let event = ActivityEvent { at, output: vec![n.to_string()], ..ActivityEvent::default() };
+            history.append(event).expect("append");
+        }
+        let events = history.snapshot(0);
+        assert_eq!(events.len(), EVENTS_WITH_OUTPUT + 1);
+        assert_eq!(events[EVENTS_WITH_OUTPUT - 1].output, [(EVENTS_WITH_OUTPUT - 1).to_string()]);
+        assert!(events[EVENTS_WITH_OUTPUT].output.is_empty(), "the oldest lost its output");
     }
 
     #[test]

@@ -5,6 +5,7 @@ use egui::{RichText, Ui};
 use jiff::Timestamp;
 use signoff_core::{ActivityEvent, ActivityKind, CheckState, ProductState};
 use signoff_ui::theme::space;
+use signoff_ui::widgets::{Chip, LogView};
 use signoff_ui::{Status, Type, icons, palette};
 
 use super::parts;
@@ -108,6 +109,7 @@ pub(super) fn show(ui: &mut Ui, state: &ProductState) {
                     if !event.command.is_empty() {
                         ui.label(RichText::new(&event.command).font(Type::Mono.font()).color(p.secondary));
                     }
+                    output(ui, event);
                 });
             });
         });
@@ -115,6 +117,27 @@ pub(super) fn show(ui: &mut Ui, state: &ProductState) {
     if state.history.len() > SHOWN {
         ui.add_space(space::S);
         parts::caption(ui, &format!("Showing the latest {SHOWN}."));
+    }
+}
+
+/// A "Show output" toggle, and the output under it, for an entry that
+/// kept what it printed.
+fn output(ui: &mut Ui, event: &ActivityEvent) {
+    let lines = crate::runs::past_log(event);
+    if lines.is_empty() {
+        return;
+    }
+    let id = ui.id().with(("history-output", &event.id));
+    let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
+    let (label, icon) = if open { ("Hide output", icons::REMOVE) } else { ("Show output", icons::TERMINAL) };
+    if ui.add(Chip::new(label).icon(icon)).clicked() {
+        open = !open;
+        ui.data_mut(|data| data.insert_temp(id, open));
+    }
+    if open {
+        let (result, status) = crate::runs::past_result(event);
+        let title = format!("{} output", event.check);
+        ui.add(LogView::new(&title, &lines).phase(&result, status).max_height(220.0));
     }
 }
 

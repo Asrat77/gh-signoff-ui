@@ -927,9 +927,9 @@ impl ProductService {
         self.store().state.pull_request(repo_id, number).cloned()
     }
 
-    /// In demo mode, marks a check passed, as a successful run would. Does
-    /// nothing outside demo mode.
-    pub fn mark_demo_passed(&self, repo_id: &str, number: u64, check_name: &str) {
+    /// In demo mode, marks a check passed, as a successful run printing
+    /// `output` would. Does nothing outside demo mode.
+    pub fn mark_demo_passed(&self, repo_id: &str, number: u64, check_name: &str, output: Vec<String>) {
         if !self.is_demo() {
             return;
         }
@@ -950,6 +950,7 @@ impl ProductService {
                 state: CheckState::Success,
                 actor: "you".into(),
                 at: now,
+                output,
                 ..ActivityEvent::default()
             };
             store.state.history.insert(0, event);
@@ -1049,11 +1050,12 @@ mod tests {
         let service = ProductService::demo();
         service.refresh();
         assert!(!service.find_pull_request("demo-signoff", 482).expect("pr").ready);
-        service.mark_demo_passed("demo-signoff", 482, "security");
+        service.mark_demo_passed("demo-signoff", 482, "security", vec!["$ bin/audit".into()]);
         let pr = service.find_pull_request("demo-signoff", 482).expect("pr");
         assert!(pr.ready);
         assert_eq!(pr.status, Health::Ready);
         assert_eq!(service.cached().history[0].kind, ActivityKind::Run);
+        assert_eq!(service.cached().history[0].output, ["$ bin/audit"]);
         assert!(service.refresh().pull_request("demo-signoff", 482).expect("pr").ready, "kept across refresh");
     }
 
