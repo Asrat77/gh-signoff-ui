@@ -58,7 +58,7 @@ pub use config::{
 };
 pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo};
 pub use git::{WatchPaths, watch_paths};
-pub use history::{ActivityEvent, ActivityKind, HistoryStore};
+pub use history::{ActivityEvent, ActivityKind, HistoryStore, OutputTail};
 pub use notify::{Change, Transition, transitions};
 pub use product::{Health, ProductService, ProductState, ProductSummary, PullRequestState, RepositoryState};
 pub use rules::{RulesError, Write as RulesWrite};

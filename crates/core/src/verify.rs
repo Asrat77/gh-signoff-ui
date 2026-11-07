@@ -29,7 +29,7 @@ use jiff::Timestamp;
 use crate::checks::{CheckState, valid_context_name};
 use crate::config::{ConfigStore, DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS};
 use crate::gh::{Gh, short_sha};
-use crate::history::{ActivityEvent, ActivityKind, HistoryStore};
+use crate::history::{ActivityEvent, ActivityKind, HistoryStore, OutputTail};
 use crate::product::ProductService;
 use crate::runner::Runner;
 use crate::worktree::{Lease, Worktrees};
@@ -236,7 +236,8 @@ impl Verifier {
 
         let _running = self.claim(request)?;
         let head = pr.pr.head_sha.clone();
-        let mut ctx = Run { pr_title: &pr.pr.title, repo: &pr.repo, request, check, on_event };
+        let mut ctx =
+            Run { pr_title: &pr.pr.title, repo: &pr.repo, request, check, on_event, output: OutputTail::default() };
 
         match &self.source {
             Source::Demo { pace } => Ok(self.play_demo(&mut ctx, &target.local_command, &head, *pace)),
@@ -312,11 +313,13 @@ impl Verifier {
         ctx.line(format!("$ {command}"));
         thread::sleep(pace);
         ctx.line("local command passed");
+        let mut run = ActivityEvent::default();
+        ctx.output.take_into(&mut run);
         ctx.emit(VerifyEvent::Phase(Phase::Signoff));
         ctx.line(format!("$ {}", signoff_args(head, ctx.check).join(" ")));
         thread::sleep(pace);
         ctx.line(format!("signed off {} on {}", ctx.check, short_sha(head)));
-        self.product.mark_demo_passed(&ctx.request.repo_id, ctx.request.pr_number, ctx.check);
+        self.product.mark_demo_passed(&ctx.request.repo_id, ctx.request.pr_number, ctx.check, run.output);
         Outcome { phase: Phase::Signoff, code: 0, message: None }
     }
 }
@@ -350,10 +353,17 @@ struct Run<'a> {
     request: &'a VerifyRequest,
     check: &'a str,
     on_event: &'a mut dyn FnMut(VerifyEvent),
+    /// What the current step printed, kept with its history entry.
+    output: OutputTail,
 }
 
 impl Run<'_> {
     fn emit(&mut self, event: VerifyEvent) {
+        match &event {
+            // Each step's entry keeps only that step's output.
+            VerifyEvent::Phase(_) => self.output.clear(),
+            VerifyEvent::Line(line) => self.output.push(line),
+        }
         (self.on_event)(event);
     }
 
@@ -361,8 +371,16 @@ impl Run<'_> {
         self.emit(VerifyEvent::Line(line.into()));
     }
 
-    fn activity(&self, kind: ActivityKind, repo_id: &str, command: String, code: i32, took: Duration) -> ActivityEvent {
-        ActivityEvent {
+    /// The history entry for the step that just ended, with its output.
+    fn activity(
+        &mut self,
+        kind: ActivityKind,
+        repo_id: &str,
+        command: String,
+        code: i32,
+        took: Duration,
+    ) -> ActivityEvent {
+        let mut event = ActivityEvent {
             kind,
             repo_id: repo_id.to_owned(),
             repo: self.repo.to_owned(),
@@ -376,7 +394,9 @@ impl Run<'_> {
             duration_millis: i64::try_from(took.as_millis()).unwrap_or(i64::MAX),
             at: Timestamp::now(),
             ..ActivityEvent::default()
-        }
+        };
+        self.output.take_into(&mut event);
+        event
     }
 }
 
@@ -658,6 +678,12 @@ mod tests {
         let kinds: Vec<ActivityKind> = f.history.snapshot(0).iter().map(|e| e.kind).collect();
         assert!(kinds.contains(&ActivityKind::Run) && kinds.contains(&ActivityKind::Signoff));
         assert!(f.history.snapshot(0).iter().all(|e| e.state == CheckState::Success && e.check == "tests"));
+        let history = f.history.snapshot(0);
+        let ran = history.iter().find(|e| e.kind == ActivityKind::Run).expect("run");
+        assert_eq!(ran.output, ["$ make test", "ok 12 tests"], "the run keeps only its own output");
+        let signed = history.iter().find(|e| e.kind == ActivityKind::Signoff).expect("signoff");
+        assert!(signed.output.iter().any(|l| l == "✓ Signed off"), "{:?}", signed.output);
+        assert!(!signed.output.iter().any(|l| l == "ok 12 tests"));
 
         let pr = f.product.find_pull_request("r1", 7).expect("pr");
         let tests = pr.checks.iter().find(|c| c.name == "tests").expect("check");
@@ -694,6 +720,7 @@ mod tests {
         let pr = f.product.find_pull_request("r1", 7).expect("pr");
         assert!(pr.checks.iter().all(|c| c.state != CheckState::Success), "nothing shown as signed off");
         assert_eq!(history[0].command, "make test");
+        assert_eq!(history[0].output, ["$ make test", "1 failed"], "kept to see why it failed");
     }
 
     /// Someone pushed while the command ran: the checkout still matches, but

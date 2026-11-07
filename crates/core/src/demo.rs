@@ -196,6 +196,13 @@ pub fn product_state(now: Timestamp) -> ProductState {
             exit_code: 1,
             detail: "1 failing test".into(),
             at: ago(22),
+            output: vec![
+                "$ bin/test".into(),
+                "Running 214 tests across 18 files".into(),
+                "\u{1b}[31mFAIL\u{1b}[0m poller_test.rb:88 drains the queue before stopping".into(),
+                "  expected 0 jobs left, got 1".into(),
+                "213 passed, 1 failed in 41.2s".into(),
+            ],
             ..ActivityEvent::default()
         },
     ];
