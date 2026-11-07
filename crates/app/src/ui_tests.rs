@@ -1279,7 +1279,7 @@ fn the_command_shortcut_opens_and_closes_the_palette() {
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
     harness.run_ok();
     assert!(palette_open(&harness));
-    assert!(harness.query_by_label_contains("Open #").is_some());
+    assert!(harness.query_by_label_contains("Refresh all repositories").is_some());
     harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
     harness.run_ok();
     assert!(!palette_open(&harness));
@@ -1341,6 +1341,43 @@ fn clicking_a_result_runs_it() {
     assert!(!palette_open(&harness));
     assert!(harness.state().settings_open);
     assert_eq!(harness.state().settings.section, settings::Section::Repositories);
+}
+
+/// A pull request is one result; its other actions wait behind Tab.
+#[test]
+fn tab_lists_a_pull_requests_actions_and_escape_goes_back() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    harness.event(egui::Event::Text("poller".into()));
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("Open on GitHub").is_none(), "one entry per pull request");
+    harness.key_press(egui::Key::Tab);
+    harness.run_ok();
+    assert!(palette_open(&harness));
+    assert!(harness.query_by_label_contains("Open on GitHub").is_some());
+    assert!(harness.query_by_label_contains("Refresh all repositories").is_none());
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(palette_open(&harness), "Escape only went back");
+    assert!(harness.query_by_label_contains("Open on GitHub").is_none());
+    assert!(harness.query_by_label_contains("Refresh all repositories").is_some());
+    harness.key_press(egui::Key::Escape);
+    harness.run_ok();
+    assert!(!palette_open(&harness));
+}
+
+/// Letters that merely appear in order do not find a pull request.
+#[test]
+fn scattered_letters_do_not_match_a_pull_request() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::K);
+    harness.run_ok();
+    harness.event(egui::Event::Text("plr".into()));
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("No matching action").is_some());
 }
 
 #[test]
