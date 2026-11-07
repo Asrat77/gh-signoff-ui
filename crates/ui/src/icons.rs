@@ -52,6 +52,8 @@ pub const COMMIT: &str = ph::GIT_COMMIT;
 pub const PULL_REQUEST: &str = ph::GIT_PULL_REQUEST;
 /// Command output.
 pub const TERMINAL: &str = ph::TERMINAL_WINDOW;
+/// Set up by Signoff on its own, such as a command read from CI.
+pub const DETECTED: &str = ph::SPARKLE;
 /// History.
 pub const HISTORY: &str = ph::CLOCK_COUNTER_CLOCKWISE;
 /// Diagnostics.

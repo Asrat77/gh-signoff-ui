@@ -7,7 +7,7 @@ use egui::{Align, DragValue, Layout, RichText, Ui};
 use signoff_core::checks::valid_context_name;
 use signoff_core::config::{DEFAULT_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS};
 use signoff_core::suggest;
-use signoff_core::{CommandMapping, CommandSuggestion, ProductService, ProductState, RepositoryState};
+use signoff_core::{CommandMapping, CommandSuggestion, DetectedCommand, ProductService, ProductState, RepositoryState};
 use signoff_ui::theme::space;
 use signoff_ui::widgets::{Button, ButtonKind, Chip, IconButton, IconButtonKind, toast};
 use signoff_ui::{Status, Type, icons, palette};
@@ -35,6 +35,8 @@ pub(crate) struct Draft {
     focus: Option<String>,
     /// Commands the checkout suggests, read when the draft is made.
     suggested: Vec<CommandSuggestion>,
+    /// The commands Signoff set up from the CI config, by check.
+    detected: BTreeMap<String, DetectedCommand>,
 }
 
 /// How many suggested commands show under a command field.
@@ -91,24 +93,28 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
         ui,
         "Commands",
         "What runs on your computer before Signoff signs off a check. Each runs in the checkout, on the pull \
-         request's head commit, and the signoff is written only when it exits 0.",
+         request's head commit, and the signoff is written only when it exits 0. Signoff sets up what it can \
+         from the default branch's CI config; edit or remove any of them and it leaves that check to you.",
     );
     let Some(repo) = parts::repository_picker(ui, &mut settings.selected_repo, state) else {
         parts::notice(ui, Status::Neutral, "Add a repository first.");
         return;
     };
+    let (saved_commands, detected) = saved(&settings.service, repo);
+    let saved_rows = rows(&saved_commands);
     let draft = match &mut settings.commands {
-        Some(draft) if draft.repo_id == repo.id => draft,
+        // Untouched drafts follow the config, which detection may change.
+        Some(draft) if draft.repo_id == repo.id && (draft.rows != draft.saved || draft.saved == saved_rows) => draft,
         slot => {
-            let rows = rows(&saved(&settings.service, repo));
             let suggested = suggest::detect(&repo.path);
             slot.insert(Draft {
                 repo_id: repo.id.clone(),
-                saved: rows.clone(),
-                rows,
+                saved: saved_rows.clone(),
+                rows: saved_rows,
                 new_check: String::new(),
                 focus: None,
                 suggested,
+                detected,
             })
         }
     };
@@ -159,6 +165,15 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
                     field.scroll_to_me(Some(Align::Center));
                 }
             });
+            if let Some(found) = draft.detected.get(&row.check).filter(|found| found.command == row.command) {
+                let p = palette(ui.ctx());
+                ui.add_space(space::XS);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(icons::DETECTED).font(signoff_ui::fonts::icon(12.0)).color(p.secondary));
+                    let text = format!("Set up from {}", found.source);
+                    ui.label(RichText::new(text).font(Type::Caption.font()).color(p.secondary));
+                });
+            }
             if !read_only && row.command.trim().is_empty() {
                 let chosen = suggestion_chips(ui, &draft.suggested, &row.check);
                 if let Some(command) = chosen {
@@ -193,12 +208,16 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
     }
 }
 
-/// The commands as saved: from the config, or the demo state's.
-fn saved(service: &ProductService, repo: &RepositoryState) -> BTreeMap<String, CommandMapping> {
+/// The commands as saved, and those of them Signoff set up: from the
+/// config, or the demo state's.
+fn saved(
+    service: &ProductService,
+    repo: &RepositoryState,
+) -> (BTreeMap<String, CommandMapping>, BTreeMap<String, DetectedCommand>) {
     service
         .config()
         .and_then(|config| config.find_repository(&repo.id))
-        .map_or_else(|| repo.commands.clone(), |tracked| tracked.commands)
+        .map_or_else(|| (repo.commands.clone(), BTreeMap::new()), |tracked| (tracked.commands, tracked.detected))
 }
 
 /// Clickable commands from the checkout, best match for `check` first;
