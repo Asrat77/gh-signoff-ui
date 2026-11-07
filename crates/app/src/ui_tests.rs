@@ -613,6 +613,21 @@ fn a_history_entry_shows_its_output() {
 }
 
 #[test]
+fn clicking_a_history_title_opens_its_output() {
+    let service = Arc::new(ProductService::demo());
+    let state = service.refresh();
+    let title =
+        state.history.iter().find(|e| !e.output.is_empty()).map(|e| e.check.clone()).expect("an entry with output");
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    harness.get_by_label("History").click();
+    harness.run_ok();
+    harness.get_by_label_contains(&format!("Ran {title} on")).click();
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("213 passed, 1 failed").is_some());
+}
+
+#[test]
 fn a_pull_request_without_signoffs_offers_to_set_them_up() {
     let mut harness = popover_harness();
     harness.run_ok();
