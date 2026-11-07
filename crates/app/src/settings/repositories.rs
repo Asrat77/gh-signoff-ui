@@ -32,16 +32,18 @@ pub(super) fn show(ui: &mut Ui, settings: &mut Settings, state: &ProductState, _
         "Local checkouts of GitHub repositories. Signoff shows their open pull requests and runs checks in them.",
     );
     accept_drops(ui.ctx(), settings);
+    add(ui, settings);
+    ui.add_space(space::S);
+    discovery::show(ui, settings, false);
     let rows = rows(settings, state);
     if rows.is_empty() {
         parts::notice(ui, Status::Neutral, "No repository yet. Add a local checkout to start.");
+    } else {
+        parts::label(ui, "Tracked");
     }
     for repo in &rows {
         row(ui, settings, repo);
     }
-    ui.add_space(space::S);
-    discovery::show(ui, settings, false);
-    add(ui, settings);
 }
 
 impl Form {
@@ -102,7 +104,7 @@ fn failing(state: &ProductState, id: &str) -> usize {
 /// The line under a row's path: what the last refresh found, or why not.
 fn status_line(repo: &Row) -> (String, Status) {
     if !repo.enabled {
-        return ("Paused".into(), Status::Neutral);
+        return ("Not watching. Turn it on to see its PRs.".into(), Status::Neutral);
     }
     if let Some(error) = &repo.error {
         return (crate::problem::describe(&repo.name_with_owner, error).title, Status::Failing);
@@ -174,8 +176,9 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row) {
         });
         ui.add_space(space::S);
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing.x = space::S;
             if ui
-                .add(Button::new("Open on GitHub").kind(ButtonKind::Secondary).compact().width(130.0))
+                .add(Button::new("Open on GitHub").kind(ButtonKind::Inset).compact().width(118.0))
                 .on_hover_text("Open this repository in your browser")
                 .clicked()
             {
@@ -183,7 +186,7 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row) {
             }
             let manager = format!("Show in {}", file_manager());
             if ui
-                .add(Button::new(&manager).kind(ButtonKind::Secondary).compact().width(130.0))
+                .add(Button::new(&manager).kind(ButtonKind::Inset).compact().width(112.0))
                 .on_hover_text("Open the checkout's folder")
                 .clicked()
             {
@@ -191,7 +194,7 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row) {
             }
             ui.add_enabled_ui(!read_only, |ui| {
                 if ui
-                    .add(Button::new("Set up signoff").kind(ButtonKind::Secondary).compact().width(130.0))
+                    .add(Button::new("Set up signoff").kind(ButtonKind::Inset).compact().width(108.0))
                     .on_hover_text("Require the signoff check on this repository's default branch")
                     .clicked()
                 {
@@ -202,11 +205,11 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row) {
                         settings.repositories.confirm_remove = None;
                         remove(ui, settings, repo);
                     }
-                    if ui.add(Button::new("Keep").kind(ButtonKind::Secondary).compact().width(72.0)).clicked() {
+                    if ui.add(Button::new("Keep").kind(ButtonKind::Inset).compact().width(72.0)).clicked() {
                         settings.repositories.confirm_remove = None;
                     }
                 } else if ui
-                    .add(Button::new("Stop tracking").kind(ButtonKind::Secondary).compact().width(130.0))
+                    .add(Button::new("Stop tracking").kind(ButtonKind::Inset).compact().width(106.0))
                     .on_hover_text("Stop showing this repository's pull requests")
                     .clicked()
                 {
@@ -271,7 +274,7 @@ fn add(ui: &mut Ui, settings: &mut Settings) {
         });
         return;
     }
-    if ui.add(AddButton::new("Add a local checkout")).clicked() {
+    if ui.add(AddButton::new("Add a repository")).clicked() {
         choose_and_add(ui.ctx(), settings);
         return;
     }
@@ -435,7 +438,10 @@ mod tests {
     #[test]
     fn the_status_line_says_what_the_last_read_found() {
         let line = |row: &Row| status_line(row);
-        assert_eq!(line(&row_of(false, true, 3, 1, None)), ("Paused".into(), Status::Neutral));
+        assert_eq!(
+            line(&row_of(false, true, 3, 1, None)),
+            ("Not watching. Turn it on to see its PRs.".into(), Status::Neutral)
+        );
         assert_eq!(line(&row_of(true, false, 0, 0, None)), ("Reading…".into(), Status::Neutral));
         assert_eq!(line(&row_of(true, true, 0, 0, None)), ("No open PRs".into(), Status::Neutral));
         assert_eq!(line(&row_of(true, true, 1, 0, None)), ("1 open PR".into(), Status::Neutral));

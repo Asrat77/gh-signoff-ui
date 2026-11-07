@@ -212,7 +212,7 @@ fn demo_settings_save_nothing() {
     harness.get_by_label_contains("Demo data: settings are shown but nothing is saved");
     harness.get_by_label("Repositories").click();
     harness.run_ok();
-    assert!(harness.query_by_label("Add a local checkout").is_none());
+    assert!(harness.query_by_label("Add a repository").is_none());
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn adding_a_checkout_tracks_it() {
     type_into(&mut harness, 0, &checkout.display().to_string());
     harness.get_by_label("Add").click();
     step_until(&mut harness, "the checkout to be added", |h| {
-        h.query_by_label("Add a local checkout").is_some()
+        h.query_by_label("Add a repository").is_some()
             && h.state().service.config().is_some_and(|c| !c.snapshot().repositories.is_empty())
     });
 
@@ -257,7 +257,7 @@ fn the_watching_switch_flips_before_the_refresh_finishes() {
 
     harness.get_by_label("Watching").click();
     harness.run_ok();
-    assert!(harness.query_by_label("Paused").is_some(), "the switch should flip at once");
+    assert!(harness.query_by_label_contains("Not watching").is_some(), "the switch should flip at once");
     assert!(!service.config().expect("config").find_repository("repo1").expect("repo").enabled);
 
     harness.get_by_label("Stop tracking").click();
@@ -610,8 +610,8 @@ fn settings_offers_checkouts_found_on_this_computer_and_adds_one() {
     harness.get_by_label("acme/gadgets");
     harness.get_by_label_contains("Add all 2");
 
-    // The suggestions come first; the paste field has an Add of its own.
-    harness.get_all_by_label("Add").next().expect("an Add button").click();
+    // The paste field has an Add of its own, above the suggestions'.
+    harness.get_all_by_label("Add").nth(1).expect("the first suggestion's Add button").click();
     step_until(&mut harness, "the checkout to be added", |h| {
         h.state().service.config().map_or(0, |c| c.snapshot().repositories.len()) >= 1
     });
