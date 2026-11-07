@@ -405,7 +405,7 @@ fn demo_app() -> Signoff {
 }
 
 fn popover_harness() -> Harness<'static, Signoff> {
-    Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+    Harness::builder().with_size(egui::vec2(400.0, 660.0)).build_ui_state(
         |ui, app: &mut Signoff| {
             if installed(ui.ctx()) {
                 // As the window does each frame: take in new state, then draw.
@@ -436,6 +436,40 @@ fn a_pull_request_opens_its_signoffs() {
     harness.run_ok();
     assert!(harness.query_by_label_contains("security:").is_some());
     assert!(harness.query_by_label("Run & sign off security").is_some());
+}
+
+#[test]
+fn a_signed_off_check_can_be_run_again() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    harness.get_by_label_contains("Add label-based partial signoff").click();
+    harness.run_ok();
+    // Tapping a signed-off row picks it, and the main button offers a rerun.
+    harness.get_by_label_contains("lint").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Run lint again").is_some());
+}
+
+/// The page fits a 400x660 window: no control or line is cut off.
+#[test]
+fn the_pull_request_page_fits_the_window() {
+    let size = egui::vec2(400.0, 660.0);
+    let mut harness = Harness::builder().with_size(size).build_ui_state(
+        |ui, app: &mut Signoff| {
+            if installed(ui.ctx()) {
+                app.tick(Some(ui.ctx()));
+                popover::show(ui, app);
+            }
+        },
+        demo_app(),
+    );
+    harness.run_ok();
+    harness.get_by_label_contains("Add label-based partial signoff").click();
+    harness.run_ok();
+    let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+    let button = harness.get_by_label("Run & sign off security");
+    let rect = button.rect();
+    assert!(screen.contains_rect(rect), "button at {rect:?} is outside {screen:?}");
 }
 
 /// The Playwright suite's main path: run the last check and reach ready.
@@ -800,7 +834,7 @@ fn unchecked_page(script: Arc<Script>) -> Harness<'static, Signoff> {
         (pr.repo_id.clone(), pr.pr.number)
     };
     app.glance.page = popover::Page::PullRequest { repo_id, number };
-    Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+    Harness::builder().with_size(egui::vec2(400.0, 660.0)).build_ui_state(
         |ui, app: &mut Signoff| {
             if installed(ui.ctx()) {
                 app.tick(Some(ui.ctx()));
@@ -966,7 +1000,7 @@ fn worktree_page(dir: &Path, on: bool, runner: Arc<dyn Runner>) -> Harness<'stat
         .with_worktrees(signoff_core::Worktrees::new(dir.join("worktrees")));
     app.runs = crate::runs::Runs::new(Arc::new(verifier), || {});
     app.glance.page = popover::Page::PullRequest { repo_id: "demo-signoff".into(), number: 485 };
-    Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+    Harness::builder().with_size(egui::vec2(400.0, 660.0)).build_ui_state(
         |ui, app: &mut Signoff| {
             if installed(ui.ctx()) {
                 app.tick(Some(ui.ctx()));
@@ -1065,7 +1099,7 @@ fn a_missing_extension_offers_to_install_it_from_the_popover() {
     let mut app = demo_app();
     app.demo = false;
     app.installer = crate::installer::Installer::new(Gh::new(script.clone()), false, || {});
-    let mut harness = Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+    let mut harness = Harness::builder().with_size(egui::vec2(400.0, 660.0)).build_ui_state(
         |ui, app: &mut Signoff| {
             if installed(ui.ctx()) {
                 app.tick(Some(ui.ctx()));
@@ -1093,7 +1127,7 @@ fn a_failed_install_says_why_and_offers_to_try_again() {
     let mut app = demo_app();
     app.demo = false;
     app.installer = crate::installer::Installer::new(Gh::new(script), false, || {});
-    let mut harness = Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+    let mut harness = Harness::builder().with_size(egui::vec2(400.0, 660.0)).build_ui_state(
         |ui, app: &mut Signoff| {
             if installed(ui.ctx()) {
                 app.tick(Some(ui.ctx()));

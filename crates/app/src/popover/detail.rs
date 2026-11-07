@@ -3,7 +3,7 @@
 
 use egui::Response;
 use egui::{Align, Frame, Layout, Margin, RichText, ScrollArea, Ui};
-use signoff_core::{Check, CheckState, Phase, PullRequestState, VerifyRequest};
+use signoff_core::{ActivityKind, Check, CheckState, Phase, PullRequestState, VerifyRequest};
 use signoff_ui::theme::{size, space};
 use signoff_ui::widgets::{
     Button, ButtonKind, CheckRow, Chip, EmptyState, Headline, IconButton, IconButtonKind, LogLine, LogView, Mood,
@@ -19,7 +19,7 @@ use crate::glance;
 use crate::runs::RunView;
 
 /// Room kept under the checks for the actions.
-const FOOTER: f32 = 92.0;
+const FOOTER: f32 = 116.0;
 
 /// More room for the actions when "Check out #N" sits under the main
 /// button: a compact button and the gap above it.
@@ -88,8 +88,12 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
                     }
                 }
                 for check in required {
-                    if check_row(ui, app, &pr, check, target.as_ref()).clicked() && check.configured {
-                        app.glance.check = Some(check.name.clone());
+                    let row = check_row(ui, app, &pr, check, target.as_ref());
+                    if check.configured {
+                        let row = row.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if row.clicked() {
+                            app.glance.check = Some(check.name.clone());
+                        }
                     }
                     if !check.configured && check.state != CheckState::Success {
                         let chip = Chip::new("Configure").icon(icons::TERMINAL);
@@ -104,6 +108,10 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
                     if !run.running() && ui.add(Chip::new("Clear output").icon(icons::REMOVE)).clicked() {
                         app.runs.dismiss(&request(&pr, check));
                     }
+                } else if let (Some(check), None) = (&target, &run)
+                    && picked(app, check)
+                {
+                    last_run(ui, app, &pr, check);
                 }
             });
             ui.add_space(space::M);
@@ -126,13 +134,51 @@ fn head(ui: &mut Ui, pr: &PullRequestState) {
             let width = ui.fonts_mut(|fonts| {
                 let a = fonts.layout_no_wrap(repo.text().to_owned(), Type::Caption.font(), p.secondary).size().x;
                 let b = fonts.layout_no_wrap(commit.text().to_owned(), Type::Mono.font(), p.secondary).size().x;
-                a + b + space::M
+                a + b.min(ui.available_width() - a - space::M).max(0.0) + space::M
             });
             ui.add_space(((ui.available_width() - width) / 2.0).max(0.0));
             ui.label(repo.color(p.secondary));
-            ui.label(commit.color(p.secondary)).on_hover_text(&pr.pr.head_sha);
+            // A long branch name shortens to fit rather than run off the edge.
+            ui.add(egui::Label::new(commit.color(p.secondary)).truncate())
+                .on_hover_text(format!("{} @ {}", pr.pr.head_ref, pr.pr.head_sha));
         });
     });
+}
+
+/// Whether `check` was picked by tapping its row, rather than being the
+/// one the merge happens to wait on.
+fn picked(app: &Signoff, check: &Check) -> bool {
+    app.glance.check.as_deref() == Some(check.name.as_str())
+}
+
+/// What the last local run of `check` on this pull request did, from
+/// history, for a check with no run in this session. History keeps the
+/// result, not the output, so the line says how to see it again.
+fn last_run(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, check: &Check) {
+    let last = app.state.history.iter().find(|event| {
+        event.kind == ActivityKind::Run
+            && event.repo_id == pr.repo_id
+            && event.pr_number == pr.pr.number
+            && event.check == check.name
+    });
+    let text = match last {
+        Some(event) => {
+            let outcome = if event.exit_code == 0 { "passed" } else { "failed" };
+            let secs = event.duration_millis as f64 / 1000.0;
+            format!(
+                "Last run {}: {outcome} (exit {}) in {secs:.1}s. Run it again to see its output.",
+                event.at.strftime("%Y-%m-%d %H:%M"),
+                event.exit_code
+            )
+        }
+        None => format!("{} has not been run from here on this pull request yet.", check.name),
+    };
+    let status = match last {
+        Some(event) if event.exit_code != 0 => Status::Failing,
+        Some(_) => Status::Ready,
+        None => Status::Neutral,
+    };
+    notice(ui, status, &text);
 }
 
 /// The check the page's button acts on: the one running, else the one
@@ -149,6 +195,12 @@ fn target<'a>(app: &Signoff, pr: &'a PullRequestState) -> Option<&'a Check> {
         return Some(check);
     }
     required.find(|check| pr.blocking.as_deref() == Some(&check.name) && check.configured)
+}
+
+/// Whether the main button runs `check`: it has a local command and is not
+/// signed off yet, or it is signed off and was picked to run once more.
+fn runnable(app: &Signoff, check: &Check) -> bool {
+    check.configured && (check.state != CheckState::Success || picked(app, check))
 }
 
 /// The check the merge waits on when it has no local command and no other
@@ -280,13 +332,15 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
                 app.runs.stop(&request(pr, check));
             }
         }
-        (Some(check), _) if check.configured && check.state != CheckState::Success && !at_head && !isolated => {
+        (Some(check), _) if runnable(app, check) && !at_head && !isolated => {
             if check_out_button(ui, app, pr, checkout.as_ref(), ButtonKind::Primary) {
                 app.checkouts.start(&pr.repo_id, number, pr.repo_path.clone());
             }
         }
-        (Some(check), _) if check.configured && check.state != CheckState::Success => {
-            let label = format!("Run & sign off {}", check.name);
+        (Some(check), _) if runnable(app, check) => {
+            let again = check.state == CheckState::Success;
+            let label =
+                if again { format!("Run {} again", check.name) } else { format!("Run & sign off {}", check.name) };
             let hover = if isolated {
                 format!(
                     "Run `{}` in Signoff's worktree at {}, then sign off {} on this commit; your checkout stays as it is",
