@@ -12,6 +12,7 @@ mod browser;
 mod cadence;
 mod checkouts;
 mod commands;
+mod failure;
 mod glance;
 mod hotkey;
 mod installer;
