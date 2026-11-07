@@ -405,6 +405,47 @@ impl ConfigStore {
         })
     }
 
+    /// Lets detection set up again the commands the person removed from the
+    /// repository with `id`. Returns whether there were any.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be saved.
+    pub fn clear_dismissed(&self, id: &str) -> Result<bool, ConfigError> {
+        if self.find_repository(id).is_none_or(|repo| repo.dismissed.is_empty()) {
+            return Ok(false);
+        }
+        self.change(|config| {
+            let Some(repo) = config.repositories.iter_mut().find(|r| r.id == id) else { return Ok(false) };
+            Ok(!std::mem::take(&mut repo.dismissed).is_empty())
+        })
+    }
+
+    /// Records `found` as where the commands of the repository with `id`
+    /// came from, for checks whose saved command is exactly the detected
+    /// one: the person chose CI's command, so it follows CI from now on.
+    /// Returns whether anything changed.
+    ///
+    /// # Errors
+    ///
+    /// When the config cannot be saved.
+    pub fn mark_detected(&self, id: &str, found: &BTreeMap<String, DetectedCommand>) -> Result<bool, ConfigError> {
+        if self
+            .find_repository(id)
+            .is_none_or(|repo| chosen(&repo, found).iter().all(|(c, d)| repo.detected.get(c) == Some(d)))
+        {
+            return Ok(false);
+        }
+        self.change(|config| {
+            let Some(repo) = config.repositories.iter_mut().find(|r| r.id == id) else { return Ok(false) };
+            for (check, d) in chosen(repo, found) {
+                repo.dismissed.remove(&check);
+                repo.detected.insert(check, d);
+            }
+            Ok(true)
+        })
+    }
+
     /// Stops tracking the repository with `id`.
     ///
     /// # Errors
@@ -511,6 +552,16 @@ impl ConfigStore {
         });
         Ok(())
     }
+}
+
+/// The detected commands in `found` that are exactly what `repo` saved for
+/// the same check.
+fn chosen(repo: &TrackedRepository, found: &BTreeMap<String, DetectedCommand>) -> Vec<(String, DetectedCommand)> {
+    found
+        .iter()
+        .filter(|(check, d)| repo.commands.get(*check).is_some_and(|m| m.command == d.command))
+        .map(|(check, d)| (check.clone(), d.clone()))
+        .collect()
 }
 
 /// `repo` with the commands in `found` set up, or `None` when nothing
@@ -842,6 +893,37 @@ mod tests {
         store.flush();
         let saved = std::fs::read_to_string(dir.path().join("config.json")).expect("saved");
         assert!(saved.contains("\"detected\"") && !saved.contains("\"dismissed\""), "{saved}");
+    }
+
+    #[test]
+    fn dismissed_commands_come_back_and_chosen_ones_follow_ci() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = ConfigStore::with_config(
+            dir.path().join("config.json"),
+            AppConfig { repositories: vec![tracked()], ..AppConfig::default() },
+        );
+        let found = BTreeMap::from([("lint".to_owned(), detected("cargo clippy"))]);
+        store.adopt_detected("repo-1", &found).expect("adopt");
+        let mut commands = store.find_repository("repo-1").expect("repo").commands;
+        commands.remove("lint");
+        store.update_repository("repo-1", RepositoryUpdate { enabled: true, commands }).expect("update");
+        assert!(!store.adopt_detected("repo-1", &found).expect("adopt"), "removed: stays removed");
+
+        assert!(store.clear_dismissed("repo-1").expect("clear"));
+        assert!(!store.clear_dismissed("repo-1").expect("clear"), "nothing left to clear");
+        assert!(store.adopt_detected("repo-1", &found).expect("adopt"));
+        assert_eq!(command(&store, "lint").as_deref(), Some("cargo clippy"));
+
+        // The person typed the same command as CI's: it follows CI from now on.
+        let mut commands = store.find_repository("repo-1").expect("repo").commands;
+        commands.insert("tests".into(), CommandMapping { command: "cargo test".into(), timeout_seconds: 60 });
+        store.update_repository("repo-1", RepositoryUpdate { enabled: true, commands }).expect("update");
+        let ci = BTreeMap::from([("tests".to_owned(), detected("cargo test")), ("other".into(), detected("x"))]);
+        assert!(store.mark_detected("repo-1", &ci).expect("mark"));
+        let repo = store.find_repository("repo-1").expect("repo");
+        assert_eq!(repo.detected_source("tests"), Some(".github/workflows/ci.yml"));
+        assert!(!repo.detected.contains_key("other"), "no command to follow CI with");
+        assert!(!store.mark_detected("repo-1", &ci).expect("mark"), "already recorded");
     }
 
     #[test]

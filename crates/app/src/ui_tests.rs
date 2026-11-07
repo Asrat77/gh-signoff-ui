@@ -212,7 +212,7 @@ fn demo_settings_save_nothing() {
     harness.get_by_label_contains("Demo data: settings are shown but nothing is saved");
     harness.get_by_label("Repositories").click();
     harness.run_ok();
-    assert!(harness.query_by_label("Add a local checkout").is_none());
+    assert!(harness.query_by_label("Add a repository").is_none());
 }
 
 #[test]
@@ -234,7 +234,7 @@ fn adding_a_checkout_tracks_it() {
     type_into(&mut harness, 0, &checkout.display().to_string());
     harness.get_by_label("Add").click();
     step_until(&mut harness, "the checkout to be added", |h| {
-        h.query_by_label("Add a local checkout").is_some()
+        h.query_by_label("Add a repository").is_some()
             && h.state().service.config().is_some_and(|c| !c.snapshot().repositories.is_empty())
     });
 
@@ -257,7 +257,7 @@ fn the_watching_switch_flips_before_the_refresh_finishes() {
 
     harness.get_by_label("Watching").click();
     harness.run_ok();
-    assert!(harness.query_by_label("Paused").is_some(), "the switch should flip at once");
+    assert!(harness.query_by_label_contains("Not watching").is_some(), "the switch should flip at once");
     assert!(!service.config().expect("config").find_repository("repo1").expect("repo").enabled);
 
     harness.get_by_label("Stop tracking").click();
@@ -610,8 +610,8 @@ fn settings_offers_checkouts_found_on_this_computer_and_adds_one() {
     harness.get_by_label("acme/gadgets");
     harness.get_by_label_contains("Add all 2");
 
-    // The suggestions come first; the paste field has an Add of its own.
-    harness.get_all_by_label("Add").next().expect("an Add button").click();
+    // The paste field has an Add of its own, above the suggestions'.
+    harness.get_all_by_label("Add").nth(1).expect("the first suggestion's Add button").click();
     step_until(&mut harness, "the checkout to be added", |h| {
         h.state().service.config().map_or(0, |c| c.snapshot().repositories.len()) >= 1
     });
@@ -820,6 +820,46 @@ fn commands_set_up_from_ci_show_where_they_came_from_and_follow_the_config() {
     harness.get_by_label("Set up from .github/workflows/rust.yml");
     let field = harness.get_all_by_role(egui::accesskit::Role::TextInput).next().expect("a command field");
     assert_eq!(field.value().as_deref(), Some("cargo test --workspace"));
+}
+
+#[test]
+fn a_command_typed_by_hand_says_so_and_can_be_detected_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut repo = tracked(dir.path());
+    repo.commands.insert(
+        "signoff".into(),
+        signoff_core::CommandMapping { command: "cargo fmt --check".into(), timeout_seconds: 300 },
+    );
+    let service = service(dir.path(), vec![repo], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.state_mut().settings.section = settings::Section::Commands;
+    harness.run_ok();
+    harness.get_by_label("Typed by you");
+    harness.get_by_label("Detect from CI again");
+    assert!(harness.query_by_label_contains("Set up from").is_none());
+
+    // CI runs more than the typed command: say so, and offer CI's.
+    step_until(&mut harness, "CI to be read", |h| h.state().settings.ci_known());
+    let source = ".github/workflows/rust.yml";
+    let all = "cargo fmt --check && cargo clippy && cargo test";
+    let found = std::collections::BTreeMap::from([(
+        "signoff".to_owned(),
+        signoff_core::DetectedCommand { command: all.into(), source: source.into() },
+    )]);
+    harness.state_mut().settings.set_ci(found);
+    harness.run_ok();
+    harness.get_by_label_contains("CI also runs `cargo clippy`, `cargo test`");
+    harness.get_by_label("Use CI's commands").click();
+    harness.run_ok();
+    let field = harness.get_all_by_role(egui::accesskit::Role::TextInput).next().expect("a command field");
+    assert_eq!(field.value().as_deref(), Some(all));
+    assert!(harness.query_by_label_contains("CI also runs").is_none(), "nothing left out");
+    harness.get_by_label("Save commands").click();
+    harness.run_ok();
+    let saved = service.config().expect("config").find_repository("repo1").expect("repo");
+    assert_eq!(saved.commands["signoff"].command, all);
+    assert_eq!(saved.detected_source("signoff"), Some(source), "it follows CI from now on");
 }
 
 /// A popover harness on the demo data where `gh` and `git` answer through

@@ -859,6 +859,30 @@ impl ProductService {
         })
     }
 
+    /// What the CI config of the repository `id`'s default branch runs for
+    /// each of `checks`, by check. Blocks on `git`; empty in demo mode, or
+    /// when the branch cannot be read.
+    pub fn ci_commands(&self, id: &str, checks: &[String]) -> BTreeMap<String, DetectedCommand> {
+        let Source::GitHub { gh, config, .. } = &self.source else { return BTreeMap::new() };
+        let Some(tracked) = config.find_repository(id) else { return BTreeMap::new() };
+        let Some(commit) = gh.branch_commit(&tracked.path, &tracked.default_branch) else { return BTreeMap::new() };
+        crate::ci::detect(&GitTree::new(gh, &tracked.path, &commit), checks)
+    }
+
+    /// Reads the CI config again and sets up the commands it finds for the
+    /// repository `id`, including those the person removed earlier. Their
+    /// own commands stay. Blocks on `git`. Returns whether the config
+    /// changed.
+    pub fn detect_commands_again(&self, id: &str) -> bool {
+        let Source::GitHub { config, detections, .. } = &self.source else { return false };
+        let cleared = config.clear_dismissed(id).unwrap_or_else(|err| {
+            log::warn!("could not bring back the removed commands: {err}");
+            false
+        });
+        detections.lock().remove(id);
+        self.set_up_commands(id) || cleared
+    }
+
     /// When GitHub's rate limit lets reads start again, if it stopped them.
     /// Reads started before then do not reach GitHub, so a scheduler should
     /// wait for it.
@@ -1645,5 +1669,17 @@ mod tests {
         assert_eq!(saved.detected_source("tests"), Some(".github/workflows/ci.yml"));
         assert!(!service.set_up_commands("r1"), "unchanged: nothing to save");
         assert!(!ProductService::demo().set_up_commands("r1"));
+
+        // The CI config's own answer for any check, without touching the config.
+        let ci = service.ci_commands("r1", &["tests".to_owned()]);
+        assert_eq!(ci["tests"].command, "cargo test");
+        assert!(ProductService::demo().ci_commands("r1", &["tests".to_owned()]).is_empty());
+
+        // Removing it keeps it removed until the person asks to detect again.
+        config.update_repository("r1", RepositoryUpdate { enabled: true, commands: BTreeMap::new() }).expect("update");
+        assert!(!service.set_up_commands("r1"));
+        assert!(service.detect_commands_again("r1"));
+        assert_eq!(config.find_repository("r1").expect("repo").commands["tests"].command, "cargo test");
+        assert!(!service.detect_commands_again("r1"), "nothing new");
     }
 }

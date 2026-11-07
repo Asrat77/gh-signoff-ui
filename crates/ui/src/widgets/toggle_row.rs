@@ -1,10 +1,11 @@
-//! A setting that is on or off. An "on" row is filled ember.
+//! A setting that is on or off. The row stays neutral; only its switch turns
+//! ember when on, because a filled ember row reads as "failing, act here".
 
-use egui::{Align2, CornerRadius, CursorIcon, Rect, Response, Sense, Ui, Vec2, Widget};
+use egui::{CornerRadius, CursorIcon, Rect, Response, Sense, Ui, Vec2, Widget};
 
 use super::paint::line;
 use crate::theme::{radius, space};
-use crate::{Palette, Type, icons, palette};
+use crate::{Palette, Type, palette};
 
 /// A labelled on/off setting with a hint under it.
 pub struct ToggleRow<'a> {
@@ -32,32 +33,28 @@ impl Widget for ToggleRow<'_> {
         response.widget_info(|| egui::WidgetInfo::selected(egui::WidgetType::Checkbox, true, on, self.label));
         let response = response.on_hover_cursor(CursorIcon::PointingHand);
         if ui.is_rect_visible(rect) {
-            let (fill, text, hint) = if on {
-                (p.accent, p.on_accent, p.on_accent.gamma_multiply(0.85))
-            } else {
-                (p.surface, p.text, p.secondary)
-            };
-            let fill = if response.hovered() { Palette::mix(fill, text, 0.05) } else { fill };
+            let enabled = ui.is_enabled();
+            let text = if enabled { p.text } else { p.secondary };
+            let fill = if response.hovered() && enabled { Palette::mix(p.surface, text, 0.05) } else { p.surface };
             let painter = ui.painter();
             painter.rect_filled(rect, CornerRadius::same(radius::ROW), fill);
-            let dot = 26.0;
+            let track = Vec2::new(44.0, 26.0);
             let left = rect.left() + space::L + 2.0;
-            let width = rect.right() - space::L - dot - space::M - left;
+            let width = rect.right() - space::L - track.x - space::M - left;
             let label = line(ui, self.label, Type::Row, text, width);
-            let detail = line(ui, self.hint, Type::Caption, hint, width);
+            let detail = line(ui, self.hint, Type::Caption, p.secondary, width);
             let block = label.size().y + 3.0 + detail.size().y;
             let top = rect.center().y - block / 2.0;
             let detail_top = top + label.size().y + 3.0;
             painter.galley(egui::pos2(left, top), label, text);
-            painter.galley(egui::pos2(left, detail_top), detail, hint);
-            let center = egui::pos2(rect.right() - space::L - dot / 2.0, rect.center().y);
-            let knob = Rect::from_center_size(center, Vec2::splat(dot));
-            if on {
-                painter.circle_filled(knob.center(), dot / 2.0, p.on_accent);
-                painter.text(knob.center(), Align2::CENTER_CENTER, icons::CHECK, crate::fonts::icon(14.0), p.accent);
-            } else {
-                painter.circle_filled(knob.center(), dot / 2.0, p.surface_active);
-            }
+            painter.galley(egui::pos2(left, detail_top), detail, p.secondary);
+            let track_rect =
+                Rect::from_center_size(egui::pos2(rect.right() - space::L - track.x / 2.0, rect.center().y), track);
+            let track_fill = if on { p.accent } else { p.surface_active };
+            painter.rect_filled(track_rect, CornerRadius::same(13), track_fill);
+            let knob_x = if on { track_rect.right() - 13.0 } else { track_rect.left() + 13.0 };
+            let knob = if on { p.on_accent } else { p.secondary };
+            painter.circle_filled(egui::pos2(knob_x, track_rect.center().y), 9.0, knob);
         }
         response
     }
