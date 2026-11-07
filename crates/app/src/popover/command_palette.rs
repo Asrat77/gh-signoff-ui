@@ -1,7 +1,12 @@
 //! The command palette: a sheet over the popover with a search field and
-//! the best few actions. Cmd+K (Ctrl+K elsewhere) opens it; arrows move,
+//! the best few results. Cmd+K (Ctrl+K elsewhere) opens it; arrows move,
 //! Enter runs, Escape or a click outside closes it.
+//!
+//! Each pull request is one result and Enter opens it. Tab on a pull
+//! request lists what else can be done to it (run, check out, copy, open
+//! on GitHub); Escape or Backspace on an empty field goes back.
 
+use egui::text::LayoutJob;
 use egui::{
     Area, Context, CornerRadius, Frame, Id, Key, Margin, Modifiers, Order, Rect, RichText, Sense, TextEdit, Ui,
     UiBuilder, Vec2,
@@ -25,6 +30,8 @@ const ROW: f32 = 48.0;
 pub(crate) struct CommandPalette {
     query: String,
     selected: usize,
+    /// The pull request whose actions are listed, once Tab went into it.
+    scope: Option<(String, u64)>,
 }
 
 impl CommandPalette {
@@ -62,21 +69,44 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
     }
     let Some(mut state) = app.glance.palette.take() else { return };
     let isolated = !app.demo && app.settings.isolated_worktrees_on();
-    let actions = commands::actions(
-        &app.state,
-        |pr| pr.checked_out || app.checkouts.simulated(&pr.repo_id, pr.pr.number),
-        isolated,
-    );
+    let viewing = match &app.glance.page {
+        Page::PullRequest { repo_id, number } => Some((repo_id.clone(), *number)),
+        _ => None,
+    };
+    let scoped = state.scope.as_ref().and_then(|(repo, number)| app.state.pull_request(repo, *number));
+    let actions = match scoped {
+        Some(pr) => {
+            let at_head = pr.checked_out || app.checkouts.simulated(&pr.repo_id, pr.pr.number);
+            commands::pull_request_actions(pr, at_head, isolated)
+        }
+        None => commands::actions(
+            &app.state,
+            &app.state.env.login,
+            viewing.as_ref().map(|(repo, number)| (repo.as_str(), *number)),
+        ),
+    };
+    if scoped.is_none() {
+        state.scope = None;
+    }
+    let scope_title = scoped.map(|pr| format!("#{} {}", pr.pr.number, pr.pr.title));
 
     // Taken before the field sees them.
-    let (escape, down, up, enter) = ctx.input_mut(|i| {
+    let (escape, down, up, enter, tab, back) = ctx.input_mut(|i| {
         (
             i.consume_key(Modifiers::NONE, Key::Escape),
             i.consume_key(Modifiers::NONE, Key::ArrowDown),
             i.consume_key(Modifiers::NONE, Key::ArrowUp),
             i.consume_key(Modifiers::NONE, Key::Enter),
+            i.consume_key(Modifiers::NONE, Key::Tab),
+            state.query.is_empty() && i.consume_key(Modifiers::NONE, Key::Backspace),
         )
     });
+    if (escape || back) && state.scope.is_some() {
+        state.scope = None;
+        state.selected = 0;
+        app.glance.palette = Some(state);
+        return;
+    }
     if escape {
         return;
     }
@@ -88,6 +118,17 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
     }
     if up {
         state.selected = state.selected.saturating_sub(1);
+    }
+    if tab
+        && state.scope.is_none()
+        && let Some(Command::OpenPage { repo_id, number }) =
+            ranked.get(state.selected).map(|index| &actions[*index].command)
+    {
+        state.scope = Some((repo_id.clone(), *number));
+        state.query.clear();
+        state.selected = 0;
+        app.glance.palette = Some(state);
+        return;
     }
     let mut run = if enter { ranked.get(state.selected).copied() } else { None };
     let mut close = false;
@@ -110,7 +151,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = space::XS;
-                    search(ui, &mut state.query);
+                    search(ui, &mut state.query, scope_title.as_deref());
                     ui.add_space(space::S);
                     if ranked.is_empty() {
                         no_match(ui);
@@ -120,6 +161,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
                             run = Some(*index);
                         }
                     }
+                    footer(ui, state.scope.is_some(), ranked.get(state.selected).map(|at| &actions[*at]));
                 })
                 .response
                 .rect
@@ -136,15 +178,32 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
     }
 }
 
-/// The mono search field, focused every frame it is open.
-fn search(ui: &mut Ui, query: &mut String) {
-    let hint = format!("Search pull requests and actions ({})", shortcut());
+/// The mono search field, focused every frame it is open. Inside a pull
+/// request it says which one.
+fn search(ui: &mut Ui, query: &mut String, scope: Option<&str>) {
+    let hint = scope.map_or_else(
+        || format!("Search pull requests and actions ({})", shortcut()),
+        |title| format!("Actions for {title}"),
+    );
     let field = TextEdit::singleline(query)
         .hint_text(hint)
         .font(Type::Mono.font())
         .desired_width(f32::INFINITY)
         .margin(Margin::symmetric(10, 10));
     ui.add(field).request_focus();
+}
+
+/// The keys that work now.
+fn footer(ui: &mut Ui, scoped: bool, selected: Option<&Action>) {
+    let p = palette(ui.ctx());
+    let tab = !scoped && selected.is_some_and(|a| matches!(a.command, Command::OpenPage { .. }));
+    let text = match (scoped, tab) {
+        (true, _) => "Enter run · Esc back",
+        (false, true) => "Enter open · Tab actions · Esc close",
+        (false, false) => "Enter run · Esc close",
+    };
+    ui.add_space(space::XS);
+    ui.label(RichText::new(text).font(Type::Caption.font()).color(p.dim));
 }
 
 fn no_match(ui: &mut Ui) {
@@ -177,9 +236,16 @@ fn result(ui: &mut Ui, action: &Action, selected: bool) -> egui::Response {
     let clip = ui.painter().with_clip_rect(rect.shrink2(Vec2::new(space::S, 0.0)));
     let step = if action.label.starts_with("Copy ") { Type::Mono } else { Type::Row };
     for (text, step, color, top) in [(&action.label, step, title, 8.0), (&action.meta, Type::Caption, meta, 28.0)] {
-        let galley = ui.painter().layout(text.clone(), step.font(), color, width);
+        // One line each; a long title ends in an ellipsis instead of
+        // running into the line below.
+        let mut job = LayoutJob::simple(text.clone(), step.font(), color, width);
+        job.wrap.max_rows = 1;
+        job.wrap.break_anywhere = true;
+        job.wrap.overflow_character = Some('…');
+        let galley = ui.painter().layout_job(job);
         clip.galley(egui::pos2(left, rect.top() + top), galley, color);
     }
+    response.clone().on_hover_text(format!("{}\n{}", action.label, action.meta));
     response
 }
 
