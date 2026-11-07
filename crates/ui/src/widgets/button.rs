@@ -17,6 +17,8 @@ pub enum ButtonKind {
     Accent,
     /// A raised row colour: anything else.
     Secondary,
+    /// A step lighter than a row, to stay visible as a button on a card.
+    Inset,
 }
 
 /// A big rounded button, full width unless given a width.
@@ -92,6 +94,7 @@ impl<'a> Button<'a> {
             ButtonKind::Primary => (p.primary, p.on_primary),
             ButtonKind::Accent => (p.accent, p.on_accent),
             ButtonKind::Secondary => (p.surface, p.text),
+            ButtonKind::Inset => (p.surface_active, p.text),
         };
         let fill = if !hovered {
             fill
