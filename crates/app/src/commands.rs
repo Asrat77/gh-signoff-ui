@@ -50,8 +50,14 @@ impl Action {
 /// its page, what to do about its checks, then the global ones.
 ///
 /// `at_head` says whether a pull request's checkout is on its head commit
-/// (the demo pretends so after a simulated checkout).
-pub(crate) fn actions(state: &ProductState, at_head: impl Fn(&PullRequestState) -> bool) -> Vec<Action> {
+/// (the demo pretends so after a simulated checkout). `isolated` says
+/// whether a run elsewhere goes to Signoff's own worktree, so running
+/// needs no checkout and checking out comes after it.
+pub(crate) fn actions(
+    state: &ProductState,
+    at_head: impl Fn(&PullRequestState) -> bool,
+    isolated: bool,
+) -> Vec<Action> {
     let mut out = Vec::new();
     for pr in &state.pull_requests {
         let (repo_id, number) = (pr.repo_id.clone(), pr.pr.number);
@@ -62,22 +68,23 @@ pub(crate) fn actions(state: &ProductState, at_head: impl Fn(&PullRequestState) 
         ));
         let at_head = at_head(pr);
         let open: Vec<&Check> = glance::required(pr).filter(|check| check.state != CheckState::Success).collect();
-        let runnable = open.iter().any(|check| check.configured);
-        if !at_head && runnable && !pr.repo_path.as_os_str().is_empty() {
-            out.push(Action::new(
-                format!("Check out #{number}"),
-                format!("{} {}", pr.repo, pr.pr.head_ref),
-                Command::CheckOut { repo_id: repo_id.clone(), number, path: pr.repo_path.clone() },
-            ));
-        }
-        for check in open {
-            if check.configured && at_head {
+        if at_head || isolated {
+            for check in open.iter().filter(|check| check.configured) {
                 out.push(Action::new(
                     format!("Run & sign off {} on #{number}", check.name),
                     pr.repo.clone(),
                     Command::Run { repo_id: repo_id.clone(), number, check: check.name.clone() },
                 ));
             }
+        }
+        if !at_head && open.iter().any(|check| check.configured) && !pr.repo_path.as_os_str().is_empty() {
+            out.push(Action::new(
+                format!("Check out #{number}"),
+                format!("switches {} to {}", pr.repo, pr.pr.head_ref),
+                Command::CheckOut { repo_id: repo_id.clone(), number, path: pr.repo_path.clone() },
+            ));
+        }
+        for check in open {
             out.push(Action::new(
                 format!("Copy {}", check.command),
                 format!("{} #{number}", pr.repo),
@@ -193,7 +200,7 @@ mod tests {
     #[test]
     fn every_pull_request_opens_and_the_globals_are_always_there() {
         let state = demo();
-        let list = actions(&state, |_| false);
+        let list = actions(&state, |_| false, false);
         for pr in &state.pull_requests {
             assert!(has(&list, |c| matches!(c, Command::OpenPage { number, .. } if *number == pr.pr.number)));
             assert!(has(&list, |c| matches!(c, Command::OpenUrl(url) if *url == pr.pr.url)));
@@ -204,15 +211,15 @@ mod tests {
         {
             assert!(has(&list, |c| *c == Command::Settings(section)));
         }
-        let none = actions(&ProductState::default(), |_| false);
+        let none = actions(&ProductState::default(), |_| false, false);
         assert_eq!(none.len(), 6, "refresh and five settings sections");
     }
 
     #[test]
     fn running_needs_a_checkout_and_checking_out_needs_none() {
         let state = demo();
-        let away = actions(&state, |_| false);
-        let here = actions(&state, |_| true);
+        let away = actions(&state, |_| false, false);
+        let here = actions(&state, |_| true, false);
         assert!(!has(&away, |c| matches!(c, Command::Run { .. })), "not checked out: nothing to run");
         assert!(has(&away, |c| matches!(c, Command::CheckOut { .. })));
         assert!(has(&here, |c| matches!(c, Command::Run { .. })));
@@ -220,9 +227,19 @@ mod tests {
     }
 
     #[test]
+    fn with_a_separate_worktree_running_needs_no_checkout_and_comes_first() {
+        let state = demo();
+        let away = actions(&state, |_| false, true);
+        let run = away.iter().position(|a| matches!(a.command, Command::Run { .. })).expect("a run");
+        let check_out = away.iter().position(|a| matches!(a.command, Command::CheckOut { .. })).expect("a checkout");
+        assert!(run < check_out, "running is the main action");
+        assert!(away[check_out].meta.starts_with("switches "), "{}", away[check_out].meta);
+    }
+
+    #[test]
     fn only_signoffs_still_to_do_get_run_or_copy_actions() {
         let state = demo();
-        let here = actions(&state, |_| true);
+        let here = actions(&state, |_| true, false);
         for action in &here {
             match &action.command {
                 Command::Run { repo_id, number, check } => {
@@ -253,7 +270,7 @@ mod tests {
                 check.configured = false;
             }
         }
-        let list = actions(&state, |_| true);
+        let list = actions(&state, |_| true, false);
         assert!(!has(&list, |c| matches!(c, Command::Run { .. } | Command::CheckOut { .. })));
         assert!(has(&list, |c| matches!(c, Command::Copy(_))));
     }

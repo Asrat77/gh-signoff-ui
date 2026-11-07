@@ -923,21 +923,21 @@ fn the_global_shortcut_switch_is_on_by_default_and_saved() {
 }
 
 #[test]
-fn the_separate_worktree_switch_is_off_by_default_and_saved() {
+fn the_separate_worktree_switch_is_on_by_default_and_saved() {
     let dir = tempfile::tempdir().expect("tempdir");
     let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
     let state = service.cached_or_config_state();
     let mut harness = settings_harness(service.clone(), state);
     harness.run_ok();
-    assert!(!harness.state().settings.isolated_worktrees_on());
-
-    harness.get_by_label("Verify in a separate worktree").click();
-    harness.run_ok();
-    assert!(service.config().expect("config").snapshot().isolated_worktrees);
+    assert!(harness.state().settings.isolated_worktrees_on());
 
     harness.get_by_label("Verify in a separate worktree").click();
     harness.run_ok();
     assert!(!service.config().expect("config").snapshot().isolated_worktrees);
+
+    harness.get_by_label("Verify in a separate worktree").click();
+    harness.run_ok();
+    assert!(service.config().expect("config").snapshot().isolated_worktrees);
 }
 
 /// Answers like [`Script`], but holds every `git fetch` until opened and
@@ -1037,14 +1037,15 @@ fn with_the_setting_on_a_checkout_elsewhere_runs_in_a_worktree_and_explains_a_fa
     let runner = Arc::new(HeldFetch { script: elsewhere(), open: std::sync::atomic::AtomicBool::new(false) });
     let mut harness = worktree_page(dir.path(), true, runner.clone());
     harness.run_ok();
-    assert!(harness.query_by_label("Check out #485").is_none());
     assert!(harness.query_by_label_contains("your checkout is not touched").is_some());
+    harness.get_by_label("Check out #485");
 
     harness.get_by_label_contains("Run & sign off").click();
     step_until(&mut harness, "the worktree to be prepared", |h| {
         h.query_by_label_contains("Preparing worktree…").is_some()
     });
     assert!(harness.query_by_label_contains("Stop").is_some(), "a preparation can be stopped");
+    assert!(harness.query_by_label("Check out #485").is_none(), "no checkout while a run goes");
 
     runner.open.store(true, std::sync::atomic::Ordering::Release);
     step_until(&mut harness, "the failed fetch", |h| {
@@ -1054,6 +1055,33 @@ fn with_the_setting_on_a_checkout_elsewhere_runs_in_a_worktree_and_explains_a_fa
     assert!(harness.query_by_label_contains("Preparing worktree…").is_none());
     let calls: Vec<String> = runner.script.calls().into_iter().map(|(line, _)| line).collect();
     assert!(!calls.iter().any(|line| line.contains("bin/test") || line.contains("signoff --commit")), "{calls:?}");
+}
+
+/// With the setting on, "Check out #N" sits under "Run & sign off" and
+/// asks before switching the checkout's branch; cancelling runs nothing.
+#[test]
+fn with_the_setting_on_checking_out_asks_before_switching_branches() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = Arc::new(elsewhere().reply("status --porcelain", "").reply("pr checkout", ""));
+    let mut harness = worktree_page(dir.path(), true, script.clone());
+    harness.state_mut().checkouts = crate::checkouts::Checkouts::new(Gh::new(script.clone()), false, || {});
+    harness.run_ok();
+
+    harness.get_by_label("Check out #485").click();
+    harness.run_ok();
+    assert!(harness.query_by_label_contains("This switches gh-signoff").is_some(), "the switch is named");
+    harness.get_by_label("Cancel").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("Switch branch").is_none());
+    assert!(harness.query_by_label_contains("your checkout is not touched").is_some());
+
+    harness.get_by_label("Check out #485").click();
+    harness.run_ok();
+    harness.get_by_label("Switch branch").click();
+    step_until(&mut harness, "gh pr checkout to run", |_| {
+        script.calls().iter().any(|(line, _)| line.contains("gh pr checkout 485"))
+    });
+    harness.get_by_label_contains("Run & sign off");
 }
 
 /// A state where `gh` is ready and only the extension is missing.
