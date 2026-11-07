@@ -4,7 +4,8 @@
 
 use std::fmt;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 use jiff::Timestamp;
 use serde::de::DeserializeOwned;
@@ -12,10 +13,24 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::api::{Api, ApiError, Transport};
 use crate::checks::{CheckState, is_signoff_context};
-use crate::runner::{Runner, SystemRunner};
+use crate::runner::{Output, Runner, SystemRunner, TIMED_OUT};
 
 /// Open pull requests read per repository.
 pub const PULL_REQUEST_LIMIT: usize = 30;
+
+/// `gh` processes reading repositories at once, across all of them. Each
+/// one is a GraphQL or REST call of its own; started all together for
+/// every repository they queued behind each other inside `gh` and the
+/// network, and every one hit its timeout.
+pub const PARALLEL_GH_READS: usize = 2;
+/// How long a `gh` read may take at first. Listing pull requests with
+/// their status rollup is a heavy GraphQL query, so this is longer than
+/// the runner's default.
+pub const READ_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest a `gh` read may take. Each read that times out doubles the
+/// limit up to this, and one that finishes sets it back, so a slow network
+/// gets reads through instead of failing every one at the same mark.
+pub const MAX_READ_TIMEOUT: Duration = Duration::from_secs(180);
 
 const PULL_REQUEST_FIELDS: &str =
     "number,title,url,state,author,headRefOid,headRefName,baseRefName,mergeable,isDraft,updatedAt";
@@ -215,11 +230,77 @@ pub enum ProtectionStatus {
     Unreadable,
 }
 
+/// `program`'s stdout, or why it could not be started or exited non-zero.
+fn finish(program: &str, args: &[&str], out: std::io::Result<Output>) -> Result<String, GhError> {
+    let out = out.map_err(|source| GhError::Launch { program: program.to_owned(), source })?;
+    if out.code != 0 {
+        let message = if out.stderr.is_empty() { out.stdout } else { out.stderr };
+        return Err(GhError::Exit { command: format!("{program} {}", args.join(" ")), code: out.code, message });
+    }
+    Ok(out.stdout)
+}
+
+/// `stdout` of `gh args` parsed as JSON.
+fn parse_json<T: DeserializeOwned>(args: &[&str], stdout: &str) -> Result<T, GhError> {
+    serde_json::from_str(stdout).map_err(|source| GhError::Json { command: format!("gh {}", args.join(" ")), source })
+}
+
 /// A `gh` (and `git`) client.
 #[derive(Clone)]
 pub struct Gh {
     runner: Arc<dyn Runner>,
     api: Option<Arc<Api>>,
+    reads: Arc<Reads>,
+}
+
+/// Limits `gh` reads: how many run at once, and how long each may take.
+#[derive(Debug)]
+struct Reads {
+    running: Mutex<usize>,
+    freed: Condvar,
+    timeout: Mutex<Duration>,
+}
+
+impl Default for Reads {
+    fn default() -> Self {
+        Self { running: Mutex::new(0), freed: Condvar::new(), timeout: Mutex::new(READ_TIMEOUT) }
+    }
+}
+
+impl Reads {
+    /// Waits for a free slot; the read holds it until the guard drops.
+    fn enter(&self) -> ReadSlot<'_> {
+        let mut running = lock(&self.running);
+        while *running >= PARALLEL_GH_READS {
+            running = self.freed.wait(running).unwrap_or_else(PoisonError::into_inner);
+        }
+        *running += 1;
+        ReadSlot(self)
+    }
+
+    fn timeout(&self) -> Duration {
+        *lock(&self.timeout)
+    }
+
+    /// Lengthens the limit after a read timed out, resets it after one
+    /// that finished.
+    fn note(&self, timed_out: bool) {
+        let mut timeout = lock(&self.timeout);
+        *timeout = if timed_out { timeout.saturating_mul(2).min(MAX_READ_TIMEOUT) } else { READ_TIMEOUT };
+    }
+}
+
+struct ReadSlot<'a>(&'a Reads);
+
+impl Drop for ReadSlot<'_> {
+    fn drop(&mut self) {
+        *lock(&self.0.running) -= 1;
+        self.0.freed.notify_one();
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl fmt::Debug for Gh {
@@ -237,7 +318,7 @@ impl Default for Gh {
 impl Gh {
     /// A client that spawns processes through `runner` for everything.
     pub fn new(runner: Arc<dyn Runner>) -> Self {
-        Self { runner, api: None }
+        Self { runner, api: None, reads: Arc::default() }
     }
 
     /// A client that reads repositories over the REST API through
@@ -245,7 +326,7 @@ impl Gh {
     /// through `runner` for everything else.
     pub fn with_api(runner: Arc<dyn Runner>, transport: Arc<dyn Transport>) -> Self {
         let api = Arc::new(Api::new(transport, runner.clone()));
-        Self { runner, api: Some(api) }
+        Self { runner, api: Some(api), reads: Arc::default() }
     }
 
     /// The REST client, if this has one.
@@ -271,21 +352,30 @@ impl Gh {
         program: &str,
         args: &[&str],
     ) -> Result<String, GhError> {
-        let out = self
-            .runner
-            .run(dir, input, program, args)
-            .map_err(|source| GhError::Launch { program: program.to_owned(), source })?;
-        if out.code != 0 {
-            let message = if out.stderr.is_empty() { out.stdout } else { out.stderr };
-            return Err(GhError::Exit { command: format!("{program} {}", args.join(" ")), code: out.code, message });
+        let out = self.runner.run(dir, input, program, args);
+        finish(program, args, out)
+    }
+
+    /// Runs `gh` to read a repository: a few at a time, under the read
+    /// timeout, which grows while reads keep timing out.
+    fn read(&self, dir: &Path, args: &[&str]) -> Result<String, GhError> {
+        let out = {
+            let _slot = self.reads.enter();
+            self.runner.run_for(Some(dir), None, "gh", args, self.reads.timeout())
+        };
+        if let Ok(out) = &out {
+            self.reads.note(out.code == TIMED_OUT);
         }
-        Ok(out.stdout)
+        finish("gh", args, out)
+    }
+
+    /// [`Gh::read`], parsed as JSON.
+    fn read_json<T: DeserializeOwned>(&self, dir: &Path, args: &[&str]) -> Result<T, GhError> {
+        parse_json(args, &self.read(dir, args)?)
     }
 
     fn json<T: DeserializeOwned>(&self, dir: Option<&Path>, args: &[&str]) -> Result<T, GhError> {
-        let stdout = self.exec(dir, "gh", args)?;
-        serde_json::from_str(&stdout)
-            .map_err(|source| GhError::Json { command: format!("gh {}", args.join(" ")), source })
+        parse_json(args, &self.exec(dir, "gh", args)?)
     }
 
     fn git(&self, dir: &Path, args: &[&str]) -> Option<String> {
@@ -345,7 +435,7 @@ impl Gh {
         struct Branch {
             name: String,
         }
-        let view: View = self.json(Some(dir), &["repo", "view", "--json", "nameWithOwner,defaultBranchRef,url"])?;
+        let view: View = self.read_json(dir, &["repo", "view", "--json", "nameWithOwner,defaultBranchRef,url"])?;
         Ok(RepoInfo {
             name_with_owner: view.name_with_owner,
             host: crate::api::host_of(&view.url),
@@ -410,7 +500,7 @@ impl Gh {
     pub fn pull_requests(&self, dir: &Path) -> Result<(Vec<PrInfo>, bool), GhError> {
         let limit = (PULL_REQUEST_LIMIT + 1).to_string();
         let args = ["pr", "list", "--state", "open", "--limit", &limit, "--json", PULL_REQUEST_LIST_FIELDS];
-        let raw: Vec<RawPr> = self.json(Some(dir), &args)?;
+        let raw: Vec<RawPr> = self.read_json(dir, &args)?;
         let (raw, truncated) = limit_pull_requests(raw);
         Ok((raw.into_iter().map(RawPr::into_info).collect(), truncated))
     }
@@ -422,7 +512,7 @@ impl Gh {
     /// When the status API call fails.
     pub fn commit_statuses(&self, dir: &Path, repo: &str, sha: &str) -> Result<Vec<CommitStatus>, GhError> {
         let path = format!("repos/{repo}/commits/{sha}/status");
-        let stdout = self.exec(Some(dir), "gh", &["api", &path])?;
+        let stdout = self.read(dir, &["api", &path])?;
         parse_combined_status(&stdout).map_err(|source| GhError::Json { command: format!("gh api {path}"), source })
     }
 
@@ -430,7 +520,7 @@ impl Gh {
     /// of the three outcomes reading it had.
     pub fn protection_contexts(&self, dir: &Path, repo: &str, branch: &str) -> (Vec<String>, ProtectionStatus) {
         let path = format!("repos/{repo}/branches/{branch}/protection");
-        match self.json::<Vec<String>>(Some(dir), &["api", &path, "--jq", "[.required_status_checks.contexts[]?]"]) {
+        match self.read_json::<Vec<String>>(dir, &["api", &path, "--jq", "[.required_status_checks.contexts[]?]"]) {
             Ok(contexts) => (contexts, ProtectionStatus::Ok),
             Err(err) if err.message().is_some_and(|m| m.contains("Branch not protected")) => {
                 (Vec::new(), ProtectionStatus::Absent)
@@ -692,6 +782,75 @@ mod tests {
 
     fn gh(runner: &Arc<FakeRunner>) -> Gh {
         Gh::new(runner.clone())
+    }
+
+    /// Counts `gh` reads running at once and the timeout each was given;
+    /// the first `timeouts` of them time out.
+    struct Slow {
+        running: std::sync::Mutex<(usize, usize)>,
+        timeouts: std::sync::Mutex<Vec<u64>>,
+        time_out_first: usize,
+    }
+
+    impl Runner for Slow {
+        fn run(&self, _: Option<&Path>, _: Option<&str>, _: &str, _: &[&str]) -> std::io::Result<Output> {
+            unreachable!("reads give a timeout")
+        }
+
+        fn run_for(
+            &self,
+            _: Option<&Path>,
+            _: Option<&str>,
+            _: &str,
+            _: &[&str],
+            timeout: Duration,
+        ) -> std::io::Result<Output> {
+            let call = {
+                let mut timeouts = self.timeouts.lock().expect("timeouts");
+                timeouts.push(timeout.as_secs());
+                timeouts.len()
+            };
+            {
+                let mut running = self.running.lock().expect("running");
+                running.0 += 1;
+                running.1 = running.1.max(running.0);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+            self.running.lock().expect("running").0 -= 1;
+            if call <= self.time_out_first {
+                return Ok(Output { code: TIMED_OUT, stderr: "gh timed out".into(), ..Output::default() });
+            }
+            Ok(Output { stdout: "[]".into(), ..Output::default() })
+        }
+    }
+
+    fn slow(time_out_first: usize) -> Arc<Slow> {
+        Arc::new(Slow { running: std::sync::Mutex::new((0, 0)), timeouts: std::sync::Mutex::default(), time_out_first })
+    }
+
+    #[test]
+    fn only_a_few_gh_reads_run_at_once() {
+        let runner = slow(0);
+        let gh = Gh::new(runner.clone());
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| gh.pull_requests(Path::new("/r")).expect("read"));
+            }
+        });
+        let most = runner.running.lock().expect("running").1;
+        assert!((1..=PARALLEL_GH_READS).contains(&most), "{most} at once");
+    }
+
+    #[test]
+    fn reads_that_time_out_get_longer_until_one_finishes() {
+        let runner = slow(3);
+        let gh = Gh::new(runner.clone());
+        for _ in 0..3 {
+            assert!(gh.pull_requests(Path::new("/r")).is_err_and(|e| e.to_string().contains("timed out")));
+        }
+        gh.pull_requests(Path::new("/r")).expect("read");
+        gh.pull_requests(Path::new("/r")).expect("read");
+        assert_eq!(*runner.timeouts.lock().expect("timeouts"), [60, 120, 180, 180, 60]);
     }
 
     #[test]
