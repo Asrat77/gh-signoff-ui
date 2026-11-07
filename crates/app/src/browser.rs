@@ -4,8 +4,8 @@
 //! does nothing here; every link goes through the `open` crate instead.
 
 use egui::Context;
-use signoff_ui::widgets::toast;
 use signoff_ui::Status;
+use signoff_ui::widgets::toast;
 
 /// Opens `url` in the default browser, with a toast when that fails.
 pub fn open(ctx: &Context, url: &str) {
