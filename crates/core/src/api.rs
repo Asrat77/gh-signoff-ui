@@ -279,6 +279,9 @@ pub struct Api {
     remotes: Mutex<HashMap<PathBuf, Remote>>,
     /// Checkouts whose remote GitHub refused once: resolved by `gh` only.
     ask_gh: Mutex<HashSet<PathBuf>>,
+    /// Why the last read went through `gh` instead, to log each new reason
+    /// once rather than once per repository per read.
+    fallback: Mutex<Option<String>>,
     offline_since: Mutex<Option<Instant>>,
 }
 
@@ -300,6 +303,7 @@ impl Api {
             blocked: Mutex::default(),
             remotes: Mutex::default(),
             ask_gh: Mutex::default(),
+            fallback: Mutex::default(),
             offline_since: Mutex::default(),
         }
     }
@@ -308,6 +312,23 @@ impl Api {
     /// could not be reached.
     pub fn usable(&self) -> bool {
         lock(&self.offline_since).is_none_or(|since| since.elapsed() >= OFFLINE_FOR)
+    }
+
+    /// Notes why a read of `repo` went through `gh` instead (`None`: it did
+    /// not), and logs it when the reason is new, so the log says why reads
+    /// are slow without repeating it for every read.
+    pub fn note_fallback(&self, repo: &str, reason: Option<&ApiError>) {
+        let reason = reason.map(ToString::to_string);
+        let mut last = lock(&self.fallback);
+        if *last == reason {
+            return;
+        }
+        match (&reason, last.is_some()) {
+            (Some(reason), _) => log::warn!("reading {repo} through gh, not the GitHub API: {reason}"),
+            (None, true) => log::info!("reading {repo} through the GitHub API again"),
+            (None, false) => {}
+        }
+        *last = reason;
     }
 
     /// When reading may start again, if a rate limit stopped it.
@@ -463,7 +484,7 @@ impl Api {
             let response = match self.transport.get(url, &headers) {
                 Ok(response) => response,
                 Err(err) => {
-                    log::warn!("GitHub API unreachable, reading through gh for a while: {err}");
+                    log::debug!("GitHub API unreachable: {err}");
                     *lock(&self.offline_since) = Some(Instant::now());
                     return Err(ApiError::Transport(err));
                 }

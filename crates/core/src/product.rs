@@ -303,8 +303,11 @@ impl StatusCache {
 pub(crate) fn read_repository(gh: &Gh, tracked: &TrackedRepository, cache: &StatusCache) -> (RepositoryRead, bool) {
     if let Some(api) = gh.api().filter(|api| api.usable()) {
         match read_with_api(gh, api, tracked) {
-            Ok(read) => return read,
-            Err(err) => log::debug!("reading {} through gh: {err}", tracked.name_with_owner),
+            Ok(read) => {
+                api.note_fallback(&tracked.name_with_owner, None);
+                return read;
+            }
+            Err(err) => api.note_fallback(&tracked.name_with_owner, Some(&err)),
         }
     }
     read_with_gh(gh, tracked, cache)
