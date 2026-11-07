@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use egui_kittest::Harness;
 use egui_kittest::kittest::{NodeT as _, Queryable as _};
-use signoff_core::config::{AppConfig, ConfigStore, TrackedRepository};
+use signoff_core::config::{AppConfig, CommandMapping, ConfigStore, TrackedRepository};
 use signoff_core::{Gh, Health, HistoryStore, Output, ProductService, ProductState, Runner};
 
 use crate::app::Signoff;
@@ -860,6 +860,140 @@ fn the_global_shortcut_switch_is_on_by_default_and_saved() {
     harness.get_by_label("Global shortcut").click();
     harness.run_ok();
     assert!(service.config().expect("config").snapshot().shortcut_enabled);
+}
+
+#[test]
+fn the_separate_worktree_switch_is_off_by_default_and_saved() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.run_ok();
+    assert!(!harness.state().settings.isolated_worktrees_on());
+
+    harness.get_by_label("Verify in a separate worktree").click();
+    harness.run_ok();
+    assert!(service.config().expect("config").snapshot().isolated_worktrees);
+
+    harness.get_by_label("Verify in a separate worktree").click();
+    harness.run_ok();
+    assert!(!service.config().expect("config").snapshot().isolated_worktrees);
+}
+
+/// Answers like [`Script`], but holds every `git fetch` until opened and
+/// then fails it, as an unreachable remote does.
+struct HeldFetch {
+    script: Script,
+    open: std::sync::atomic::AtomicBool,
+}
+
+impl Runner for HeldFetch {
+    fn run(&self, dir: Option<&Path>, input: Option<&str>, program: &str, args: &[&str]) -> io::Result<Output> {
+        if program == "git" && args.first() == Some(&"fetch") {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !self.open.load(std::sync::atomic::Ordering::Acquire) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            return Ok(Output {
+                stdout: String::new(),
+                stderr: "fatal: unable to access 'https://github.com/basecamp/gh-signoff.git/': Could not resolve host"
+                    .into(),
+                code: 128,
+            });
+        }
+        self.script.run(dir, input, program, args)
+    }
+}
+
+/// The demo's pull request #485, which is not checked out, outside demo
+/// mode with the separate-worktree setting `on`: runs go through `runner`
+/// into worktrees under a temporary folder.
+fn worktree_page(dir: &Path, on: bool, runner: Arc<dyn Runner>) -> Harness<'static, Signoff> {
+    let checkout = dir.join("gh-signoff");
+    std::fs::create_dir_all(checkout.join(".git")).expect("mkdir");
+    std::fs::write(checkout.join(".git").join("HEAD"), "0123456789abcdef0123456789abcdef01234567\n").expect("HEAD");
+    let repo = TrackedRepository {
+        id: "demo-signoff".into(),
+        path: checkout,
+        name_with_owner: "basecamp/gh-signoff".into(),
+        enabled: true,
+        commands: ["tests", "lint"]
+            .into_iter()
+            .map(|name| (name.to_owned(), CommandMapping { command: "bin/test".into(), timeout_seconds: 60 }))
+            .collect(),
+        ..TrackedRepository::default()
+    };
+    let config = Arc::new(ConfigStore::with_config(
+        dir.join("config.json"),
+        AppConfig { isolated_worktrees: on, repositories: vec![repo], ..AppConfig::default() },
+    ));
+    let history = Arc::new(HistoryStore::open(dir.join("history.json")).expect("history"));
+    let settings_service =
+        Arc::new(ProductService::new(Gh::new(Arc::new(Script::default())), config.clone(), history.clone(), None));
+
+    let mut app = demo_app();
+    app.demo = false;
+    app.settings = Settings::new(settings_service, || {});
+    let demo = Arc::new(ProductService::demo());
+    demo.refresh();
+    let verifier = signoff_core::Verifier::new(demo, runner, config, history)
+        .with_worktrees(signoff_core::Worktrees::new(dir.join("worktrees")));
+    app.runs = crate::runs::Runs::new(Arc::new(verifier), || {});
+    app.glance.page = popover::Page::PullRequest { repo_id: "demo-signoff".into(), number: 485 };
+    Harness::builder().with_size(egui::vec2(380.0, 620.0)).build_ui_state(
+        |ui, app: &mut Signoff| {
+            if installed(ui.ctx()) {
+                app.tick(Some(ui.ctx()));
+                popover::show(ui, app);
+            }
+        },
+        app,
+    )
+}
+
+/// What a checkout on another commit answers, and the git steps before
+/// the fetch.
+fn elsewhere() -> Script {
+    Script::default()
+        .reply("rev-parse HEAD", "0123456789abcdef0123456789abcdef01234567")
+        .reply("worktree prune", "")
+        .reply("worktree add", "")
+        .reply("remote -v", "origin\thttps://github.com/basecamp/gh-signoff.git (fetch)")
+}
+
+#[test]
+fn with_the_setting_off_a_checkout_elsewhere_still_offers_to_check_it_out() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut harness = worktree_page(dir.path(), false, Arc::new(elsewhere()));
+    harness.run_ok();
+    harness.get_by_label("Check out #485");
+    assert!(harness.query_by_label_contains("Run & sign off").is_none());
+    assert!(harness.query_by_label_contains("separate worktree").is_none());
+}
+
+#[test]
+fn with_the_setting_on_a_checkout_elsewhere_runs_in_a_worktree_and_explains_a_failed_fetch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let runner = Arc::new(HeldFetch { script: elsewhere(), open: std::sync::atomic::AtomicBool::new(false) });
+    let mut harness = worktree_page(dir.path(), true, runner.clone());
+    harness.run_ok();
+    assert!(harness.query_by_label("Check out #485").is_none());
+    assert!(harness.query_by_label_contains("your checkout is not touched").is_some());
+
+    harness.get_by_label_contains("Run & sign off").click();
+    step_until(&mut harness, "the worktree to be prepared", |h| {
+        h.query_by_label_contains("Preparing worktree…").is_some()
+    });
+    assert!(harness.query_by_label_contains("Stop").is_some(), "a preparation can be stopped");
+
+    runner.open.store(true, std::sync::atomic::Ordering::Release);
+    step_until(&mut harness, "the failed fetch", |h| {
+        h.query_by_label_contains("could not fetch #485 from origin").is_some()
+    });
+    assert!(harness.query_by_label_contains("git fetch origin").is_some(), "the fix is named");
+    assert!(harness.query_by_label_contains("Preparing worktree…").is_none());
+    let calls: Vec<String> = runner.script.calls().into_iter().map(|(line, _)| line).collect();
+    assert!(!calls.iter().any(|line| line.contains("bin/test") || line.contains("signoff --commit")), "{calls:?}");
 }
 
 /// A state where `gh` is ready and only the extension is missing.

@@ -190,6 +190,13 @@ impl Settings {
         self.service.config().is_none_or(|config| config.snapshot().notifications)
     }
 
+    /// Whether runs may use a separate, Signoff-managed worktree when the
+    /// checkout is elsewhere. Off until switched on, and always off for
+    /// demo data.
+    pub(crate) fn isolated_worktrees_on(&self) -> bool {
+        self.service.config().is_some_and(|config| config.snapshot().isolated_worktrees)
+    }
+
     /// Whether the global shortcut is on, and its config string (empty: the
     /// default). On with the default until a config says otherwise.
     pub(crate) fn shortcut_config(&self) -> (bool, String) {

@@ -104,7 +104,7 @@ pub fn watch_paths(dir: &Path) -> Option<WatchPaths> {
 }
 
 /// The git directory for the checkout at or above `dir`.
-fn find_git_dir(dir: &Path) -> Option<PathBuf> {
+pub(crate) fn find_git_dir(dir: &Path) -> Option<PathBuf> {
     for candidate in dir.ancestors() {
         let dot_git = candidate.join(".git");
         if dot_git.is_dir() {
@@ -123,7 +123,7 @@ fn find_git_dir(dir: &Path) -> Option<PathBuf> {
 
 /// Where shared refs live: a linked worktree's `commondir`, or the git
 /// directory itself.
-fn common_dir(git_dir: &Path) -> PathBuf {
+pub(crate) fn common_dir(git_dir: &Path) -> PathBuf {
     match fs::read_to_string(git_dir.join("commondir")) {
         Ok(text) if !text.trim().is_empty() => git_dir.join(text.trim()),
         _ => git_dir.to_owned(),

@@ -200,6 +200,7 @@ fn run_log(ui: &mut Ui, check: &Check, run: &RunView) {
     let (phase, status) = match &run.result {
         None => (
             match run.phase {
+                Phase::Prepare => "preparing worktree",
                 Phase::Checkout => "checking commit",
                 Phase::Run => "streaming",
                 Phase::Signoff => "signing off",
@@ -246,6 +247,9 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
     let number = pr.pr.number;
     let checkout = app.checkouts.view(&pr.repo_id, number);
     let at_head = pr.checked_out || app.checkouts.simulated(&pr.repo_id, number);
+    // With the setting on, a checkout elsewhere is no reason to stop: the
+    // run happens in Signoff's own worktree at the head.
+    let isolated = !at_head && !app.demo && app.settings.isolated_worktrees_on();
     let unmapped = to_configure(pr, target);
     match (target, run) {
         (Some(check), Some(run)) if run.running() => {
@@ -254,14 +258,22 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
                 app.runs.stop(&request(pr, check));
             }
         }
-        (Some(check), _) if check.configured && check.state != CheckState::Success && !at_head => {
+        (Some(check), _) if check.configured && check.state != CheckState::Success && !at_head && !isolated => {
             check_out_button(ui, app, pr, checkout.as_ref());
         }
         (Some(check), _) if check.configured && check.state != CheckState::Success => {
             let label = format!("Run & sign off {}", check.name);
-            let button = ui
-                .add(Button::new(&label).icon(icons::RUN))
-                .on_hover_text(format!("Run `{}`, then sign off {} on this commit", check.local_command, check.name));
+            let hover = if isolated {
+                format!(
+                    "Run `{}` in Signoff's worktree at {}, then sign off {} on this commit; your checkout stays as it is",
+                    check.local_command,
+                    glance::short_sha(&pr.pr.head_sha),
+                    check.name
+                )
+            } else {
+                format!("Run `{}`, then sign off {} on this commit", check.local_command, check.name)
+            };
+            let button = ui.add(Button::new(&label).icon(icons::RUN)).on_hover_text(hover);
             if button.clicked() {
                 app.runs.start(request(pr, check));
             }
@@ -287,6 +299,11 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
     let hint = match checkout {
         Some(Checkout::Failed(message)) => message,
         Some(Checkout::Running) => format!("Running gh pr checkout {number}…"),
+        _ if run.is_some_and(|run| run.running() && run.phase == Phase::Prepare) => "Preparing worktree…".to_owned(),
+        _ if isolated && unmapped.is_none() => format!(
+            "Runs in a separate worktree at {}; your checkout is not touched.",
+            glance::short_sha(&pr.pr.head_sha)
+        ),
         _ => hint(app, pr, target, unmapped),
     };
     caption(ui, &hint);
