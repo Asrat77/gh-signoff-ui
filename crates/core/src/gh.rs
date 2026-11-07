@@ -488,6 +488,31 @@ impl Gh {
             .map_err(|err| format!("could not check out #{number}: {}", detail(&err, "gh pr checkout failed")))
     }
 
+    /// The commit `branch` is at, preferring the copy fetched from `origin`
+    /// over the local branch, which may lag behind.
+    pub(crate) fn branch_commit(&self, dir: &Path, branch: &str) -> Option<String> {
+        if branch.is_empty() || branch.starts_with('-') {
+            return None;
+        }
+        [format!("refs/remotes/origin/{branch}^{{commit}}"), format!("refs/heads/{branch}^{{commit}}")]
+            .iter()
+            .find_map(|name| self.git(dir, &["rev-parse", "--verify", "--quiet", name]))
+            .filter(|sha| !sha.is_empty())
+    }
+
+    /// The paths in `commit` that `paths` name, relative to `dir`: a
+    /// folder with a trailing `/` lists the files in it.
+    pub(crate) fn tree_files(&self, dir: &Path, commit: &str, paths: &[&str]) -> Vec<String> {
+        let mut args = vec!["ls-tree", "--name-only", commit, "--"];
+        args.extend_from_slice(paths);
+        self.git(dir, &args).map(|out| out.lines().map(str::to_owned).collect()).unwrap_or_default()
+    }
+
+    /// The text of `path`, relative to `dir`, as it is in `commit`.
+    pub(crate) fn show_file(&self, dir: &Path, commit: &str, path: &str) -> Option<String> {
+        self.git(dir, &["show", &format!("{commit}:./{path}")])
+    }
+
     /// Installs the `gh signoff` extension.
     ///
     /// # Errors
