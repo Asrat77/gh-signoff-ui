@@ -116,7 +116,7 @@ fn body(
 ) -> Option<Action> {
     let mut action = None;
     Frame::new().inner_margin(Margin { left: 22, right: 22, top: 22, bottom: 14 }).show(ui, |ui| {
-        let (title, detail) = glance::headline(state);
+        let (title, detail) = glance::headline(state, *filter);
         ui.add(Headline::new(&title).detail(&detail));
     });
     Frame::new().inner_margin(Margin::symmetric(18, 0)).show(ui, |ui| {
@@ -186,16 +186,18 @@ fn row(ui: &mut Ui, pr: &PullRequestState) -> egui::Response {
 /// Errors that are not one pull request's: the refresh failing, or a
 /// repository that could not be read.
 fn problems(ui: &mut Ui, state: &ProductState) {
+    let mut failed: Vec<(String, String)> = Vec::new();
     if let Some(error) = &state.error {
-        notice(ui, Status::Failing, error);
+        failed.push((String::new(), error.clone()));
     }
+    failed
+        .extend(state.repositories.iter().filter_map(|repo| Some((repo.name_with_owner.clone(), repo.error.clone()?))));
+    parts::read_problems(ui, &failed);
     if let Some(warning) = &state.warning {
         notice(ui, Status::Attention, warning);
     }
     for repo in &state.repositories {
-        if let Some(error) = &repo.error {
-            notice(ui, Status::Failing, &format!("{}: {error}", repo.name_with_owner));
-        } else if repo.pull_requests_truncated {
+        if repo.error.is_none() && repo.pull_requests_truncated {
             let text =
                 format!("{}: showing the first {} open pull requests.", repo.name_with_owner, repo.pull_request_count);
             notice(ui, Status::Attention, &text);

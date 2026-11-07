@@ -105,7 +105,7 @@ fn status_line(repo: &Row) -> (String, Status) {
         return ("Paused".into(), Status::Neutral);
     }
     if let Some(error) = &repo.error {
-        return (error.clone(), Status::Failing);
+        return (crate::problem::describe(&repo.name_with_owner, error).title, Status::Failing);
     }
     if !repo.read {
         return ("Reading…".into(), Status::Neutral);
@@ -440,7 +440,7 @@ mod tests {
         assert_eq!(line(&row_of(true, true, 0, 0, None)), ("No open PRs".into(), Status::Neutral));
         assert_eq!(line(&row_of(true, true, 1, 0, None)), ("1 open PR".into(), Status::Neutral));
         assert_eq!(line(&row_of(true, true, 3, 1, None)), ("3 open PRs · 1 failing".into(), Status::Failing));
-        assert_eq!(line(&row_of(true, true, 3, 1, Some("gh failed"))), ("gh failed".into(), Status::Failing));
+        assert_eq!(line(&row_of(true, true, 3, 1, Some("gh failed"))), ("Couldn't read a.".into(), Status::Failing));
     }
 
     #[test]

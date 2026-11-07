@@ -301,7 +301,7 @@ fn the_row_shows_why_it_could_not_be_read() {
     harness.run_ok();
     harness.get_by_label("Repositories").click();
     harness.run_ok();
-    harness.get_by_label("gh: not logged in");
+    harness.get_by_label_contains("gh auth login");
 }
 
 #[test]
