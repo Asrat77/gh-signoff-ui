@@ -52,7 +52,7 @@
 //!   The spike ran with a token the proxy added, so the free 304 is
 //!   confirmed for authenticated requests, which is the only kind sent.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -277,6 +277,8 @@ pub struct Api {
     /// Per host: no reads before this.
     blocked: Mutex<HashMap<String, Timestamp>>,
     remotes: Mutex<HashMap<PathBuf, Remote>>,
+    /// Checkouts whose remote GitHub refused once: resolved by `gh` only.
+    ask_gh: Mutex<HashSet<PathBuf>>,
     offline_since: Mutex<Option<Instant>>,
 }
 
@@ -297,6 +299,7 @@ impl Api {
             cache: Mutex::default(),
             blocked: Mutex::default(),
             remotes: Mutex::default(),
+            ask_gh: Mutex::default(),
             offline_since: Mutex::default(),
         }
     }
@@ -323,10 +326,17 @@ impl Api {
         lock(&self.remotes).insert(path.to_owned(), remote);
     }
 
-    /// Resolves the checkout at `path` again on its next read: the
-    /// repository moved, or access to it changed.
+    /// Resolves the checkout at `path` again, through `gh`, on its next
+    /// read: the repository moved, or access to it changed.
     pub fn forget(&self, path: &Path) {
         lock(&self.remotes).remove(path);
+        lock(&self.ask_gh).insert(path.to_owned());
+    }
+
+    /// Whether the checkout at `path` must be resolved by `gh`: a remote
+    /// worked out any other way was refused once this session.
+    pub fn needs_gh(&self, path: &Path) -> bool {
+        lock(&self.ask_gh).contains(path)
     }
 
     /// Asks again on the next read for branch protection of `branch` in

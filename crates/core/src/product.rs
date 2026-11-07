@@ -356,9 +356,14 @@ const PARALLEL_STATUSES: usize = 4;
 /// anything GitHub answered is a read, failed or not.
 fn read_with_api(gh: &Gh, api: &Api, tracked: &TrackedRepository) -> Result<(RepositoryRead, bool), ApiError> {
     let mut view = initial_view(tracked);
-    // Which repository and host: from gh, once per checkout per session.
-    let remote = match api.remote(&tracked.path) {
-        Some(remote) => remote,
+    // Which repository and host: from the checkout's git config when it
+    // says for certain, otherwise from gh; once per checkout per session.
+    let from_checkout = || remote_from_checkout(tracked).filter(|_| !api.needs_gh(&tracked.path));
+    let remote = match api.remote(&tracked.path).or_else(from_checkout) {
+        Some(remote) => {
+            api.remember(&tracked.path, remote.clone());
+            remote
+        }
         None => match gh.repo(&tracked.path) {
             Ok(info) => {
                 let remote = Remote {
@@ -435,6 +440,24 @@ fn read_with_api(gh: &Gh, api: &Api, tracked: &TrackedRepository) -> Result<(Rep
         history.extend(events);
     }
     Ok((RepositoryRead { repository: view, pull_requests, history, deferred: false }, false))
+}
+
+/// The remote of `tracked` without asking `gh`: the repository and default
+/// branch saved when it was added, on the host its git remote names. A
+/// repository renamed since answers 404, after which `gh` is asked.
+///
+/// `gh repo view` was the one `gh` call left on the REST path, and on a
+/// slow machine it timed out before the API was ever tried.
+fn remote_from_checkout(tracked: &TrackedRepository) -> Option<Remote> {
+    if tracked.default_branch.is_empty() {
+        return None;
+    }
+    let host = crate::git::github_host(&tracked.path, &tracked.name_with_owner)?;
+    Some(Remote {
+        host,
+        name_with_owner: tracked.name_with_owner.clone(),
+        default_branch: tracked.default_branch.clone(),
+    })
 }
 
 /// `f` applied to every item, `workers` at a time, in order.
@@ -1210,9 +1233,16 @@ mod tests {
     }
 
     fn api_fixture(replies: Vec<Reply>) -> (Fixture, Arc<FakeRunner>, Arc<FakeTransport>) {
+        api_fixture_with(replies, vec![tracked()])
+    }
+
+    fn api_fixture_with(
+        replies: Vec<Reply>,
+        repos: Vec<TrackedRepository>,
+    ) -> (Fixture, Arc<FakeRunner>, Arc<FakeTransport>) {
         let fake = Arc::new(FakeRunner::new(replies));
         let transport = Arc::new(FakeTransport::default());
-        let f = fixture(fake.clone(), vec![tracked()]);
+        let f = fixture(fake.clone(), repos);
         let gh = Gh::with_api(fake.clone(), transport.clone());
         let service = Arc::new(ProductService::new(
             gh,
@@ -1264,6 +1294,28 @@ mod tests {
         assert_eq!(conditional, 3);
         let gh_calls = |needle: &str| fake.commands().iter().filter(|c| c.contains(needle)).count();
         assert_eq!((gh_calls("repo view"), gh_calls("auth token")), (1, 1), "resolved once per session");
+    }
+
+    /// The checkout's git config names the repository on github.com, so
+    /// the REST path needs no `gh repo view`, until GitHub refuses it.
+    #[test]
+    fn the_remote_comes_from_the_checkout_until_github_refuses_it() {
+        let checkout = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(checkout.path().join(".git")).expect("mkdir");
+        std::fs::write(checkout.path().join(".git/config"), "[remote \"origin\"]\n\turl = git@github.com:o/r.git\n")
+            .expect("config");
+        let repo = TrackedRepository { path: checkout.path().into(), default_branch: "main".into(), ..tracked() };
+        let (f, fake, transport) = api_fixture_with(api_gh(true), vec![repo]);
+        rest_answers(&transport);
+        assert_eq!(f.service.refresh().pull_requests.len(), 2);
+        assert!(!fake.called("repo view"), "resolved from .git/config");
+
+        transport.answer("/pulls?", json(404, None, r#"{"message":"Not Found"}"#));
+        f.service.refresh();
+        assert!(!fake.called("repo view"));
+        rest_answers(&transport);
+        f.service.refresh();
+        assert!(fake.called("repo view"), "after a 404, gh resolves it");
     }
 
     #[test]

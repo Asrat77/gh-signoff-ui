@@ -130,6 +130,44 @@ pub(crate) fn common_dir(git_dir: &Path) -> PathBuf {
     }
 }
 
+/// The host of the remote of the checkout at `dir` that points at
+/// `name_with_owner` (`owner/name`), read from `.git/config`. Only
+/// `github.com` and GitHub Enterprise Cloud (`*.ghe.com`) hosts are given:
+/// an SSH alias, a GitHub Enterprise Server or a URL rewritten by
+/// `insteadOf` is left to `gh`, which resolves those for certain.
+pub(crate) fn github_host(dir: &Path, name_with_owner: &str) -> Option<String> {
+    if name_with_owner.is_empty() {
+        return None;
+    }
+    let config = fs::read_to_string(common_dir(&find_git_dir(dir)?).join("config")).ok()?;
+    config
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.trim().split_once('=')?;
+            (key.trim() == "url").then(|| value.trim().trim_matches('"'))
+        })
+        .filter_map(split_remote_url)
+        .find(|(host, path)| {
+            path.eq_ignore_ascii_case(name_with_owner) && (host == "github.com" || host.ends_with(".ghe.com"))
+        })
+        .map(|(host, _)| host)
+}
+
+/// The host and `owner/name` path of a remote URL in any form git takes:
+/// `https://host/o/r.git`, `ssh://git@host:22/o/r`, or `git@host:o/r.git`.
+fn split_remote_url(url: &str) -> Option<(String, String)> {
+    let (authority, path) = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?,
+        // scp-like: `[user@]host:path`, never with a slash before the colon.
+        None => url.split_once(':').filter(|(host, _)| !host.contains('/'))?,
+    };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = host.split_once(':').map_or(host, |(host, _)| host).to_ascii_lowercase();
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    (!host.is_empty() && !path.is_empty()).then(|| (host, path.to_owned()))
+}
+
 /// The commit `name` (`refs/heads/main`) points at.
 fn resolve(git_dir: &Path, common: &Path, name: &str, depth: usize) -> Option<String> {
     if depth > MAX_SYMREF_DEPTH || !safe_ref_name(name) {
@@ -179,6 +217,36 @@ mod tests {
     fn write(path: &Path, text: &str) {
         fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
         fs::write(path, text).expect("write");
+    }
+
+    #[test]
+    fn remote_urls_split_into_host_and_path_in_every_form() {
+        let split = |url| split_remote_url(url).map(|(h, p)| format!("{h} {p}"));
+        assert_eq!(split("https://github.com/o/r.git").as_deref(), Some("github.com o/r"));
+        assert_eq!(split("https://user:tok@GitHub.com/o/r/").as_deref(), Some("github.com o/r"));
+        assert_eq!(split("ssh://git@github.com:22/o/r").as_deref(), Some("github.com o/r"));
+        assert_eq!(split("git@github.com:o/r.git").as_deref(), Some("github.com o/r"));
+        assert_eq!(split("/local/path/r.git"), None);
+        assert_eq!(split("../r"), None);
+    }
+
+    #[test]
+    fn the_github_host_comes_from_the_remote_that_names_the_repository() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = "[core]\n\tbare = false\n[remote \"fork\"]\n\turl = git@github.com:me/r.git\n\
+                      [remote \"origin\"]\n\turl = https://github.com/O/R.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n";
+        write(&dir.path().join(".git/config"), config);
+        assert_eq!(github_host(dir.path(), "o/r").as_deref(), Some("github.com"));
+        assert_eq!(github_host(&dir.path().join("sub/dir"), "me/r").as_deref(), Some("github.com"));
+        assert_eq!(github_host(dir.path(), "other/r"), None, "no remote names it");
+        assert_eq!(github_host(dir.path(), ""), None);
+
+        write(&dir.path().join(".git/config"), "[remote \"origin\"]\n\turl = git@github-work:o/r.git\n");
+        assert_eq!(github_host(dir.path(), "o/r"), None, "an SSH alias is left to gh");
+        write(&dir.path().join(".git/config"), "[remote \"origin\"]\n\turl = https://git.corp.example/o/r\n");
+        assert_eq!(github_host(dir.path(), "o/r"), None, "so is GitHub Enterprise Server");
+        write(&dir.path().join(".git/config"), "[remote \"origin\"]\n\turl = https://acme.ghe.com/o/r\n");
+        assert_eq!(github_host(dir.path(), "o/r").as_deref(), Some("acme.ghe.com"));
     }
 
     #[test]
