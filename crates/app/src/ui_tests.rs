@@ -1013,6 +1013,52 @@ fn the_demo_simulates_a_checkout_and_then_offers_to_run() {
     step_until(&mut harness, "the simulated checkout", |h| h.query_by_label_contains("Run & sign off").is_some());
 }
 
+/// A failing check reads as the check's result, with ways to act on it:
+/// a prompt for a coding agent, the output, History, and running it again.
+#[test]
+fn a_failed_check_reads_as_the_checks_result_and_offers_next_steps() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    {
+        let app = harness.state_mut();
+        let pr = app.state.pull_requests.iter().find(|pr| pr.pr.number == 485).expect("the failing pull request");
+        let (repo_id, number) = (pr.repo_id.clone(), pr.pr.number);
+        app.glance.page = popover::Page::PullRequest { repo_id, number };
+    }
+    harness.run_ok();
+    harness.get_by_label("Check out #485").click();
+    step_until(&mut harness, "the simulated checkout", |h| h.query_by_label_contains("Run & sign off").is_some());
+    harness.get_by_label_contains("Run & sign off").click();
+    step_until(&mut harness, "the run to fail", |h| h.query_by_label("tests failed").is_some());
+
+    assert!(harness.query_by_label_contains("the check's own result, not a Signoff error").is_some());
+    let button = harness.get_by_label("Run tests again").rect();
+    let actions = harness.get_by_label("Copy for agent").rect();
+    assert!(actions.bottom() < button.top(), "the actions at {actions:?} are hidden under the button at {button:?}");
+    for label in ["Copy output", "Open in History", "Dismiss"] {
+        assert!(harness.query_by_label(label).is_some(), "no {label} action");
+    }
+
+    harness.get_by_label("Copy for agent").click();
+    harness.step();
+    let copied = harness.output().platform_output.commands.iter().find_map(|command| match command {
+        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+        _ => None,
+    });
+    let copied = copied.expect("a prompt on the clipboard");
+    assert!(copied.contains("The `tests` check failed"), "{copied}");
+    assert!(copied.contains("assertion failed: handle.is_finished()"), "{copied}");
+    harness.run_ok();
+
+    harness.get_by_label("Open in History").click();
+    harness.run_ok();
+    assert!(harness.state().settings_open, "History opens in Settings");
+
+    harness.get_by_label("Dismiss").click();
+    harness.run_ok();
+    assert!(harness.query_by_label("tests failed").is_none());
+}
+
 #[test]
 fn the_notifications_switch_is_on_by_default_and_saved() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1177,9 +1223,11 @@ fn with_the_setting_on_a_checkout_elsewhere_runs_in_a_worktree_and_explains_a_fa
 
     runner.open.store(true, std::sync::atomic::Ordering::Release);
     step_until(&mut harness, "the failed fetch", |h| {
-        h.query_by_label_contains("could not fetch #485 from origin").is_some()
+        h.query_all_by_label_contains("ould not fetch #485 from origin").next().is_some()
     });
-    assert!(harness.query_by_label_contains("git fetch origin").is_some(), "the fix is named");
+    assert!(harness.query_by_label_contains("Couldn't run").is_some(), "worded as Signoff not finishing");
+    assert!(harness.query_by_label("Copy for agent").is_none(), "nothing for an agent to fix");
+    assert!(harness.query_all_by_label_contains("git fetch origin").next().is_some(), "the fix is named");
     assert!(harness.query_by_label_contains("Preparing worktree…").is_none());
     let calls: Vec<String> = runner.script.calls().into_iter().map(|(line, _)| line).collect();
     assert!(!calls.iter().any(|line| line.contains("bin/test") || line.contains("signoff --commit")), "{calls:?}");

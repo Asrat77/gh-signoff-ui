@@ -57,7 +57,7 @@ impl VerifyRequest {
 }
 
 /// The step a run is on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Phase {
     /// Preparing Signoff's worktree at the pull request's head, when the
     /// checkout is elsewhere and the separate-worktree setting is on.
@@ -65,13 +65,33 @@ pub enum Phase {
     /// Confirming the checkout and pull request are at the expected commit.
     Checkout,
     /// Running the mapped command.
+    #[default]
     Run,
     /// Writing the signoff.
     Signoff,
 }
 
+/// Why a run ended, in the terms the person cares about: their check
+/// failing is not Signoff failing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Ending {
+    /// The command passed and the signoff was written.
+    #[default]
+    SignedOff,
+    /// The person's command ran and exited non-zero: the check found a
+    /// problem in the code, such as a failing test or a vulnerability.
+    CheckFailed,
+    /// The person's command ran past its timeout.
+    TimedOut,
+    /// The person stopped the run.
+    Stopped,
+    /// Signoff could not finish around the command: the worktree, the
+    /// pull request moving, the command not starting, or `gh signoff`.
+    Interrupted,
+}
+
 /// How a run ended.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
     /// The step it ended on.
     pub phase: Phase,
@@ -79,6 +99,12 @@ pub struct Outcome {
     pub code: i32,
     /// Why it stopped, when it did not succeed.
     pub message: Option<String>,
+    /// Why it ended.
+    pub ending: Ending,
+    /// The check's command as it ran; empty when the run stopped before it.
+    pub command: String,
+    /// The id of the command's history entry, when one was recorded.
+    pub entry: Option<String>,
 }
 
 impl Outcome {
@@ -87,8 +113,40 @@ impl Outcome {
         self.phase == Phase::Signoff && self.code == 0
     }
 
+    /// Whether the person's own command ran and did not pass, so the fix
+    /// is in their code, not in Signoff.
+    pub fn check_failed(&self) -> bool {
+        matches!(self.ending, Ending::CheckFailed | Ending::TimedOut)
+    }
+
+    /// A run that ended at `phase` before the signoff; a cancelled one
+    /// reads as stopped, anything else as Signoff not finishing.
     fn stopped(phase: Phase, code: i32, message: impl Into<String>) -> Self {
-        Self { phase, code, message: Some(message.into()) }
+        let ending = if code == crate::runner::CANCELLED { Ending::Stopped } else { Ending::Interrupted };
+        Self { phase, code, message: Some(message.into()), ending, ..Self::default() }
+    }
+
+    /// The person's `command` exited with `code`.
+    fn command_exited(code: i32, command: &str, timeout: Duration, entry: Option<String>) -> Self {
+        let ending = match code {
+            crate::runner::TIMED_OUT => Ending::TimedOut,
+            crate::runner::CANCELLED => Ending::Stopped,
+            _ => Ending::CheckFailed,
+        };
+        Self {
+            phase: Phase::Run,
+            code,
+            message: Some(run_failure(code, timeout)),
+            ending,
+            command: command.to_owned(),
+            entry,
+        }
+    }
+
+    fn with_command(mut self, command: &str, entry: Option<String>) -> Self {
+        self.command = command.to_owned();
+        self.entry = entry;
+        self
     }
 }
 
@@ -240,7 +298,10 @@ impl Verifier {
             Run { pr_title: &pr.pr.title, repo: &pr.repo, request, check, on_event, output: OutputTail::default() };
 
         match &self.source {
-            Source::Demo { pace } => Ok(self.play_demo(&mut ctx, &target.local_command, &head, *pace)),
+            Source::Demo { pace } => {
+                let fails = target.state.is_failed();
+                Ok(self.play_demo(&mut ctx, &target.local_command, &head, *pace, fails))
+            }
             Source::Live { runner, gh, config, history } => {
                 let repo = config.find_repository(&request.repo_id).ok_or(VerifyError::RepositoryGone)?;
                 let mapping = repo
@@ -308,10 +369,29 @@ impl Verifier {
         Ok(Running { set: &self.running, key })
     }
 
-    fn play_demo(&self, ctx: &mut Run<'_>, command: &str, head: &str, pace: Duration) -> Outcome {
+    /// Plays a run of `command`. One that `fails` (its check is failing on
+    /// GitHub) fails again here, as a real run would, so the demo shows a
+    /// failed check too.
+    fn play_demo(&self, ctx: &mut Run<'_>, command: &str, head: &str, pace: Duration, fails: bool) -> Outcome {
         ctx.emit(VerifyEvent::Phase(Phase::Run));
         ctx.line(format!("$ {command}"));
         thread::sleep(pace);
+        if fails {
+            for line in DEMO_FAILURE {
+                ctx.line(*line);
+            }
+            let mut run = ActivityEvent::default();
+            ctx.output.take_into(&mut run);
+            let entry = self.product.record_demo_failure(
+                &ctx.request.repo_id,
+                ctx.request.pr_number,
+                ctx.check,
+                command,
+                1,
+                run.output,
+            );
+            return Outcome::command_exited(1, command, Duration::ZERO, entry);
+        }
         ctx.line("local command passed");
         let mut run = ActivityEvent::default();
         ctx.output.take_into(&mut run);
@@ -320,9 +400,24 @@ impl Verifier {
         thread::sleep(pace);
         ctx.line(format!("signed off {} on {}", ctx.check, short_sha(head)));
         self.product.mark_demo_passed(&ctx.request.repo_id, ctx.request.pr_number, ctx.check, run.output);
-        Outcome { phase: Phase::Signoff, code: 0, message: None }
+        Outcome { phase: Phase::Signoff, command: command.to_owned(), ..Outcome::default() }
     }
 }
+
+/// What a failing demo run prints.
+const DEMO_FAILURE: &[&str] = &[
+    "running 24 tests",
+    "test poller::tests::polls_on_an_interval ... ok",
+    "test poller::tests::stops_when_cancelled ... \u{1b}[31mFAILED\u{1b}[0m",
+    "",
+    "failures:",
+    "",
+    "---- poller::tests::stops_when_cancelled stdout ----",
+    "thread 'poller::tests::stops_when_cancelled' panicked at src/poller.rs:88:9:",
+    "assertion failed: handle.is_finished()",
+    "",
+    "test result: \u{1b}[31mFAILED\u{1b}[0m. 23 passed; 1 failed; 0 ignored",
+];
 
 /// Prepares `repo`'s worktree at `head` for the run in `ctx`, reporting it
 /// as [`Phase::Prepare`]; a failure is the run's outcome.
@@ -432,14 +527,21 @@ impl Live<'_> {
                 return Outcome::stopped(Phase::Run, 1, message);
             }
         };
-        self.record(ctx.activity(ActivityKind::Run, self.repo_id, command.to_owned(), code, started.elapsed()));
+        let entry =
+            self.record(ctx.activity(ActivityKind::Run, self.repo_id, command.to_owned(), code, started.elapsed()));
         if code != 0 {
-            return Outcome::stopped(Phase::Run, code, run_failure(code, timeout));
+            return Outcome::command_exited(code, command, timeout, entry);
         }
         if cancel.load(Ordering::Acquire) {
-            return Outcome::stopped(Phase::Run, crate::runner::CANCELLED, "stopped before signing off");
+            return Outcome::stopped(Phase::Run, crate::runner::CANCELLED, "stopped before signing off")
+                .with_command(command, entry);
         }
+        self.confirm_and_sign_off(ctx, head).with_command(command, entry)
+    }
 
+    /// After the command passed: checks nothing moved while it ran, then
+    /// writes the signoff.
+    fn confirm_and_sign_off(&self, ctx: &mut Run<'_>, head: &str) -> Outcome {
         // Nothing moved while it ran.
         ctx.emit(VerifyEvent::Phase(Phase::Checkout));
         if let Err(message) = self.gh.require_checked_out_commit(self.dir, head) {
@@ -495,7 +597,7 @@ impl Live<'_> {
         self.record(ctx.activity(ActivityKind::Signoff, self.repo_id, shown, code, started.elapsed()));
         if code == 0 {
             ctx.line(format!("signed off {} on {}", ctx.check, short_sha(head)));
-            Outcome { phase: Phase::Signoff, code, message: None }
+            Outcome { phase: Phase::Signoff, ..Outcome::default() }
         } else {
             Outcome::stopped(Phase::Signoff, code, format!("gh signoff exited with {code}"))
         }
@@ -514,10 +616,9 @@ impl Live<'_> {
             .map_err(|err| format!("could not start {program}: {err}"))
     }
 
-    fn record(&self, event: ActivityEvent) {
-        if let Err(err) = self.history.append(event) {
-            log::warn!("could not record activity: {err}");
-        }
+    /// Records `event` in history and returns its id.
+    fn record(&self, event: ActivityEvent) -> Option<String> {
+        self.history.append(event).inspect_err(|err| log::warn!("could not record activity: {err}")).ok()
     }
 }
 
@@ -528,7 +629,7 @@ fn run_failure(code: i32, timeout: Duration) -> String {
             format!("the command timed out after {}", crate::runner::human_duration(timeout))
         }
         crate::runner::CANCELLED => "stopped".to_owned(),
-        code => format!("the command exited with {code}; nothing was signed off"),
+        code => format!("the command exited with {code}, so nothing was signed off"),
     }
 }
 
@@ -710,9 +811,13 @@ mod tests {
         let (result, _) = run(&f, "tests");
         let outcome = result.expect("started");
         assert_eq!((outcome.phase, outcome.code), (Phase::Run, 2));
+        assert_eq!(outcome.ending, Ending::CheckFailed, "the check failed, not Signoff");
+        assert!(outcome.check_failed());
+        assert_eq!(outcome.command, "make test");
         assert!(!f.fake.called("signoff"));
         let history = f.history.snapshot(0);
         assert_eq!(history.len(), 1);
+        assert_eq!(outcome.entry.as_deref(), Some(history[0].id.as_str()), "points at its history entry");
         assert_eq!(
             (history[0].kind, history[0].state, history[0].exit_code),
             (ActivityKind::Run, CheckState::Failure, 2)
@@ -731,6 +836,8 @@ mod tests {
         let (result, events) = run(&f, "tests");
         let outcome = result.expect("started");
         assert_eq!(outcome.phase, Phase::Checkout);
+        assert_eq!(outcome.ending, Ending::Interrupted, "the check passed; Signoff could not finish");
+        assert!(!outcome.check_failed());
         assert!(lines(&events).iter().any(|l| l.contains("moved to aaaaaaaa")));
         assert!(!f.fake.called("signoff"));
     }
@@ -785,15 +892,42 @@ mod tests {
     fn demo_runs_pretend_and_mark_the_check_passed() {
         let product = Arc::new(ProductService::demo());
         product.refresh();
-        let pr = product.cached().pull_requests.into_iter().find(|pr| !pr.ready).expect("a pr to verify");
+        let pr = product.cached().pull_requests.into_iter().find(|pr| pr.pr.number == 482).expect("a pr to verify");
         let check =
-            pr.checks.iter().find(|c| c.configured && c.state != CheckState::Success).expect("check").name.clone();
+            pr.checks.iter().find(|c| c.configured && c.state == CheckState::Absent).expect("check").name.clone();
         let verifier = Verifier::from_source(product.clone(), Source::Demo { pace: Duration::ZERO });
         let request = VerifyRequest { repo_id: pr.repo_id.clone(), pr_number: pr.pr.number, check: check.clone() };
         let outcome = verifier.verify(&request, &AtomicBool::new(false), &mut |_| {}).expect("started");
         assert!(outcome.signed_off());
         let after = product.find_pull_request(&pr.repo_id, pr.pr.number).expect("pr");
         assert_eq!(after.checks.iter().find(|c| c.name == check).expect("check").state, CheckState::Success);
+    }
+
+    /// A check failing on GitHub fails in the demo too, so the demo shows
+    /// what a failed check looks like.
+    #[test]
+    fn a_failing_demo_check_fails_again_and_is_recorded() {
+        let product = Arc::new(ProductService::demo());
+        product.refresh();
+        let pr = product.cached().pull_requests.into_iter().find(|pr| pr.pr.number == 485).expect("pr");
+        let verifier = Verifier::from_source(product.clone(), Source::Demo { pace: Duration::ZERO });
+        let request = VerifyRequest { repo_id: pr.repo_id.clone(), pr_number: 485, check: "tests".into() };
+        let mut lines = Vec::new();
+        let outcome = verifier
+            .verify(&request, &AtomicBool::new(false), &mut |event| {
+                if let VerifyEvent::Line(line) = event {
+                    lines.push(line);
+                }
+            })
+            .expect("started");
+        assert_eq!(outcome.ending, Ending::CheckFailed);
+        assert_eq!(outcome.code, 1);
+        assert!(lines.iter().any(|line| line.contains("assertion failed")), "{lines:?}");
+        let entry = outcome.entry.expect("recorded");
+        let history = product.cached().history;
+        let ran = history.iter().find(|event| event.id == entry).expect("in history");
+        assert_eq!((ran.state, ran.exit_code), (CheckState::Failure, 1));
+        assert!(!ran.output.is_empty());
     }
 
     #[test]

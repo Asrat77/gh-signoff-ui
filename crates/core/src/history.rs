@@ -178,17 +178,19 @@ impl HistoryStore {
     }
 
     /// Records `event`, filling its time and id if missing, and saves.
+    /// Returns the event's id.
     ///
     /// # Errors
     ///
     /// When the events cannot be serialized; the event is then not kept.
-    pub fn append(&self, mut event: ActivityEvent) -> Result<(), ConfigError> {
+    pub fn append(&self, mut event: ActivityEvent) -> Result<String, ConfigError> {
         if event.at == Timestamp::UNIX_EPOCH {
             event.at = Timestamp::now();
         }
         if event.id.is_empty() {
             event.id = format!("{}-{}-{}-{}", event.at.as_nanosecond(), event.repo_id, event.pr_number, event.check);
         }
+        let id = event.id.clone();
         let mut guard = self.events.write().unwrap_or_else(PoisonError::into_inner);
         let mut next = Vec::with_capacity(guard.len() + 1);
         next.push(event);
@@ -203,7 +205,7 @@ impl HistoryStore {
             log::error!("could not write {}", path.display());
         });
         *guard = next;
-        Ok(())
+        Ok(id)
     }
 
     /// Waits, at most [`fastframe_file::FLUSH_TIMEOUT`], until every event

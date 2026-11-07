@@ -958,6 +958,45 @@ impl ProductService {
         });
     }
 
+    /// Records a failed demo run of `command` in the demo's history and
+    /// returns its id. Nothing on a live service.
+    pub fn record_demo_failure(
+        &self,
+        repo_id: &str,
+        number: u64,
+        check_name: &str,
+        command: &str,
+        code: i32,
+        output: Vec<String>,
+    ) -> Option<String> {
+        if !self.is_demo() {
+            return None;
+        }
+        let now = Timestamp::now();
+        let id = format!("demo-run:{}", now.as_nanosecond());
+        self.mutate(|store| {
+            let Some(pr) = store.state.pull_request(repo_id, number) else { return };
+            let event = ActivityEvent {
+                id: id.clone(),
+                kind: ActivityKind::Run,
+                repo_id: repo_id.to_owned(),
+                repo: pr.repo.clone(),
+                pr_number: number,
+                pr_title: pr.pr.title.clone(),
+                check: check_name.to_owned(),
+                state: CheckState::Failure,
+                actor: "you".into(),
+                command: command.to_owned(),
+                exit_code: code,
+                at: now,
+                output,
+                ..ActivityEvent::default()
+            };
+            store.state.history.insert(0, event);
+        });
+        Some(id)
+    }
+
     fn store(&self) -> RwLockReadGuard<'_, Store> {
         self.store.read().unwrap_or_else(PoisonError::into_inner)
     }
