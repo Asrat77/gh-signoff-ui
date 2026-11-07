@@ -33,7 +33,7 @@ const RAILS_CI: &str = "config/ci.rb";
 /// Where GitHub Actions workflows live.
 const WORKFLOWS: &str = ".github/workflows";
 /// The check that vouches for the whole pull request.
-const WHOLE: &str = "signoff";
+pub const WHOLE: &str = "signoff";
 
 /// Where a candidate came from; earlier kinds win ties.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -151,6 +151,13 @@ fn whole(rails: &[RailsStep], workflows: &[Workflow]) -> Option<DetectedCommand>
         }
     }
     (!commands.is_empty()).then(|| DetectedCommand { command: chain(commands), source: sources.join(", ") })
+}
+
+/// The steps of `ci`, a command [`detect`] chained for the whole pull
+/// request, that `command` does not run. Empty when it covers them all.
+pub fn missing(command: &str, ci: &str) -> Vec<String> {
+    let have: Vec<&str> = command.split(" && ").map(str::trim).collect();
+    ci.split(" && ").map(str::trim).filter(|step| !step.is_empty() && !have.contains(step)).map(str::to_owned).collect()
 }
 
 /// `commands` run one after another, stopping at the first that fails.
@@ -547,6 +554,17 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --locked
 "#;
+
+    #[test]
+    fn missing_lists_the_ci_steps_a_command_does_not_run() {
+        assert_eq!(
+            missing("cargo fmt --check", "cargo fmt --check && cargo clippy && cargo test"),
+            ["cargo clippy", "cargo test"]
+        );
+        assert!(missing("cargo test && cargo fmt --check", "cargo fmt --check && cargo test").is_empty());
+        assert!(missing("make ci", "make ci").is_empty());
+        assert_eq!(missing("", "make ci"), ["make ci"]);
+    }
 
     #[test]
     fn checks_get_the_job_that_matches_their_name() {
