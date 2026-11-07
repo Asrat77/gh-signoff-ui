@@ -543,8 +543,11 @@ fn set_up_signoff_opens_branch_rules_ready_to_save() {
 
     harness.get_by_label("Set up signoff").click();
     step_until(&mut harness, "the rules to load with signoff ready", |h| {
-        h.query_by_label_contains("`signoff` is ready below").is_some()
+        h.query_by_label_contains("Require `signoff` before a pull request into main can merge").is_some()
     });
+    // Where the branch stands comes first, then what saving changes.
+    harness.get_by_label_contains("widgets requires no signoff on it yet");
+    harness.get_by_label_contains("Keep reviews, push rules and every other required check");
     harness.get_by_label("ci/build");
     harness.get_by_label("Save to GitHub").click();
     step_until(&mut harness, "the rules to be written", |_| {
@@ -555,6 +558,29 @@ fn set_up_signoff_opens_branch_rules_ready_to_save() {
     let (_, input) = calls.iter().find(|(line, _)| line.contains("--method")).expect("a write");
     let input = input.as_deref().unwrap_or_default();
     assert!(input.contains(r#""signoff""#) && input.contains("ci/build"), "{input}");
+}
+
+#[test]
+fn set_up_signoff_says_when_a_branch_already_requires_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script = Arc::new(
+        Script::default().reply("check-ref-format", "main").reply("protection --jq", r#"["ci/build","signoff"]"#),
+    );
+    let service = service(dir.path(), vec![tracked(dir.path())], script.clone());
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service, state);
+    harness.run_ok();
+    harness.get_by_label("Repositories").click();
+    harness.run_ok();
+
+    harness.get_by_label("Set up signoff").click();
+    step_until(&mut harness, "the rules to load", |h| {
+        h.query_by_label_contains("widgets already requires `signoff` on main").is_some()
+    });
+    assert!(harness.query_by_label("Save to GitHub will").is_none(), "nothing to change");
+    harness.get_by_label("Save to GitHub").click();
+    harness.run_ok();
+    assert!(!script.calls().iter().any(|(line, _)| line.contains("--method")), "nothing written");
 }
 
 #[test]
