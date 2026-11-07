@@ -195,7 +195,7 @@ fn execute(app: &mut Signoff, ctx: &Context, command: &Command) {
             ctx.copy_text(text.clone());
             toast(ctx, "Command copied", Status::Ready);
         }
-        Command::OpenUrl(url) => crate::browser::open(ctx, &url),
+        Command::OpenUrl(url) => crate::browser::open(ctx, url),
         Command::Refresh => app.recheck(),
         Command::Settings(section) => {
             app.settings.section = *section;
