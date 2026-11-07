@@ -36,7 +36,8 @@ pub(super) fn band(ui: &mut Ui, mood: Mood, demo: bool, trailing: impl FnOnce(&m
 /// runs.
 pub(super) fn refresh_button(ui: &mut Ui, app: &Signoff) {
     if app.refreshing() {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(size::ICON_BUTTON), Sense::hover());
+        let (rect, response) = ui.allocate_exact_size(Vec2::splat(size::ICON_BUTTON), Sense::hover());
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, true, "Refreshing"));
         ui.painter().circle_filled(rect.center(), size::ICON_BUTTON / 2.0, egui::Color32::from_black_alpha(46));
         spinner(ui, rect.center(), 7.0, palette(ui.ctx()).on_accent);
     } else if ui.add(IconButton::new(icons::REFRESH, "Refresh")).clicked() {

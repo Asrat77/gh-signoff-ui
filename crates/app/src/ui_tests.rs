@@ -429,6 +429,24 @@ fn the_glance_lists_pull_requests_across_repositories() {
 }
 
 #[test]
+fn every_button_on_the_glance_and_a_pull_request_has_a_name_for_screen_readers() {
+    let mut harness = popover_harness();
+    harness.run_ok();
+    for label in ["Refresh", "Settings"] {
+        assert!(harness.query_by_label(label).is_some(), "no accessible {label} button");
+    }
+    harness.get_by_label_contains("Add label-based partial signoff").click();
+    harness.run_ok();
+    for label in ["Back to pull requests", "Open on GitHub"] {
+        assert!(harness.query_by_label(label).is_some(), "no accessible {label} button");
+    }
+    for button in harness.get_all_by_role(egui::accesskit::Role::Button) {
+        let named = button.accesskit_node().label().is_some_and(|label| !label.is_empty());
+        assert!(named, "a button without an accessible name: {:?}", button.accesskit_node());
+    }
+}
+
+#[test]
 fn a_pull_request_opens_its_signoffs() {
     let mut harness = popover_harness();
     harness.run_ok();
