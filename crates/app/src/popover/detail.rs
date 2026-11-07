@@ -34,7 +34,7 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
     let mood = if running { Mood::Busy } else { Mood::for_status(glance::status(pr.status)) };
     band(ui, mood, app.demo, |ui| {
         if ui.add(IconButton::new(icons::EXTERNAL, "Open on GitHub")).clicked() {
-            ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.pr.url));
+            crate::browser::open(ui.ctx(), &pr.pr.url);
         }
         super::parts::palette_button(ui, app);
         refresh_button(ui, app);
@@ -291,7 +291,7 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
                 ("Open on GitHub", ButtonKind::Secondary)
             };
             if ui.add(Button::new(label).kind(kind).trailing_icon(icons::FORWARD)).clicked() {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(&pr.pr.url));
+                crate::browser::open(ui.ctx(), &pr.pr.url);
             }
         }
     }

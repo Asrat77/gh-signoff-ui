@@ -8,6 +8,7 @@
 mod anchor;
 mod app;
 mod autostart;
+mod browser;
 mod cadence;
 mod checkouts;
 mod commands;
