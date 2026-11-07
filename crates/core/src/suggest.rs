@@ -1,12 +1,13 @@
 //! Commands worth mapping to a check, read from the checkout.
 //!
-//! Detection looks only at well-known files at the checkout's root and
+//! Detection looks only at well-known files at the repository's root and
 //! never runs anything. [`rank`] puts the suggestions that match a check's
 //! name first, so the check `lint` leads with `npm run lint`.
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::Path;
+
+use crate::files::Tree;
 
 /// The most suggestions [`detect`] returns.
 const MAX: usize = 40;
@@ -31,8 +32,13 @@ impl CommandSuggestion {
 /// The commands the checkout at `dir` suggests, in the order they were
 /// found.
 pub fn detect(dir: &Path) -> Vec<CommandSuggestion> {
-    let read = |name: &str| fs::read_to_string(dir.join(name)).ok();
-    let has = |name: &str| dir.join(name).is_file();
+    detect_in(dir)
+}
+
+/// The commands the files of `tree` suggest, in the order they were found.
+pub fn detect_in(tree: &(impl Tree + ?Sized)) -> Vec<CommandSuggestion> {
+    let read = |name: &str| tree.read(name);
+    let has = |name: &str| tree.has_file(name);
     let mut found = Vec::new();
 
     if let Some(text) = read("Makefile").or_else(|| read("makefile")).or_else(|| read("GNUmakefile")) {
@@ -41,7 +47,7 @@ pub fn detect(dir: &Path) -> Vec<CommandSuggestion> {
         }
     }
     if let Some(text) = read("package.json") {
-        let manager = package_manager(dir);
+        let manager = package_manager(tree);
         for script in package_scripts(&text) {
             found.push(CommandSuggestion::new(format!("{manager} run {script}"), script, "package.json"));
         }
@@ -85,7 +91,7 @@ pub fn suggest(dir: &Path, check: &str) -> Vec<CommandSuggestion> {
 }
 
 /// 0 for the same name, 1 for a synonym, 2 for a substring, 3 otherwise.
-fn closeness(name: &str, check: &str) -> u8 {
+pub(crate) fn closeness(name: &str, check: &str) -> u8 {
     let (name, check) = (name.to_ascii_lowercase(), check.to_ascii_lowercase());
     if name == check {
         return 0;
@@ -108,7 +114,7 @@ fn family(name: &str) -> Option<&'static str> {
     let any = |names: &[&str]| words.iter().any(|w| names.contains(w));
     if any(&["test", "tests", "unit", "spec", "pytest"]) {
         Some("test")
-    } else if any(&["lint", "linter", "clippy", "eslint", "vet", "ruff", "check"]) {
+    } else if any(&["lint", "linter", "clippy", "eslint", "vet", "ruff", "rubocop", "standardrb", "check"]) {
         Some("lint")
     } else if any(&["fmt", "format", "prettier", "style"]) {
         Some("format")
@@ -116,6 +122,8 @@ fn family(name: &str) -> Option<&'static str> {
         Some("build")
     } else if any(&["typecheck", "types", "tsc", "mypy"]) {
         Some("types")
+    } else if any(&["security", "audit", "brakeman", "vulnerabilities"]) {
+        Some("security")
     } else {
         None
     }
@@ -157,8 +165,8 @@ fn package_scripts(text: &str) -> Vec<String> {
 }
 
 /// The package manager the lockfile names, else npm.
-fn package_manager(dir: &Path) -> &'static str {
-    let has = |name: &str| dir.join(name).is_file();
+fn package_manager(tree: &(impl Tree + ?Sized)) -> &'static str {
+    let has = |name: &str| tree.has_file(name);
     if has("pnpm-lock.yaml") {
         "pnpm"
     } else if has("yarn.lock") {
@@ -190,6 +198,7 @@ fn just_recipes(text: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn dir_with(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = tempfile::tempdir().expect("tempdir");

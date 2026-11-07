@@ -762,6 +762,32 @@ fn configuring_a_check_selects_its_repository_and_offers_commands_from_the_check
     assert_eq!(repo.commands["lint"].command, "pnpm run lint");
 }
 
+#[test]
+fn commands_set_up_from_ci_show_where_they_came_from_and_follow_the_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let service = service(dir.path(), vec![tracked(dir.path())], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.state_mut().settings.section = settings::Section::Commands;
+    harness.run_ok();
+    assert!(harness.query_by_label("cargo test --workspace").is_none());
+
+    // Detection lands while the page is open, and the untouched page shows it.
+    let found = std::collections::BTreeMap::from([(
+        "tests".to_owned(),
+        signoff_core::DetectedCommand {
+            command: "cargo test --workspace".into(),
+            source: ".github/workflows/rust.yml".into(),
+        },
+    )]);
+    assert!(service.config().expect("config").adopt_detected("repo1", &found).expect("adopt"));
+    harness.run_ok();
+    harness.get_by_label("tests");
+    harness.get_by_label("Set up from .github/workflows/rust.yml");
+    let field = harness.get_all_by_role(egui::accesskit::Role::TextInput).next().expect("a command field");
+    assert_eq!(field.value().as_deref(), Some("cargo test --workspace"));
+}
+
 /// A popover harness on the demo data where `gh` and `git` answer through
 /// `script`, as outside demo mode, opened on the pull request that is not
 /// checked out.

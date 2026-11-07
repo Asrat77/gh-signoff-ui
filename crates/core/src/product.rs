@@ -5,7 +5,7 @@
 //! result into the shared state as it lands; the `store` module explains how
 //! those patches stay consistent with the app's own changes.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard};
@@ -18,7 +18,8 @@ use crate::api::{Api, ApiError, Remote, path_segment};
 use crate::checks::{
     self, Check, CheckState, Rules, display_name, is_signoff_context, latest_signoffs, resolve_checks, rules_for, tally,
 };
-use crate::config::{CommandMapping, ConfigStore, TrackedRepository};
+use crate::config::{CommandMapping, ConfigStore, DetectedCommand, TrackedRepository};
+use crate::files::GitTree;
 use crate::gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo, same_contexts};
 use crate::history::{ActivityEvent, ActivityKind, HistoryStore};
 use crate::store::{RepositoryRead, Store};
@@ -540,6 +541,14 @@ fn build_pull_request_state(
     (state, history)
 }
 
+/// Whether detection may set up `check`'s command: it has none, or the
+/// one Signoff set up, and the person did not remove it.
+fn wants_detection(tracked: &TrackedRepository, check: &str) -> bool {
+    !tracked.dismissed.contains(check)
+        && (tracked.commands.get(check).is_none_or(|m| m.command.trim().is_empty())
+            || tracked.detected_source(check).is_some())
+}
+
 enum Source {
     GitHub {
         gh: Gh,
@@ -547,8 +556,27 @@ enum Source {
         history: Arc<HistoryStore>,
         seed_dir: Option<PathBuf>,
         cache: StatusCache,
+        detections: Detections,
     },
     Demo,
+}
+
+/// The last commands detected per repository, so the CI config is read
+/// again only when the default branch moves or other checks appear.
+#[derive(Debug, Default)]
+struct Detections(Mutex<HashMap<String, Detection>>);
+
+impl Detections {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, Detection>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+#[derive(Debug)]
+struct Detection {
+    commit: String,
+    checks: BTreeSet<String>,
+    found: BTreeMap<String, DetectedCommand>,
 }
 
 /// Keeps the latest [`ProductState`] and patches it as reads land.
@@ -591,7 +619,14 @@ impl ProductService {
     /// Reads GitHub for the repositories in `config`. `seed_dir` is probed
     /// for the environment when no repository is tracked yet.
     pub fn new(gh: Gh, config: Arc<ConfigStore>, history: Arc<HistoryStore>, seed_dir: Option<PathBuf>) -> Self {
-        Self::from_source(Source::GitHub { gh, config, history, seed_dir, cache: StatusCache::default() })
+        Self::from_source(Source::GitHub {
+            gh,
+            config,
+            history,
+            seed_dir,
+            cache: StatusCache::default(),
+            detections: Detections::default(),
+        })
     }
 
     /// Serves [`crate::demo::product_state`] and never touches GitHub or disk.
@@ -744,6 +779,45 @@ impl ProductService {
             }
             store.set_rate_limit(next_allowed);
             store.land(&ticket, read, Timestamp::now())
+        })
+    }
+
+    /// Sets up commands for the repository `id`'s checks from its CI
+    /// config, as of its default branch: for checks that have no command,
+    /// and for those whose command Signoff set up before. Commands the
+    /// person typed or removed are left alone. Blocks on `git`; call it
+    /// after [`ProductService::refresh_repository`], from the same thread.
+    /// Returns whether the config changed.
+    ///
+    /// The default branch is read, never the checkout, so a pull request
+    /// cannot choose the command that later runs for every other one.
+    pub fn set_up_commands(&self, id: &str) -> bool {
+        let Source::GitHub { gh, config, detections, .. } = &self.source else { return false };
+        let Some(tracked) = config.find_repository(id).filter(|repo| repo.enabled) else { return false };
+        let checks: BTreeSet<String> = self
+            .store()
+            .state
+            .pull_requests
+            .iter()
+            .filter(|pr| pr.repo_id == id)
+            .flat_map(|pr| pr.checks.iter().map(|check| check.name.clone()))
+            .filter(|check| wants_detection(&tracked, check))
+            .collect();
+        if checks.is_empty() {
+            return false;
+        }
+        let Some(commit) = gh.branch_commit(&tracked.path, &tracked.default_branch) else { return false };
+        let cached =
+            detections.lock().get(id).filter(|d| d.commit == commit && d.checks == checks).map(|d| d.found.clone());
+        let found = cached.unwrap_or_else(|| {
+            let names: Vec<&String> = checks.iter().collect();
+            let found = crate::ci::detect(&GitTree::new(gh, &tracked.path, &commit), &names);
+            detections.lock().insert(id.to_owned(), Detection { commit, checks, found: found.clone() });
+            found
+        });
+        config.adopt_detected(id, &found).unwrap_or_else(|err| {
+            log::warn!("could not save the commands set up for {}: {err}", tracked.name_with_owner);
+            false
         })
     }
 
@@ -1422,5 +1496,65 @@ mod tests {
         assert!(read.join().expect("read"));
         assert_eq!(f.service.find_pull_request("r1", 2).expect("pr").status, Health::Ready, "GitHub lags");
         assert_eq!(f.service.cached().pull_requests[0].pr.number, 1, "re-sorted");
+    }
+
+    /// Runs `git` in `dir` for a test, failing it when git does.
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn commands_are_set_up_from_the_default_branchs_ci_config_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".github/workflows")).expect("mkdir");
+        let workflow =
+            |command: &str| format!("on: pull_request\njobs:\n  test:\n    steps:\n      - run: {command}\n");
+        git(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(".github/workflows/ci.yml"), workflow("cargo test")).expect("write");
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "ci"]);
+        // The checkout is on a pull request that changes what CI runs.
+        git(&repo, &["checkout", "-qb", "pr"]);
+        std::fs::write(repo.join(".github/workflows/ci.yml"), workflow("bin/steal-secrets")).expect("write");
+        git(&repo, &["commit", "-qam", "change ci"]);
+
+        let tracked = TrackedRepository {
+            id: "r1".into(),
+            path: repo.clone(),
+            name_with_owner: "acme/repo".into(),
+            default_branch: "main".into(),
+            enabled: true,
+            ..TrackedRepository::default()
+        };
+        let config = Arc::new(ConfigStore::with_config(
+            dir.path().join("config.json"),
+            AppConfig { repositories: vec![tracked], ..AppConfig::default() },
+        ));
+        let history = Arc::new(HistoryStore::open(dir.path().join("history.json")).expect("history"));
+        let runner: Arc<dyn Runner> = Arc::new(crate::runner::SystemRunner::default());
+        let service = ProductService::new(Gh::new(runner), config.clone(), history, None);
+        let check = |name: &str| Check { name: name.into(), required: true, ..Check::default() };
+        let pr = PullRequestState {
+            repo_id: "r1".into(),
+            checks: vec![check("tests"), check("deploy")],
+            ..PullRequestState::default()
+        };
+        *service.store.write().unwrap_or_else(PoisonError::into_inner) =
+            Store::serving(ProductState { pull_requests: vec![pr], ..ProductState::default() });
+
+        assert!(service.set_up_commands("r1"));
+        let saved = config.find_repository("r1").expect("repo");
+        assert_eq!(saved.commands.keys().collect::<Vec<_>>(), ["tests"], "nothing is made up for deploy");
+        assert_eq!(saved.commands["tests"].command, "cargo test", "read from main, not the checkout");
+        assert_eq!(saved.detected_source("tests"), Some(".github/workflows/ci.yml"));
+        assert!(!service.set_up_commands("r1"), "unchanged: nothing to save");
+        assert!(!ProductService::demo().set_up_commands("r1"));
     }
 }

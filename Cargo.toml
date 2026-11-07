@@ -37,6 +37,9 @@ thiserror = "2"
 # corporate CAs in the OS store work, HTTPS_PROXY/NO_PROXY from the env.
 ureq = { version = "3.5", default-features = false, features = ["rustls", "platform-verifier", "gzip"] }
 tempfile = "3"
+# Reads GitHub Actions workflows to set up check commands. Pure Rust, no
+# unsafe, YAML 1.2 (so the `on:` key stays a string).
+yaml-rust2 = { version = "0.13", default-features = false }
 # Watches each checkout's HEAD and branches, so checking out a branch is
 # read at once instead of on the next timed read.
 notify = "8.2"

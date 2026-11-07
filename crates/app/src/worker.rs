@@ -467,6 +467,9 @@ fn read(service: &ProductService, queue: &Queue, wake: &dyn Fn(), commands: &Sen
             }
             Job::Read(id) => {
                 let landed = service.refresh_repository(id);
+                // Checks without a command get one from the CI config; the
+                // config subscription shows it.
+                service.set_up_commands(id);
                 // A rate-limited read never reached GitHub.
                 let verdict = (landed && service.next_allowed().is_none()).then(|| service.read_failed(id));
                 let _ = commands.send(Command::Read(verdict));

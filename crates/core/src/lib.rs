@@ -24,6 +24,9 @@
 //! - [`discover`] finds the GitHub checkouts already on this computer.
 //! - [`suggest`] proposes local commands for a check from the checkout's
 //!   `Makefile`, `package.json` and the like.
+//! - [`ci`] sets up each check's command on its own from the repository's
+//!   CI config: GitHub Actions workflows and Rails' `config/ci.rb`.
+//! - [`files`] reads a repository's files from disk or from a commit.
 //! - [`notify`] decides which changes between two states earn a desktop
 //!   notification.
 //! - [`worktree`] keeps the worktrees Signoff verifies pull requests in
@@ -32,9 +35,11 @@
 
 pub mod api;
 pub mod checks;
+pub mod ci;
 pub mod config;
 pub mod demo;
 pub mod discover;
+pub mod files;
 pub mod gh;
 mod git;
 pub mod history;
@@ -48,7 +53,9 @@ pub mod verify;
 pub mod worktree;
 
 pub use checks::{Check, CheckState, Rules, Tally};
-pub use config::{AppConfig, CommandMapping, ConfigError, ConfigStore, RepositoryUpdate, TrackedRepository};
+pub use config::{
+    AppConfig, CommandMapping, ConfigError, ConfigStore, DetectedCommand, RepositoryUpdate, TrackedRepository,
+};
 pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo};
 pub use git::{WatchPaths, watch_paths};
 pub use history::{ActivityEvent, ActivityKind, HistoryStore};

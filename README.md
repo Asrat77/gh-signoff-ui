@@ -9,7 +9,7 @@ It is a native Rust app built with [egui](https://github.com/emilk/egui) on [fas
 - Tracks several local GitHub checkouts and shows either your pull requests or everyone's.
 - The tray icon is a pair of eyes coloured by overall health. Click it to open the glance popover, which lists pull requests failing first, then waiting on you, then ready. Filter by Yours, All, Failing or Ready.
 - Opens a pull request to show each required Signoff context and its latest status on the exact head commit.
-- Maps every check to a local command and timeout. **Run & sign off** streams the output, then calls `gh signoff --commit <sha>` only on exit code 0.
+- Sets up each check's local command from your CI config (GitHub Actions workflows and Rails' `config/ci.rb`), and lets you change any of them. **Run & sign off** streams the output, then calls `gh signoff --commit <sha>` only on exit code 0.
 - Refuses to run when the pull request's head commit isn't checked out locally, and checks again before signing off.
 - Keeps a local history of runs, signoffs and rule changes beside the statuses GitHub reported.
 - Edits only the Signoff contexts a branch requires. Reviews, restrictions and other required checks are left alone.
@@ -55,10 +55,10 @@ The first run copies the config and history the previous Go/Electron version wro
 
 1. Open Settings from the sliders button on the popover's band, or from the tray menu.
 2. Under **Repositories**, add a local checkout from the folder picker or paste its path. Choose **My pull requests** or **Everyone's**.
-3. Under **Commands**, give each check the command that proves it, for example `cargo test --workspace` or `bin/lint`. Checks that your pull requests require are offered with one click.
+3. Under **Commands**, check what each check runs. Signoff sets up what it can from the default branch's CI config: the job or step whose name matches the check (`tests` gets the `test` job, `lint` the `Clippy` step), and every checking job chained for the plain `signoff` check. Installs and other CI setup are left out. Give any other check the command that proves it, for example `cargo test --workspace` or `bin/lint`. A command you edit or remove is yours from then on.
 4. Check out the pull request's branch, open the pull request in the popover and press **Run & sign off**.
 
-Commands come only from your local config. Nothing from GitHub can supply or change them. **Settings → General** shows where the config file lives.
+Commands run only from your local config. Detection reads the default branch you fetched, never a pull request's branch, so a pull request cannot choose what runs. **Settings → General** shows where the config file lives.
 
 ## Branch rules
 
