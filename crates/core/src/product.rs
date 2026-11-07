@@ -941,8 +941,8 @@ mod tests {
     use super::*;
     use crate::api::fake::{FakeTransport, json, not_modified};
     use crate::config::{AppConfig, RepositoryUpdate};
-    use crate::runner::Runner;
     use crate::runner::fake::{FakeRunner, Reply, fail, ok};
+    use crate::runner::{Runner, TIMED_OUT};
 
     #[test]
     fn summary_uses_the_worst_pull_request() {
@@ -1287,6 +1287,28 @@ mod tests {
         assert_eq!(state.pull_requests.len(), 2);
         assert!(fake.called("pr list"));
         assert_eq!(transport.sent().len(), 1);
+    }
+
+    /// The Mac this was found on: the API cannot be reached, and `gh`,
+    /// which reads instead, times out. What was read before stays.
+    #[test]
+    fn when_the_api_is_unreachable_and_gh_times_out_the_last_read_stays() {
+        let mut replies = api_gh(true);
+        replies.push(Reply { matches: "pr list", stdout: "", stderr: "gh timed out after 60s", code: TIMED_OUT });
+        let (f, fake, transport) = api_fixture(replies);
+        rest_answers(&transport);
+        let first = f.service.refresh();
+        assert_eq!(first.pull_requests.len(), 2);
+
+        transport.fail("/pulls?", "tls: unknown certificate authority");
+        let second = f.service.refresh();
+        assert!(fake.called("pr list"), "read through gh");
+        assert_eq!(second.pull_requests, first.pull_requests, "nothing vanished");
+        assert_eq!(second.summary, first.summary, "the counts hold");
+        let repo = &second.repositories[0];
+        assert!(repo.error.as_deref().is_some_and(|e| e.contains("timed out")));
+        assert_eq!(repo.stale_since, first.repositories[0].fetched_at);
+        assert!(f.service.read_failed("r1"), "the scheduler still backs off");
     }
 
     #[test]

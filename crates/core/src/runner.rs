@@ -43,6 +43,25 @@ pub trait Runner: Send + Sync {
     /// Only when the program could not be started at all.
     fn run(&self, dir: Option<&Path>, input: Option<&str>, program: &str, args: &[&str]) -> io::Result<Output>;
 
+    /// [`Runner::run`], killing the program after `timeout` instead of the
+    /// runner's own limit. The default ignores `timeout`, which is enough
+    /// for recorded output in tests.
+    ///
+    /// # Errors
+    ///
+    /// Only when the program could not be started at all.
+    fn run_for(
+        &self,
+        dir: Option<&Path>,
+        input: Option<&str>,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> io::Result<Output> {
+        let _ = timeout;
+        self.run(dir, input, program, args)
+    }
+
     /// Runs `program` with `args` in `dir`, passing each line it writes to
     /// stdout or stderr to `on_line` as it arrives, and returns its exit
     /// code.
@@ -89,6 +108,17 @@ impl Default for SystemRunner {
 
 impl Runner for SystemRunner {
     fn run(&self, dir: Option<&Path>, input: Option<&str>, program: &str, args: &[&str]) -> io::Result<Output> {
+        self.run_for(dir, input, program, args, self.timeout)
+    }
+
+    fn run_for(
+        &self,
+        dir: Option<&Path>,
+        input: Option<&str>,
+        program: &str,
+        args: &[&str],
+        timeout: Duration,
+    ) -> io::Result<Output> {
         let mut command = Command::new(program);
         command
             .args(args)
@@ -110,7 +140,7 @@ impl Runner for SystemRunner {
         let stdout = drain(child.stdout.take());
         let stderr = drain(child.stderr.take());
 
-        let deadline = Instant::now() + self.timeout;
+        let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break Some(status);
@@ -128,7 +158,7 @@ impl Runner for SystemRunner {
             // left to finish on their own rather than joined.
             return Ok(Output {
                 stdout: String::new(),
-                stderr: format!("{program} timed out after {}s", self.timeout.as_secs()),
+                stderr: format!("{program} timed out after {}s", timeout.as_secs()),
                 code: TIMED_OUT,
             });
         };
