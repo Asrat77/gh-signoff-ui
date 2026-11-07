@@ -34,6 +34,9 @@ pub(crate) struct Glance {
     pub(crate) check: Option<String>,
     /// The command palette, while it is open.
     pub(crate) palette: Option<CommandPalette>,
+    /// The pull request (repository id, number) whose "Check out" asks to
+    /// confirm switching the checkout's branch.
+    pub(crate) confirm_checkout: Option<(String, u64)>,
 }
 
 /// The page the sheet shows.

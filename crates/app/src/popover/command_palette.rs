@@ -61,8 +61,12 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff) {
         toggle(app);
     }
     let Some(mut state) = app.glance.palette.take() else { return };
-    let actions =
-        commands::actions(&app.state, |pr| pr.checked_out || app.checkouts.simulated(&pr.repo_id, pr.pr.number));
+    let isolated = !app.demo && app.settings.isolated_worktrees_on();
+    let actions = commands::actions(
+        &app.state,
+        |pr| pr.checked_out || app.checkouts.simulated(&pr.repo_id, pr.pr.number),
+        isolated,
+    );
 
     // Taken before the field sees them.
     let (escape, down, up, enter) = ctx.input_mut(|i| {
@@ -189,7 +193,13 @@ fn execute(app: &mut Signoff, ctx: &Context, command: &Command) {
         }
         Command::CheckOut { repo_id, number, path } => {
             open_page(app, repo_id, *number, None);
-            app.checkouts.start(repo_id, *number, path.clone());
+            if !app.demo && app.settings.isolated_worktrees_on() {
+                // Not the main action: the page asks before switching the
+                // checkout's branch.
+                app.glance.confirm_checkout = Some((repo_id.clone(), *number));
+            } else {
+                app.checkouts.start(repo_id, *number, path.clone());
+            }
         }
         Command::Copy(text) => {
             ctx.copy_text(text.clone());

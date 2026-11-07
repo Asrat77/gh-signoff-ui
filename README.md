@@ -56,7 +56,7 @@ The first run copies the config and history the previous Go/Electron version wro
 1. Open Settings from the sliders button on the popover's band, or from the tray menu.
 2. Under **Repositories**, add a local checkout from the folder picker or paste its path. Choose **My pull requests** or **Everyone's**.
 3. Under **Commands**, check what each check runs. Signoff sets up what it can from the default branch's CI config: the job or step whose name matches the check (`tests` gets the `test` job, `lint` the `Clippy` step), and every checking job chained for the plain `signoff` check. Installs and other CI setup are left out. Give any other check the command that proves it, for example `cargo test --workspace` or `bin/lint`. A command you edit or remove is yours from then on.
-4. Check out the pull request's branch, open the pull request in the popover and press **Run & sign off**.
+4. Open the pull request in the popover and press **Run & sign off**. Your checkout stays on its branch: when it is on another commit, Signoff runs the command in a worktree of its own at the pull request's head. To work on the branch yourself, press **Check out #N** under it, which asks before switching your checkout. Turning off **Settings → General → Verify in a separate worktree** makes checking out the main button again.
 
 Commands run only from your local config. Detection reads the default branch you fetched, never a pull request's branch, so a pull request cannot choose what runs. **Settings → General** shows where the config file lives.
 
