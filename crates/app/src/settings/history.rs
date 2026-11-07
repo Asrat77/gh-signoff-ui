@@ -41,22 +41,23 @@ fn state_word(state: CheckState) -> &'static str {
     }
 }
 
-/// The first line of an entry.
+/// Where an entry happened: "repo #22", or just "repo".
+fn place(event: &ActivityEvent) -> String {
+    if event.pr_number > 0 { format!("{} #{}", event.repo, event.pr_number) } else { event.repo.clone() }
+}
+
+/// The first line of an entry, as a sentence: what happened, where, and
+/// which check it was about.
 fn title(event: &ActivityEvent) -> String {
-    let what = match event.kind {
-        ActivityKind::Run => format!("Ran {}", event.check),
-        ActivityKind::Signoff => format!("Signed off {}", event.check),
-        ActivityKind::Status => format!(
-            "{} reported {}",
-            if event.check.is_empty() { "GitHub" } else { &event.check },
-            state_word(event.state)
-        ),
-        ActivityKind::Rules => "Changed branch rules".to_owned(),
-    };
-    if event.pr_number > 0 {
-        format!("{what} · {} #{}", event.repo, event.pr_number)
-    } else {
-        format!("{what} · {}", event.repo)
+    let place = place(event);
+    match event.kind {
+        ActivityKind::Run => format!("Ran {} on {place}", event.check),
+        ActivityKind::Signoff => format!("Signed off {place} ({})", event.check),
+        ActivityKind::Status => {
+            let who = if event.check.is_empty() { "GitHub" } else { &event.check };
+            format!("{who} reported {} on {place}", state_word(event.state))
+        }
+        ActivityKind::Rules => format!("Changed branch rules on {}", event.repo),
     }
 }
 
@@ -86,7 +87,12 @@ pub(super) fn show(ui: &mut Ui, state: &ProductState) {
                 ui.label(RichText::new(icon(event.kind)).font(signoff_ui::fonts::icon(16.0)).color(status.color(&p)));
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(title(event)).font(Type::Row.font()).color(p.text));
+                        let has_output = !crate::runs::past_log(event).is_empty();
+                        let label = egui::Label::new(RichText::new(title(event)).font(Type::Row.font()).color(p.text));
+                        // A title opens the output it kept, like the chip below it.
+                        if ui.add(if has_output { label.sense(egui::Sense::click()) } else { label }).clicked() {
+                            toggle(ui, event);
+                        }
                         ui.label(RichText::new(ago(event.at, now)).font(Type::Caption.font()).color(p.secondary));
                     });
                     let mut detail = Vec::new();
@@ -120,6 +126,20 @@ pub(super) fn show(ui: &mut Ui, state: &ProductState) {
     }
 }
 
+fn output_id(event: &ActivityEvent) -> egui::Id {
+    egui::Id::new(("history-output", &event.id))
+}
+
+fn is_open(ui: &Ui, event: &ActivityEvent) -> bool {
+    let id = output_id(event);
+    ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false)
+}
+
+fn toggle(ui: &Ui, event: &ActivityEvent) {
+    let (id, open) = (output_id(event), is_open(ui, event));
+    ui.data_mut(|data| data.insert_temp(id, !open));
+}
+
 /// A "Show output" toggle, and the output under it, for an entry that
 /// kept what it printed.
 fn output(ui: &mut Ui, event: &ActivityEvent) {
@@ -127,12 +147,10 @@ fn output(ui: &mut Ui, event: &ActivityEvent) {
     if lines.is_empty() {
         return;
     }
-    let id = ui.id().with(("history-output", &event.id));
-    let mut open = ui.data(|data| data.get_temp::<bool>(id)).unwrap_or(false);
+    let open = is_open(ui, event);
     let (label, icon) = if open { ("Hide output", icons::REMOVE) } else { ("Show output", icons::TERMINAL) };
     if ui.add(Chip::new(label).icon(icon)).clicked() {
-        open = !open;
-        ui.data_mut(|data| data.insert_temp(id, open));
+        toggle(ui, event);
     }
     if open {
         let (result, status) = crate::runs::past_result(event);
@@ -163,6 +181,20 @@ mod tests {
             pr_number: 7,
             ..ActivityEvent::default()
         };
-        assert_eq!(title(&event), "Signed off tests · o/r #7");
+        assert_eq!(title(&event), "Signed off o/r #7 (tests)");
+    }
+
+    #[test]
+    fn titles_read_as_sentences() {
+        let run = ActivityEvent {
+            kind: ActivityKind::Run,
+            check: "fmt".into(),
+            repo: "o/r".into(),
+            pr_number: 7,
+            ..ActivityEvent::default()
+        };
+        assert_eq!(title(&run), "Ran fmt on o/r #7");
+        let rules = ActivityEvent { kind: ActivityKind::Rules, repo: "o/r".into(), ..ActivityEvent::default() };
+        assert_eq!(title(&rules), "Changed branch rules on o/r");
     }
 }
