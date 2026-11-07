@@ -18,6 +18,7 @@ mod installer;
 mod notifier;
 mod paths;
 mod popover;
+mod problem;
 mod runs;
 mod settings;
 mod tray;
