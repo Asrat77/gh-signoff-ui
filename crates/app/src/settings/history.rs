@@ -72,7 +72,9 @@ fn ago(at: Timestamp, now: Timestamp) -> String {
     }
 }
 
-pub(super) fn show(ui: &mut Ui, state: &ProductState) {
+/// Draws History. `focus` names an entry to open and scroll to; it is
+/// cleared once shown.
+pub(super) fn show(ui: &mut Ui, state: &ProductState, focus: &mut Option<String>) {
     parts::heading(ui, "History", "Commands run and signoffs written from this computer, with what GitHub reported.");
     if state.history.is_empty() {
         parts::notice(ui, Status::Neutral, "Nothing yet. Runs, signoffs and rule changes show up here.");
@@ -80,6 +82,11 @@ pub(super) fn show(ui: &mut Ui, state: &ProductState) {
     }
     let now = Timestamp::now();
     for event in state.history.iter().take(SHOWN) {
+        let focused = focus.as_deref() == Some(event.id.as_str());
+        if focused {
+            ui.data_mut(|data| data.insert_temp(output_id(event), true));
+        }
+        let top = ui.cursor().top();
         parts::card(ui, |ui| {
             let p = palette(ui.ctx());
             let status = status(event.state);
@@ -119,6 +126,11 @@ pub(super) fn show(ui: &mut Ui, state: &ProductState) {
                 });
             });
         });
+        if focused {
+            let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+            ui.scroll_to_rect(rect, Some(egui::Align::TOP));
+            *focus = None;
+        }
     }
     if state.history.len() > SHOWN {
         ui.add_space(space::S);

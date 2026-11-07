@@ -85,6 +85,8 @@ pub(crate) struct Settings {
     pub(crate) installing: bool,
     /// Whether the global shortcut works; the app sets this when it changes.
     pub(crate) shortcut_status: crate::hotkey::Status,
+    /// The History entry to open and scroll to once, from a run's page.
+    history_focus: Option<String>,
 }
 
 /// What the settings asked the app for this frame.
@@ -116,6 +118,7 @@ impl Settings {
             rules: None,
             installing: false,
             shortcut_status: crate::hotkey::Status::Off,
+            history_focus: None,
         }
     }
 
@@ -135,6 +138,13 @@ impl Settings {
         self.section = Section::Commands;
         self.selected_repo = Some(repo_id.to_owned());
         self.configure = Some((repo_id.to_owned(), check.to_owned()));
+    }
+
+    /// Opens History, with the entry `entry` open and in view when given.
+    /// The caller opens the window.
+    pub(crate) fn open_history(&mut self, entry: Option<String>) {
+        self.section = Section::History;
+        self.history_focus = entry;
     }
 
     /// Asks for a checkout with the folder picker and starts tracking it.
@@ -302,7 +312,7 @@ fn section(ui: &mut Ui, settings: &mut Settings, state: &ProductState, effects: 
             Section::Repositories => repositories::show(ui, settings, state, effects),
             Section::Commands => commands::show(ui, settings, state, effects),
             Section::BranchRules => rules::show(ui, settings, state, effects),
-            Section::History => history::show(ui, state),
+            Section::History => history::show(ui, state, &mut settings.history_focus),
         }
     });
 }
