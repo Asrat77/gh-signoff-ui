@@ -66,7 +66,7 @@ fn blocked(ui: &mut Ui, app: &mut Signoff) -> bool {
         ui.add(EmptyState::new(Mood::AtYou, problem.title, problem.detail).action(problem.action, &mut clicked));
         if clicked {
             match problem.url {
-                Some(url) => ui.ctx().open_url(egui::OpenUrl::new_tab(url)),
+                Some(url) => crate::browser::open(ui.ctx(), url),
                 None => app.refresh(),
             }
         }

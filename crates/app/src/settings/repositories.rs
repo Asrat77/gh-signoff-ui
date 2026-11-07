@@ -179,7 +179,7 @@ fn row(ui: &mut Ui, settings: &mut Settings, repo: &Row) {
                 .on_hover_text("Open this repository in your browser")
                 .clicked()
             {
-                ui.ctx().open_url(egui::OpenUrl::new_tab(format!("https://github.com/{}", repo.name_with_owner)));
+                crate::browser::open(ui.ctx(), &format!("https://github.com/{}", repo.name_with_owner));
             }
             let manager = format!("Show in {}", file_manager());
             if ui
