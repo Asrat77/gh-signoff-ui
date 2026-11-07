@@ -368,6 +368,9 @@ pub(crate) struct Window {
     placed: bool,
     /// The window has had focus since it opened.
     focused: bool,
+    /// The popover sits at the normal window level so the Settings window
+    /// opens over it, not under.
+    lowered: bool,
 }
 
 /// Makes the window for `lease` once eframe has a context.
@@ -379,7 +382,7 @@ pub(crate) fn window(cc: &eframe::CreationContext<'_>, lease: Lease<Signoff>) ->
     if let Some(tray) = &mut app.tray {
         tray.attach();
     }
-    Box::new(Window { app, placed: false, focused: false })
+    Box::new(Window { app, placed: false, focused: false, lowered: false })
 }
 
 /// The main window: with a tray, a borderless popover that floats over
@@ -420,6 +423,19 @@ impl Window {
         self.placed = true;
     }
 
+    /// Drops the always-on-top popover to the normal window level while
+    /// Settings is open, so Settings is not covered by it, and puts it back
+    /// after.
+    fn follow_settings(&mut self, ctx: &egui::Context) {
+        let lowered = self.app.settings_open;
+        if !self.app.is_popover() || lowered == self.lowered {
+            return;
+        }
+        self.lowered = lowered;
+        let level = if lowered { egui::WindowLevel::Normal } else { egui::WindowLevel::AlwaysOnTop };
+        ctx.send_viewport_cmd(ViewportCommand::WindowLevel(level));
+    }
+
     /// Hides the popover when it loses focus or Escape is pressed, as a
     /// menu-bar popover does. Settings opens its own window, which takes
     /// focus, so the popover stays while it is open.
@@ -447,6 +463,7 @@ impl eframe::App for Window {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.app.tick(Some(ctx));
         self.place(ctx);
+        self.follow_settings(ctx);
         self.dismiss_when_done(ctx);
         // Decided here, not in `ui`, which eframe skips while minimized.
         self.app.closing = if self.app.quit || !self.app.keeps_running() { Closed::Quit } else { Closed::Hide };
