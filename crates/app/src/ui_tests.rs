@@ -822,6 +822,46 @@ fn commands_set_up_from_ci_show_where_they_came_from_and_follow_the_config() {
     assert_eq!(field.value().as_deref(), Some("cargo test --workspace"));
 }
 
+#[test]
+fn a_command_typed_by_hand_says_so_and_can_be_detected_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut repo = tracked(dir.path());
+    repo.commands.insert(
+        "signoff".into(),
+        signoff_core::CommandMapping { command: "cargo fmt --check".into(), timeout_seconds: 300 },
+    );
+    let service = service(dir.path(), vec![repo], Arc::new(Script::default()));
+    let state = service.cached_or_config_state();
+    let mut harness = settings_harness(service.clone(), state);
+    harness.state_mut().settings.section = settings::Section::Commands;
+    harness.run_ok();
+    harness.get_by_label("Typed by you");
+    harness.get_by_label("Detect from CI again");
+    assert!(harness.query_by_label_contains("Set up from").is_none());
+
+    // CI runs more than the typed command: say so, and offer CI's.
+    step_until(&mut harness, "CI to be read", |h| h.state().settings.ci_known());
+    let source = ".github/workflows/rust.yml";
+    let all = "cargo fmt --check && cargo clippy && cargo test";
+    let found = std::collections::BTreeMap::from([(
+        "signoff".to_owned(),
+        signoff_core::DetectedCommand { command: all.into(), source: source.into() },
+    )]);
+    harness.state_mut().settings.set_ci(found);
+    harness.run_ok();
+    harness.get_by_label_contains("CI also runs `cargo clippy`, `cargo test`");
+    harness.get_by_label("Use CI's commands").click();
+    harness.run_ok();
+    let field = harness.get_all_by_role(egui::accesskit::Role::TextInput).next().expect("a command field");
+    assert_eq!(field.value().as_deref(), Some(all));
+    assert!(harness.query_by_label_contains("CI also runs").is_none(), "nothing left out");
+    harness.get_by_label("Save commands").click();
+    harness.run_ok();
+    let saved = service.config().expect("config").find_repository("repo1").expect("repo");
+    assert_eq!(saved.commands["signoff"].command, all);
+    assert_eq!(saved.detected_source("signoff"), Some(source), "it follows CI from now on");
+}
+
 /// A popover harness on the demo data where `gh` and `git` answer through
 /// `script`, as outside demo mode, opened on the pull request that is not
 /// checked out.

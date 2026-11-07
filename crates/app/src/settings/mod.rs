@@ -160,6 +160,18 @@ impl Settings {
         self.discovery = discovery::Discovery::with_found(found);
     }
 
+    /// Whether the Commands page has CI's answer for the whole pull request.
+    #[cfg(test)]
+    pub(crate) fn ci_known(&self) -> bool {
+        commands::ci_known(self)
+    }
+
+    /// Shows `found` as what CI runs, as if the read had returned it.
+    #[cfg(test)]
+    pub(crate) fn set_ci(&mut self, found: std::collections::BTreeMap<String, signoff_core::DetectedCommand>) {
+        commands::set_ci(self, found);
+    }
+
     /// Tracks the folders dropped onto the window this frame.
     pub(crate) fn accept_drops(&mut self, ctx: &egui::Context) {
         repositories::accept_drops(ctx, self);
