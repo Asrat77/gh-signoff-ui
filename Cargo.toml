@@ -55,3 +55,11 @@ unwrap_used = "warn"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+# egui redraws everything every frame; unoptimised dependencies make scrolling
+# stutter in a plain `cargo run`. Optimise them, keep our own crates fast to build.
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.dev]
+opt-level = 1
