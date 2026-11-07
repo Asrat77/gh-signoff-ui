@@ -91,7 +91,7 @@ pub fn suggest(dir: &Path, check: &str) -> Vec<CommandSuggestion> {
 }
 
 /// 0 for the same name, 1 for a synonym, 2 for a substring, 3 otherwise.
-fn closeness(name: &str, check: &str) -> u8 {
+pub(crate) fn closeness(name: &str, check: &str) -> u8 {
     let (name, check) = (name.to_ascii_lowercase(), check.to_ascii_lowercase());
     if name == check {
         return 0;
@@ -114,7 +114,7 @@ fn family(name: &str) -> Option<&'static str> {
     let any = |names: &[&str]| words.iter().any(|w| names.contains(w));
     if any(&["test", "tests", "unit", "spec", "pytest"]) {
         Some("test")
-    } else if any(&["lint", "linter", "clippy", "eslint", "vet", "ruff", "check"]) {
+    } else if any(&["lint", "linter", "clippy", "eslint", "vet", "ruff", "rubocop", "standardrb", "check"]) {
         Some("lint")
     } else if any(&["fmt", "format", "prettier", "style"]) {
         Some("format")
@@ -122,6 +122,8 @@ fn family(name: &str) -> Option<&'static str> {
         Some("build")
     } else if any(&["typecheck", "types", "tsc", "mypy"]) {
         Some("types")
+    } else if any(&["security", "audit", "brakeman", "vulnerabilities"]) {
+        Some("security")
     } else {
         None
     }

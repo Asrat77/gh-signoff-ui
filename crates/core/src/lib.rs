@@ -24,6 +24,8 @@
 //! - [`discover`] finds the GitHub checkouts already on this computer.
 //! - [`suggest`] proposes local commands for a check from the checkout's
 //!   `Makefile`, `package.json` and the like.
+//! - [`ci`] sets up each check's command on its own from the repository's
+//!   CI config: GitHub Actions workflows and Rails' `config/ci.rb`.
 //! - [`files`] reads a repository's files from disk or from a commit.
 //! - [`notify`] decides which changes between two states earn a desktop
 //!   notification.
@@ -33,6 +35,7 @@
 
 pub mod api;
 pub mod checks;
+pub mod ci;
 pub mod config;
 pub mod demo;
 pub mod discover;
