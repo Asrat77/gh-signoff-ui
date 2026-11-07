@@ -4,7 +4,7 @@
 use egui::Response;
 use egui::{Align, Frame, Layout, Margin, RichText, ScrollArea, Ui};
 use signoff_core::{Check, CheckState, Phase, PullRequestState, VerifyRequest};
-use signoff_ui::theme::space;
+use signoff_ui::theme::{size, space};
 use signoff_ui::widgets::{
     Button, ButtonKind, CheckRow, Chip, EmptyState, Headline, IconButton, IconButtonKind, LogLine, LogView, Mood,
     Segments, sheet,
@@ -20,6 +20,10 @@ use crate::runs::RunView;
 
 /// Room kept under the checks for the actions.
 const FOOTER: f32 = 92.0;
+
+/// More room for the actions when "Check out #N" sits under the main
+/// button: a compact button and the gap above it.
+const SECOND_BUTTON: f32 = size::CHIP + 6.0 + space::S;
 
 /// Draws the page for the pull request `number` in `repo_id`, or sends
 /// the popover back to the list once it is gone (merged or closed).
@@ -62,7 +66,8 @@ pub(super) fn show(ui: &mut Ui, app: &mut Signoff, repo_id: &str, number: u64) {
         });
         Frame::new().inner_margin(Margin::symmetric(14, 0)).show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = space::S;
-            let height = height_above(ui, FOOTER);
+            let extra = if offers_checkout(app, &pr, target.as_ref(), run.as_ref()) { SECOND_BUTTON } else { 0.0 };
+            let height = height_above(ui, FOOTER + extra);
             ScrollArea::vertical().max_height(height).auto_shrink([false, false]).show(ui, |ui| {
                 problems(ui, &pr);
                 let required: Vec<&Check> = glance::required(&pr).collect();
@@ -241,16 +246,33 @@ fn problems(ui: &mut Ui, pr: &PullRequestState) {
     }
 }
 
+/// Whether the page is not on the pull request's head, so a run happens in
+/// Signoff's own worktree, and the checkout can be switched there instead.
+fn isolated(app: &Signoff, pr: &PullRequestState) -> bool {
+    let at_head = pr.checked_out || app.checkouts.simulated(&pr.repo_id, pr.pr.number);
+    // With the setting on, a checkout elsewhere is no reason to stop: the
+    // run happens in Signoff's own worktree at the head.
+    !at_head && !app.demo && app.settings.isolated_worktrees_on()
+}
+
+/// Whether "Check out #N" is offered under "Run & sign off": a run would
+/// use Signoff's worktree, and none is going.
+fn offers_checkout(app: &Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) -> bool {
+    isolated(app, pr)
+        && target.is_some_and(|check| check.configured && check.state != CheckState::Success)
+        && !run.is_some_and(RunView::running)
+        && !pr.repo_path.as_os_str().is_empty()
+}
+
 /// The page's main button: run and sign off the target check, stop it
 /// while it runs, or open a ready pull request to merge.
 fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option<&Check>, run: Option<&RunView>) {
     let number = pr.pr.number;
     let checkout = app.checkouts.view(&pr.repo_id, number);
     let at_head = pr.checked_out || app.checkouts.simulated(&pr.repo_id, number);
-    // With the setting on, a checkout elsewhere is no reason to stop: the
-    // run happens in Signoff's own worktree at the head.
-    let isolated = !at_head && !app.demo && app.settings.isolated_worktrees_on();
+    let isolated = isolated(app, pr);
     let unmapped = to_configure(pr, target);
+    let confirming = app.glance.confirm_checkout.as_ref().is_some_and(|(id, n)| *id == pr.repo_id && *n == number);
     match (target, run) {
         (Some(check), Some(run)) if run.running() => {
             let label = format!("Stop {}", check.name);
@@ -259,7 +281,9 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
             }
         }
         (Some(check), _) if check.configured && check.state != CheckState::Success && !at_head && !isolated => {
-            check_out_button(ui, app, pr, checkout.as_ref());
+            if check_out_button(ui, app, pr, checkout.as_ref(), ButtonKind::Primary) {
+                app.checkouts.start(&pr.repo_id, number, pr.repo_path.clone());
+            }
         }
         (Some(check), _) if check.configured && check.state != CheckState::Success => {
             let label = format!("Run & sign off {}", check.name);
@@ -275,6 +299,7 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
             };
             let button = ui.add(Button::new(&label).icon(icons::RUN)).on_hover_text(hover);
             if button.clicked() {
+                app.glance.confirm_checkout = None;
                 app.runs.start(request(pr, check));
             }
         }
@@ -296,10 +321,12 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
         }
     }
     ui.add_space(space::S);
-    let hint = match checkout {
-        Some(Checkout::Failed(message)) => message,
+    let offered = offers_checkout(app, pr, target, run);
+    let hint = match &checkout {
+        Some(Checkout::Failed(message)) => message.clone(),
         Some(Checkout::Running) => format!("Running gh pr checkout {number}…"),
         _ if run.is_some_and(|run| run.running() && run.phase == Phase::Prepare) => "Preparing worktree…".to_owned(),
+        _ if offered && confirming => format!("{}?", switch(app, pr)),
         _ if isolated && unmapped.is_none() => format!(
             "Runs in a separate worktree at {}; your checkout is not touched.",
             glance::short_sha(&pr.pr.head_sha)
@@ -307,24 +334,94 @@ fn actions(ui: &mut Ui, app: &mut Signoff, pr: &PullRequestState, target: Option
         _ => hint(app, pr, target, unmapped),
     };
     caption(ui, &hint);
+    if offered {
+        ui.add_space(space::S);
+        check_out_instead(ui, app, pr, checkout.as_ref(), confirming);
+    }
 }
 
-/// The button that checks out the pull request, disabled while that runs.
-fn check_out_button(ui: &mut Ui, app: &Signoff, pr: &PullRequestState, checkout: Option<&Checkout>) {
+/// "Check out #N" under "Run & sign off". Checking out switches the
+/// person's own checkout, so a click first asks to confirm it.
+fn check_out_instead(
+    ui: &mut Ui,
+    app: &mut Signoff,
+    pr: &PullRequestState,
+    checkout: Option<&Checkout>,
+    confirm: bool,
+) {
+    let number = pr.pr.number;
+    let busy = matches!(checkout, Some(Checkout::Running | Checkout::Done));
+    if !confirm || busy {
+        if check_out_button(ui, app, pr, checkout, ButtonKind::Secondary) {
+            app.glance.confirm_checkout = Some((pr.repo_id.clone(), number));
+        }
+        return;
+    }
+    let half = ((ui.available_width() - space::S) / 2.0).max(0.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = space::S;
+        let cancel = Button::new("Cancel").kind(ButtonKind::Secondary).compact().width(half);
+        if ui.add(cancel).clicked() {
+            app.glance.confirm_checkout = None;
+        }
+        let switch_branch =
+            Button::new("Switch branch").kind(ButtonKind::Secondary).icon(icons::BRANCH).compact().width(half);
+        if ui.add(switch_branch).on_hover_text(checkout_hover(app, pr)).clicked() {
+            app.glance.confirm_checkout = None;
+            app.checkouts.start(&pr.repo_id, number, pr.repo_path.clone());
+        }
+    });
+}
+
+/// The button that checks out the pull request, disabled while that runs:
+/// the main button (`kind` primary), or a compact one under it. Returns
+/// whether it was clicked.
+fn check_out_button(
+    ui: &mut Ui,
+    app: &Signoff,
+    pr: &PullRequestState,
+    checkout: Option<&Checkout>,
+    kind: ButtonKind,
+) -> bool {
     let number = pr.pr.number;
     let (label, busy) = match checkout {
         Some(Checkout::Running) => (format!("Checking out #{number}…"), true),
         Some(Checkout::Done) => (format!("Reading #{number}…"), true),
         _ => (format!("Check out #{number}"), false),
     };
-    let button = Button::new(&label).icon(if busy { icons::RUNNING } else { icons::BRANCH }).enabled(!busy);
-    let button = ui.add(button).on_hover_text(format!(
-        "Run `gh pr checkout {number}` in {}; refused if tracked files have uncommitted changes",
-        pr.repo_path.display()
-    ));
-    if button.clicked() {
-        app.checkouts.start(&pr.repo_id, number, pr.repo_path.clone());
+    let mut button =
+        Button::new(&label).kind(kind).icon(if busy { icons::RUNNING } else { icons::BRANCH }).enabled(!busy);
+    if kind != ButtonKind::Primary {
+        button = button.compact();
     }
+    ui.add(button).on_hover_text(checkout_hover(app, pr)).clicked()
+}
+
+/// What checking out does to the person's checkout, such as "This
+/// switches gh-signoff from main to fix-flaky-tests".
+fn switch(app: &Signoff, pr: &PullRequestState) -> String {
+    let dir = pr.repo_path.file_name().map_or_else(|| pr.repo.clone(), |name| name.to_string_lossy().into_owned());
+    let current = app
+        .state
+        .repositories
+        .iter()
+        .find(|repo| repo.id == pr.repo_id)
+        .map(|repo| repo.current_branch.as_str())
+        .filter(|branch| !branch.is_empty() && *branch != pr.pr.head_ref);
+    match current {
+        Some(current) => format!("This switches {dir} from {current} to {}", pr.pr.head_ref),
+        None => format!("This switches {dir} to {}", pr.pr.head_ref),
+    }
+}
+
+/// The hover text of the buttons that check the pull request out.
+fn checkout_hover(app: &Signoff, pr: &PullRequestState) -> String {
+    format!(
+        "{} with `gh pr checkout {}` in {}; refused if tracked files have uncommitted changes",
+        switch(app, pr),
+        pr.pr.number,
+        pr.repo_path.display()
+    )
 }
 
 /// The line under the main button when nothing is running or failed.
