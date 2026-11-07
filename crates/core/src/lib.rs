@@ -50,7 +50,9 @@ pub mod verify;
 pub mod worktree;
 
 pub use checks::{Check, CheckState, Rules, Tally};
-pub use config::{AppConfig, CommandMapping, ConfigError, ConfigStore, RepositoryUpdate, TrackedRepository};
+pub use config::{
+    AppConfig, CommandMapping, ConfigError, ConfigStore, DetectedCommand, RepositoryUpdate, TrackedRepository,
+};
 pub use gh::{CommitStatus, Environment, Gh, GhError, PrInfo, ProtectionStatus, RepoInfo};
 pub use git::{WatchPaths, watch_paths};
 pub use history::{ActivityEvent, ActivityKind, HistoryStore};
